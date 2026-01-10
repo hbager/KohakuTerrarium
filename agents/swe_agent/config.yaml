@@ -5,8 +5,11 @@ name: swe_agent
 version: "1.0"
 
 # LLM Configuration
+# Options: mistralai/mistral-small-3.1-24b-instruct (cheap/fast)
+#          mistralai/devstral-small-2505 (free, agentic coding)
+#          qwen/qwen3-32b (good balance)
 controller:
-  model: "${OPENROUTER_MODEL:openai/gpt-4o-mini}"
+  model: "${OPENROUTER_MODEL:mistralai/mistral-small-3.1-24b-instruct}"
   temperature: 0.7
   max_tokens: 4096
   api_key_env: OPENROUTER_API_KEY
@@ -29,6 +32,8 @@ tools:
   - name: read
     type: builtin
   - name: write
+    type: builtin
+  - name: edit
     type: builtin
   - name: glob
     type: builtin
