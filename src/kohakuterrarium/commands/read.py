@@ -1,11 +1,19 @@
 """
 Read command - Read job output.
+Info command - Get tool/subagent documentation.
 
-Usage: ##read job_id [--lines N] [--offset M]##
+Usage:
+    ##read job_id [--lines N] [--offset M]##
+    ##info tool_name##
 """
 
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from kohakuterrarium.builtin_skills import (
+    get_builtin_subagent_doc,
+    get_builtin_tool_doc,
+)
 from kohakuterrarium.commands.base import BaseCommand, CommandResult, parse_command_args
 
 if TYPE_CHECKING:
@@ -92,6 +100,14 @@ class InfoCommand(BaseCommand):
     """
     Get documentation for a tool or sub-agent.
 
+    Loads documentation from files in order of priority:
+    1. prompts/tools/{name}.md (agent folder - user override)
+    2. prompts/subagents/{name}.md (agent folder - user override)
+    3. Builtin skills from package (builtin_skills/tools/{name}.md)
+    4. Tool's get_full_documentation() method
+    5. ToolInfo.documentation field
+    6. Basic description fallback
+
     Usage:
         ##info tool_name##
         ##info subagent_name##
@@ -112,16 +128,52 @@ class InfoCommand(BaseCommand):
         if not target_name:
             return CommandResult(error="No name provided. Usage: ##info name##")
 
-        # Try to get tool info
+        # 1. Try to load from agent folder first (user override)
+        if hasattr(context, "agent_path") and context.agent_path:
+            agent_path = Path(context.agent_path)
+
+            # Try tool documentation file
+            tool_doc_path = agent_path / "prompts" / "tools" / f"{target_name}.md"
+            if tool_doc_path.exists():
+                content = tool_doc_path.read_text(encoding="utf-8")
+                return CommandResult(content=content)
+
+            # Try subagent documentation file
+            subagent_doc_path = (
+                agent_path / "prompts" / "subagents" / f"{target_name}.md"
+            )
+            if subagent_doc_path.exists():
+                content = subagent_doc_path.read_text(encoding="utf-8")
+                return CommandResult(content=content)
+
+        # 2. Try builtin skills from package
+        builtin_tool_doc = get_builtin_tool_doc(target_name)
+        if builtin_tool_doc:
+            return CommandResult(content=builtin_tool_doc)
+
+        builtin_subagent_doc = get_builtin_subagent_doc(target_name)
+        if builtin_subagent_doc:
+            return CommandResult(content=builtin_subagent_doc)
+
+        # 3. Try to get tool info from registry
         if hasattr(context, "get_tool_info"):
             tool_info = context.get_tool_info(target_name)
             if tool_info is not None:
+                # Try to get full documentation from tool instance
+                if hasattr(context, "get_tool") and context.get_tool:
+                    tool = context.get_tool(target_name)
+                    if tool and hasattr(tool, "get_full_documentation"):
+                        doc = tool.get_full_documentation()
+                        if doc:
+                            return CommandResult(content=doc)
+
+                # Fall back to ToolInfo documentation
                 return CommandResult(
                     content=tool_info.documentation
                     or f"# {target_name}\n\n{tool_info.description}"
                 )
 
-        # Try to get subagent info
+        # 4. Try to get subagent info
         if hasattr(context, "get_subagent_info"):
             subagent_info = context.get_subagent_info(target_name)
             if subagent_info is not None:

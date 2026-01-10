@@ -6,6 +6,8 @@ Configurable patterns for detecting tool calls, sub-agent calls, and commands.
 
 from dataclasses import dataclass, field
 
+import yaml
+
 
 @dataclass
 class BlockPattern:
@@ -192,17 +194,37 @@ def parse_tool_content(content: str) -> tuple[str, dict[str, str]]:
     Returns:
         (tool_name, args_dict)
     """
-    parsed = parse_yaml_like(content)
-    name = parsed.pop("name", "")
+    # Use PyYAML for proper YAML parsing (handles | multiline, etc.)
+    try:
+        parsed = yaml.safe_load(content)
+        if not isinstance(parsed, dict):
+            # Fallback to simple parser
+            parsed = parse_yaml_like(content)
+    except yaml.YAMLError:
+        # Fallback to simple parser on YAML errors
+        parsed = parse_yaml_like(content)
 
-    # If there's an "args" key with nested content, parse it
-    if "args" in parsed:
-        args_content = parsed.pop("args")
-        # Parse nested args
-        nested = parse_yaml_like(args_content)
-        parsed.update(nested)
+    name = str(parsed.pop("name", "")) if parsed else ""
 
-    return name, parsed
+    # If there's an "args" key, flatten it
+    if parsed and "args" in parsed:
+        args = parsed.pop("args")
+        if isinstance(args, dict):
+            # Convert all values to strings for consistency
+            for key, value in args.items():
+                parsed[key] = str(value) if not isinstance(value, str) else value
+        elif isinstance(args, str):
+            # Parse nested args string
+            nested = parse_yaml_like(args)
+            parsed.update(nested)
+
+    # Ensure all values are strings
+    result = {}
+    if parsed:
+        for key, value in parsed.items():
+            result[key] = str(value) if not isinstance(value, str) else value
+
+    return name, result
 
 
 def parse_subagent_content(content: str) -> dict[str, str]:
@@ -211,7 +233,21 @@ def parse_subagent_content(content: str) -> dict[str, str]:
 
     Returns args dict.
     """
-    return parse_yaml_like(content)
+    # Use PyYAML for proper YAML parsing
+    try:
+        parsed = yaml.safe_load(content)
+        if not isinstance(parsed, dict):
+            parsed = parse_yaml_like(content)
+    except yaml.YAMLError:
+        parsed = parse_yaml_like(content)
+
+    # Ensure all values are strings
+    result = {}
+    if parsed:
+        for key, value in parsed.items():
+            result[key] = str(value) if not isinstance(value, str) else value
+
+    return result
 
 
 def parse_command(raw: str) -> tuple[str, str]:

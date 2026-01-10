@@ -1,7 +1,8 @@
 """
 Prompt aggregation - build system prompts from components.
 
-Combines base prompt, tool documentation, and framework hints.
+Combines base prompt, tool list (name + one-line description), and framework hints.
+Full tool documentation is loaded on-demand via ##info## command.
 """
 
 from kohakuterrarium.core.registry import Registry
@@ -15,14 +16,14 @@ logger = get_logger(__name__)
 DEFAULT_FRAMEWORK_HINTS = """
 ## Framework Commands
 
-To read job output:
+To get full documentation for a tool or sub-agent:
 ```
-##read job_id [--lines N] [--offset M]##
+##info <name>##
 ```
 
-To get tool documentation:
+To read output from a completed job:
 ```
-##info tool_name##
+##read <job_id>##
 ```
 """.strip()
 
@@ -37,6 +38,9 @@ def aggregate_system_prompt(
 ) -> str:
     """
     Build complete system prompt from components.
+
+    Includes only tool names + one-line descriptions.
+    Full documentation is available via ##info tool_name## command.
 
     Args:
         base_prompt: Base system prompt (can contain Jinja2 templates)
@@ -68,11 +72,11 @@ def aggregate_system_prompt(
     rendered_base = render_template_safe(base_prompt, **context)
     parts.append(rendered_base)
 
-    # Add tool list if registry provided and not already in template
+    # Add tool list (name + one-line description only)
     if registry and include_tools and "{{ tools }}" not in base_prompt:
-        tools_section = registry.get_tools_prompt()
-        if tools_section:
-            parts.append(tools_section)
+        tools_list = _build_tools_list(registry)
+        if tools_list:
+            parts.append(tools_list)
 
     # Add framework hints
     if include_hints:
@@ -81,6 +85,24 @@ def aggregate_system_prompt(
     result = "\n\n".join(parts)
     logger.debug("Aggregated system prompt", length=len(result))
     return result
+
+
+def _build_tools_list(registry: Registry) -> str:
+    """Build a concise tool list with names and one-line descriptions."""
+    tool_names = registry.list_tools()
+    if not tool_names:
+        return ""
+
+    lines = ["## Available Tools", ""]
+    for name in tool_names:
+        info = registry.get_tool_info(name)
+        description = info.description if info else "No description"
+        lines.append(f"- `{name}`: {description}")
+
+    lines.append("")
+    lines.append("Use `##info <tool_name>##` for full documentation.")
+
+    return "\n".join(lines)
 
 
 def build_context_message(

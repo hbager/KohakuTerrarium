@@ -19,7 +19,15 @@ from kohakuterrarium.modules.input.cli import CLIInput
 from kohakuterrarium.modules.output.base import OutputModule
 from kohakuterrarium.modules.output.router import OutputRouter
 from kohakuterrarium.modules.output.stdout import StdoutOutput
-from kohakuterrarium.modules.tool import BashTool, PythonTool
+from kohakuterrarium.modules.tool import (
+    BashTool,
+    GlobTool,
+    GrepTool,
+    PythonTool,
+    ReadTool,
+    WriteTool,
+)
+from kohakuterrarium.commands.read import InfoCommand, ReadCommand
 from kohakuterrarium.parsing import (
     CommandEvent,
     ParseEvent,
@@ -31,6 +39,36 @@ from kohakuterrarium.prompt.aggregator import aggregate_system_prompt
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+class _CommandContext:
+    """Context object passed to framework commands."""
+
+    def __init__(
+        self,
+        executor: "Executor",
+        registry: "Registry",
+        agent_path: Any = None,
+    ):
+        self._executor = executor
+        self._registry = registry
+        self.agent_path = agent_path
+
+    def get_job_result(self, job_id: str) -> Any:
+        """Get job result by ID."""
+        return self._executor.get_result(job_id)
+
+    def get_job_status(self, job_id: str) -> Any:
+        """Get job status by ID."""
+        return self._executor.get_status(job_id)
+
+    def get_tool_info(self, tool_name: str) -> Any:
+        """Get tool info by name."""
+        return self._registry.get_tool_info(tool_name)
+
+    def get_tool(self, tool_name: str) -> Any:
+        """Get tool instance by name."""
+        return self._registry.get_tool(tool_name)
 
 
 class Agent:
@@ -74,6 +112,7 @@ class Agent:
         self._init_registry()
         self._init_executor()
         self._init_controller()
+        self._init_commands()
         self._init_input(input_module)
         self._init_output(output_module)
 
@@ -118,6 +157,14 @@ class Agent:
                 return BashTool()
             case "python":
                 return PythonTool()
+            case "read":
+                return ReadTool()
+            case "write":
+                return WriteTool()
+            case "glob":
+                return GlobTool()
+            case "grep":
+                return GrepTool()
             case _:
                 logger.warning("Unknown built-in tool", tool_name=name)
                 return None
@@ -154,6 +201,13 @@ class Agent:
             executor=self.executor,
             registry=self.registry,
         )
+
+    def _init_commands(self) -> None:
+        """Initialize framework commands."""
+        self._commands: dict[str, Any] = {
+            "read": ReadCommand(),
+            "info": InfoCommand(),
+        }
 
     def _init_input(self, custom_input: InputModule | None) -> None:
         """Initialize input module."""
@@ -272,10 +326,12 @@ class Agent:
         # Handle pending commands
         commands = self.output_router.pending_commands
         for cmd in commands:
-            logger.debug("Command processed", command=cmd.command)
+            await self._handle_command(cmd)
 
     async def _handle_tool_calls(self, tool_calls: list[ToolCallEvent]) -> None:
-        """Execute tool calls and feed results back to controller."""
+        """Execute all tool calls and feed combined results back to controller."""
+        results: list[str] = []
+
         for tool_call in tool_calls:
             logger.info("Executing tool", tool_name=tool_call.name)
 
@@ -287,20 +343,76 @@ class Agent:
                 result = await self.executor.wait_for(job_id, timeout=60.0)
 
                 if result:
-                    # Create completion event
-                    completion = create_tool_complete_event(
-                        job_id=job_id,
-                        output=result.output[:2000] if result.output else "",
-                        success=result.success,
-                    )
-
-                    # Process the result through controller
-                    await self._process_event(completion)
+                    # Format result for context
+                    output = result.output[:2000] if result.output else ""
+                    if result.error:
+                        results.append(
+                            f"## {tool_call.name} ({job_id}) - ERROR\n{result.error}\n{output}"
+                        )
+                    else:
+                        status = (
+                            "OK"
+                            if result.exit_code == 0
+                            else f"exit={result.exit_code}"
+                        )
+                        results.append(
+                            f"## {tool_call.name} ({job_id}) - {status}\n{output}"
+                        )
 
             except Exception as e:
                 logger.error(
                     "Tool execution failed", tool_name=tool_call.name, error=str(e)
                 )
+                results.append(f"## {tool_call.name} - FAILED\n{str(e)}")
+
+        # Send combined results back to controller (single event)
+        if results:
+            combined_content = "\n\n".join(results)
+            completion = create_tool_complete_event(
+                job_id="batch",
+                content=combined_content,
+                exit_code=0,
+                error=None,
+            )
+            await self._process_event(completion)
+
+    async def _handle_command(self, cmd: CommandEvent) -> None:
+        """Execute a framework command and feed result back to controller."""
+        logger.debug("Executing command", command=cmd.command)
+
+        command_handler = self._commands.get(cmd.command)
+        if command_handler is None:
+            logger.warning("Unknown command", command=cmd.command)
+            return
+
+        try:
+            # Create command context with access to job store, registry, and agent path
+            context = _CommandContext(
+                executor=self.executor,
+                registry=self.registry,
+                agent_path=self.config.agent_path,
+            )
+
+            # Execute command
+            result = await command_handler.execute(cmd.args, context)
+
+            if result.content:
+                # Inject command result as system message
+                completion = TriggerEvent(
+                    type="command_result",
+                    content=result.content,
+                    context={"command": cmd.command},
+                )
+                await self._process_event(completion)
+            elif result.error:
+                logger.warning(
+                    "Command error",
+                    command=cmd.command,
+                    error=result.error,
+                )
+
+        except Exception as e:
+            logger.error("Command execution failed", command=cmd.command, error=str(e))
 
     @property
     def is_running(self) -> bool:

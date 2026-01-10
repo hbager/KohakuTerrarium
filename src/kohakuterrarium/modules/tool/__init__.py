@@ -6,6 +6,10 @@ Exports:
 - BaseTool: Base class for tools
 - BashTool: Shell command execution
 - PythonTool: Python code execution
+- ReadTool: File reading
+- WriteTool: File writing
+- GlobTool: File pattern matching
+- GrepTool: Content search
 """
 
 from kohakuterrarium.modules.tool.base import (
@@ -17,6 +21,12 @@ from kohakuterrarium.modules.tool.base import (
     ToolResult,
 )
 from kohakuterrarium.modules.tool.bash import BashTool, PythonTool
+from kohakuterrarium.modules.tool.file_tools import (
+    GlobTool,
+    GrepTool,
+    ReadTool,
+    WriteTool,
+)
 
 __all__ = [
     # Protocol and base
@@ -29,4 +39,8 @@ __all__ = [
     # Implementations
     "BashTool",
     "PythonTool",
+    "ReadTool",
+    "WriteTool",
+    "GlobTool",
+    "GrepTool",
 ]
