@@ -3,13 +3,15 @@ Builtins module - all built-in components for the framework.
 
 Contains:
 - tools: Built-in tool implementations (bash, python, read, write, edit, glob, grep)
-- skills: Skill documentation files (future)
-- inputs: Input modules (future)
-- outputs: Output modules (future)
-- triggers: Trigger modules (future)
-- subagents: Sub-agent definitions (future)
+- subagents: Built-in sub-agent configurations (explore, plan, memory_read, memory_write)
+- skills: Skill documentation files
 """
 
+from kohakuterrarium.builtins.subagents import (
+    BUILTIN_SUBAGENTS,
+    get_builtin_subagent_config,
+    list_builtin_subagents,
+)
 from kohakuterrarium.builtins.tools import (
     BashTool,
     EditTool,
@@ -38,4 +40,8 @@ __all__ = [
     "EditTool",
     "GlobTool",
     "GrepTool",
+    # Sub-agent registry
+    "BUILTIN_SUBAGENTS",
+    "get_builtin_subagent_config",
+    "list_builtin_subagents",
 ]
