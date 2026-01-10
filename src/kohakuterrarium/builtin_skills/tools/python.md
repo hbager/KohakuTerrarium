@@ -18,52 +18,42 @@ Execute Python code in a subprocess and return output.
 
 ## HOW TO USE
 
-```
-##tool##
-name: python
-args:
-  code: |
-    <python code>
-##tool##
+```xml
+<python>code here</python>
 ```
 
 ## Arguments
 
-| Arg | Required | Description |
-|-----|----------|-------------|
-| `code` | Yes | Python code to execute |
+| Arg | Type | Description |
+|-----|------|-------------|
+| code | body | Python code to execute (required) |
 
 ## Examples
 
-```yaml
-# Simple computation
-##tool##
-name: python
-args:
-  code: |
-    result = sum(range(100))
-    print(f"Sum: {result}")
-##tool##
+```xml
+<!-- Simple computation -->
+<python>
+result = sum(range(100))
+print(f"Sum: {result}")
+</python>
 
-# Check packages
-##tool##
-name: python
-args:
-  code: |
-    import sys
-    print(f"Python {sys.version}")
-##tool##
+<!-- Check packages -->
+<python>
+import sys
+print(f"Python {sys.version}")
+</python>
 
-# Data processing
-##tool##
-name: python
-args:
-  code: |
-    import json
-    data = {"name": "test", "values": [1, 2, 3]}
-    print(json.dumps(data, indent=2))
-##tool##
+<!-- Data processing -->
+<python>
+import json
+data = {"name": "test", "values": [1, 2, 3]}
+print(json.dumps(data, indent=2))
+</python>
 ```
+
+## Output Format
+
+Returns stdout output from the Python process.
 
 ## LIMITATIONS
 

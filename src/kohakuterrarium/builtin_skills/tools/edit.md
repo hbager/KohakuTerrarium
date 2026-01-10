@@ -1,99 +1,118 @@
 ---
 name: edit
-description: Edit file by replacing text (string replacement)
+description: Edit file using unified diff format
 category: builtin
-tags: [file, io, edit]
+tags: [file, io, edit, diff, patch]
 ---
 
 # edit
 
-Edit file by finding and replacing text. Requires unique match.
+Apply unified diff patches to modify files precisely.
 
 ## WHEN TO USE
 
 - Modifying existing code (functions, classes, etc.)
 - Fixing bugs in existing files
-- Adding/removing lines in specific locations
-- Updating config values
+- Adding/removing lines at specific locations
+- Making targeted, precise changes
 
 ## HOW TO USE
 
-```
-##tool##
-name: edit
-args:
-  path: <file path>
-  old_string: |
-    <exact text to find>
-  new_string: |
-    <replacement text>
-##tool##
+```xml
+<edit path="file_path">
+@@ -start,count +start,count @@
+-removed line
++added line
+ context line
+</edit>
 ```
 
 ## Arguments
 
-| Arg | Required | Description |
-|-----|----------|-------------|
-| `path` | Yes | Path to file |
-| `old_string` | Yes | Exact text to find (must be unique) |
-| `new_string` | Yes | Text to replace with |
+| Arg | Type | Description |
+|-----|------|-------------|
+| `path` | attribute | Path to file (required) |
+| content | body | Unified diff content |
+
+## Diff Format
+
+Standard unified diff format:
+
+```
+@@ -start,count +start,count @@
+```
+
+- **`-start,count`**: Starting line and number of lines in original
+- **`+start,count`**: Starting line and number of lines in new version
+- Lines starting with `-` are **removed**
+- Lines starting with `+` are **added**
+- Lines starting with ` ` (space) are **context** (must match exactly)
 
 ## Examples
 
-```yaml
-# Replace a function
-##tool##
-name: edit
-args:
-  path: src/main.py
-  old_string: |
-    def hello():
-        print("Hi")
-  new_string: |
-    def hello():
-        print("Hello, World!")
-##tool##
+### Replace a function
 
-# Add an import
-##tool##
-name: edit
-args:
-  path: src/utils.py
-  old_string: |
-    import os
-  new_string: |
-    import os
-    import sys
-##tool##
+```xml
+<edit path="src/main.py">
+@@ -5,3 +5,3 @@
+-def hello():
+-    print("Hi")
++def hello():
++    print("Hello, World!")
+</edit>
+```
 
-# Fix a bug
-##tool##
-name: edit
-args:
-  path: src/calc.py
-  old_string: |
-    return a + b
-  new_string: |
-    return a * b
-##tool##
+### Add import after existing import
+
+```xml
+<edit path="src/utils.py">
+@@ -1,1 +1,2 @@
+ import os
++import sys
+</edit>
+```
+
+### Delete lines
+
+```xml
+<edit path="src/old.py">
+@@ -10,3 +10,1 @@
+ # Keep this comment
+-# Delete this
+-# And this
+</edit>
+```
+
+### Multiple changes in one diff
+
+```xml
+<edit path="src/app.py">
+@@ -1,2 +1,3 @@
+ import os
++import json
+ import sys
+@@ -20,2 +21,2 @@
+-    return None
++    return {}
+</edit>
 ```
 
 ## Output Format
 
 ```
-Edited /path/to/file.py: replaced 3 lines with 5 lines (+2 lines)
+Edited /path/to/file.py
+  2 hunk(s) applied
+  +5 -3 lines
 ```
-
-## LIMITATIONS
-
-- `old_string` must exist exactly ONCE in file
-- If multiple matches found, add more context lines
-- Whitespace and indentation must match exactly
 
 ## TIPS
 
-- Use `read` first to see exact file content
-- Include surrounding lines if match isn't unique
-- Preserve original indentation exactly
-- Use YAML multiline (`|`) for multi-line content
-- For new files, use `write` tool instead
+- Use `<read path="file.py"/>` first to see exact line numbers
+- Include context lines (` ` prefix) to anchor changes
+- Line numbers in `@@` header are 1-indexed
+- Multiple hunks can be in one diff
+
+## LIMITATIONS
+
+- Context lines must match the file exactly
+- Cannot create new files (use `write` for that)

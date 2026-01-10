@@ -18,44 +18,39 @@ Execute shell commands and return output.
 
 ## HOW TO USE
 
-```
-##tool##
-name: bash
-args:
-  command: <shell command>
-##tool##
+```xml
+<bash>command here</bash>
 ```
 
 ## Arguments
 
-| Arg | Required | Description |
-|-----|----------|-------------|
-| `command` | Yes | Shell command to execute |
+| Arg | Type | Description |
+|-----|------|-------------|
+| command | body | Shell command to execute (required) |
 
 ## Examples
 
-```yaml
-# List files
-##tool##
-name: bash
-args:
-  command: ls -la
-##tool##
+```xml
+<!-- List files -->
+<bash>ls -la</bash>
 
-# Git status
-##tool##
-name: bash
-args:
-  command: git status
-##tool##
+<!-- Git status -->
+<bash>git status</bash>
 
-# Run tests
-##tool##
-name: bash
-args:
-  command: pytest tests/ -v
-##tool##
+<!-- Run tests -->
+<bash>pytest tests/ -v</bash>
+
+<!-- Multi-line script -->
+<bash>
+cd /tmp
+ls -la
+pwd
+</bash>
 ```
+
+## Output Format
+
+Returns stdout and stderr combined. Exit code is included in result.
 
 ## LIMITATIONS
 

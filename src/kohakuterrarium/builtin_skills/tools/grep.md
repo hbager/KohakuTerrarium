@@ -18,55 +18,37 @@ Search file contents for a pattern using regex.
 
 ## HOW TO USE
 
-```
-##tool##
-name: grep
-args:
-  pattern: <regex pattern>
-  path: <directory, optional>
-  glob: <file filter, optional>
-  limit: <max matches, optional>
-  ignore_case: <true/false, optional>
-##tool##
+```xml
+<grep>pattern</grep>
+
+<!-- With optional parameters -->
+<grep path="src/" glob="**/*.py" limit="50" ignore_case="true">pattern</grep>
 ```
 
 ## Arguments
 
-| Arg | Required | Description |
-|-----|----------|-------------|
-| `pattern` | Yes | Regex pattern to search |
-| `path` | No | Directory to search (default: cwd) |
-| `glob` | No | File pattern filter (default: `**/*`) |
-| `limit` | No | Max matches (default: 50) |
-| `ignore_case` | No | Case-insensitive (default: false) |
+| Arg | Type | Description |
+|-----|------|-------------|
+| pattern | body | Regex pattern to search (required) |
+| path | attribute | Directory to search (default: cwd) |
+| glob | attribute | File pattern filter (default: `**/*`) |
+| limit | attribute | Max matches (default: 50) |
+| ignore_case | attribute | Case-insensitive (default: false) |
 
 ## Examples
 
-```yaml
-# Find function definitions
-##tool##
-name: grep
-args:
-  pattern: "def \\w+\\("
-  glob: "**/*.py"
-##tool##
+```xml
+<!-- Find function definitions -->
+<grep glob="**/*.py">def \w+\(</grep>
 
-# Case-insensitive search
-##tool##
-name: grep
-args:
-  pattern: "todo|fixme"
-  ignore_case: true
-##tool##
+<!-- Case-insensitive search -->
+<grep ignore_case="true">todo|fixme</grep>
 
-# Search specific directory
-##tool##
-name: grep
-args:
-  pattern: "import.*react"
-  path: src/components
-  glob: "*.tsx"
-##tool##
+<!-- Search specific directory -->
+<grep path="src/components" glob="*.tsx">import.*react</grep>
+
+<!-- Search in single file -->
+<grep path="src/main.py">import</grep>
 ```
 
 ## Output Format
@@ -74,16 +56,18 @@ args:
 ```
 src/main.py:10: def main():
 src/utils.py:25: def helper(x):
+
+(2 matches in 15 files)
 ```
 
 ## LIMITATIONS
 
-- Regex syntax (escape special chars with `\\`)
+- Regex syntax (escape special chars with `\`)
 - Large codebases may need file filter
 
 ## TIPS
 
 - Use `glob` arg to narrow file types
-- Escape regex special chars: `\\(`, `\\[`, `\\.`
+- Escape regex special chars: `\(`, `\[`, `\.`
 - Use `read` after grep to examine context
-- For simple text, `ignore_case: true` helps
+- For simple text, `ignore_case="true"` helps

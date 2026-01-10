@@ -18,42 +18,35 @@ Read file contents with optional line range.
 
 ## HOW TO USE
 
-```
-##tool##
-name: read
-args:
-  path: <file path>
-  offset: <start line, optional>
-  limit: <max lines, optional>
-##tool##
+```xml
+<read path="file_path"/>
+
+<!-- Or with optional parameters -->
+<read path="file_path" offset="10" limit="20"/>
+
+<!-- Alternative: path as content -->
+<read>file_path</read>
 ```
 
 ## Arguments
 
-| Arg | Required | Description |
-|-----|----------|-------------|
-| `path` | Yes | Path to file |
-| `offset` | No | Starting line (0-based, default: 0) |
-| `limit` | No | Max lines to read (default: all) |
+| Arg | Type | Description |
+|-----|------|-------------|
+| path | attribute/content | Path to file (required) |
+| offset | attribute | Starting line (0-based, default: 0) |
+| limit | attribute | Max lines to read (default: all) |
 
 ## Examples
 
-```yaml
-# Read entire file
-##tool##
-name: read
-args:
-  path: src/main.py
-##tool##
+```xml
+<!-- Read entire file -->
+<read path="src/main.py"/>
 
-# Read specific section
-##tool##
-name: read
-args:
-  path: src/main.py
-  offset: 10
-  limit: 20
-##tool##
+<!-- Read lines 10-30 -->
+<read path="src/main.py" offset="10" limit="20"/>
+
+<!-- Alternative format -->
+<read>src/main.py</read>
 ```
 
 ## Output Format

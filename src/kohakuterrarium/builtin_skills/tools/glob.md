@@ -17,23 +17,20 @@ Find files matching a glob pattern.
 
 ## HOW TO USE
 
-```
-##tool##
-name: glob
-args:
-  pattern: <glob pattern>
-  path: <base directory, optional>
-  limit: <max results, optional>
-##tool##
+```xml
+<glob>pattern</glob>
+
+<!-- Or with optional parameters -->
+<glob path="base_dir" limit="50">pattern</glob>
 ```
 
 ## Arguments
 
-| Arg | Required | Description |
-|-----|----------|-------------|
-| `pattern` | Yes | Glob pattern (e.g., `**/*.py`) |
-| `path` | No | Base directory (default: cwd) |
-| `limit` | No | Max results (default: 100) |
+| Arg | Type | Description |
+|-----|------|-------------|
+| pattern | body | Glob pattern (required) |
+| path | attribute | Base directory (default: cwd) |
+| limit | attribute | Max results (default: 100) |
 
 ## Pattern Syntax
 
@@ -46,28 +43,18 @@ args:
 
 ## Examples
 
-```yaml
-# All Python files
-##tool##
-name: glob
-args:
-  pattern: "**/*.py"
-##tool##
+```xml
+<!-- All Python files -->
+<glob>**/*.py</glob>
 
-# Files in specific dir
-##tool##
-name: glob
-args:
-  pattern: "*.ts"
-  path: src/components
-##tool##
+<!-- Files in specific dir -->
+<glob path="src/components">*.ts</glob>
 
-# Config files
-##tool##
-name: glob
-args:
-  pattern: "**/*.{json,yaml,toml}"
-##tool##
+<!-- Config files -->
+<glob>**/*.{json,yaml,toml}</glob>
+
+<!-- With limit -->
+<glob path="." limit="50">**/*.md</glob>
 ```
 
 ## Output Format

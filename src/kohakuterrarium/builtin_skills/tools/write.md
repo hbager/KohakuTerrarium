@@ -17,50 +17,38 @@ Write content to a file. Creates if doesn't exist, overwrites if it does.
 
 ## HOW TO USE
 
-```
-##tool##
-name: write
-args:
-  path: <file path>
-  content: |
-    <file content>
-##tool##
+```xml
+<write path="file_path">
+content here
+</write>
 ```
 
 ## Arguments
 
-| Arg | Required | Description |
-|-----|----------|-------------|
-| `path` | Yes | Path to file |
-| `content` | Yes | Content to write |
+| Arg | Type | Description |
+|-----|------|-------------|
+| path | attribute | Path to file (required) |
+| content | body | Content to write |
 
 ## Examples
 
-```yaml
-# Create Python file
-##tool##
-name: write
-args:
-  path: src/hello.py
-  content: |
-    def hello():
-        print("Hello, World!")
+```xml
+<!-- Create Python file -->
+<write path="src/hello.py">
+def hello():
+    print("Hello, World!")
 
-    if __name__ == "__main__":
-        hello()
-##tool##
+if __name__ == "__main__":
+    hello()
+</write>
 
-# Create config
-##tool##
-name: write
-args:
-  path: config.json
-  content: |
-    {
-      "name": "my-app",
-      "version": "1.0.0"
-    }
-##tool##
+<!-- Create config -->
+<write path="config.json">
+{
+  "name": "my-app",
+  "version": "1.0.0"
+}
+</write>
 ```
 
 ## Output Format
@@ -77,5 +65,5 @@ Created /path/to/file.py (15 lines, 342 bytes)
 ## TIPS
 
 - Use `read` first to understand existing content
-- Use YAML multiline syntax (`|`) for content
-- For partial edits, use `edit` tool (when available)
+- For partial edits, use `edit` tool
+- Content is written exactly as provided
