@@ -264,8 +264,6 @@ class SubAgent:
         self.conversation = Conversation()
         system_prompt = self._build_system_prompt()
         self.conversation.append("system", system_prompt)
-
-        # Add task as user message
         self.conversation.append("user", task)
 
         output_parts: list[str] = []
