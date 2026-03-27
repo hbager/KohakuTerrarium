@@ -132,12 +132,33 @@ class BlockEndEvent:
     error: str | None = None
 
 
+@dataclass
+class CommandResultEvent:
+    """
+    Result of an inline framework command.
+
+    NOT LLM output - this is injected by the controller after executing
+    a command (read, info, wait, jobs). Should be routed to agent feedback
+    context, NOT to user output.
+
+    Attributes:
+        command: Command that was executed
+        content: Result content (empty if error)
+        error: Error message (empty if success)
+    """
+
+    command: str
+    content: str = ""
+    error: str | None = None
+
+
 # Union type for all parse events
 ParseEvent = (
     TextEvent
     | ToolCallEvent
     | SubAgentCallEvent
     | CommandEvent
+    | CommandResultEvent
     | OutputEvent
     | BlockStartEvent
     | BlockEndEvent

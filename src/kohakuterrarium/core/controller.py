@@ -33,6 +33,7 @@ from kohakuterrarium.llm.base import LLMProvider
 from kohakuterrarium.modules.tool.base import ToolInfo
 from kohakuterrarium.parsing import (
     CommandEvent,
+    CommandResultEvent,
     ParseEvent,
     ParserConfig,
     StreamParser,
@@ -380,15 +381,21 @@ class Controller:
             parse_events = self._parser.feed(chunk)
 
             for event in parse_events:
-                # Handle commands inline
+                # Commands execute inline; yield result as CommandResultEvent
+                # (NOT TextEvent - command results are internal feedback,
+                # not user-facing output)
                 if isinstance(event, CommandEvent):
                     result = await self._handle_command(event)
                     if result.content:
-                        # Inject command result as text
-                        yield TextEvent(f"\n{result.content}\n")
+                        assistant_content += f"\n{result.content}\n"
+                        yield CommandResultEvent(
+                            command=event.command, content=result.content
+                        )
                     elif result.error:
-                        # Also surface errors to the model
-                        yield TextEvent(f"\n[Command Error: {result.error}]\n")
+                        assistant_content += f"\n[Command Error: {result.error}]\n"
+                        yield CommandResultEvent(
+                            command=event.command, error=result.error
+                        )
                 else:
                     yield event
 
@@ -397,9 +404,13 @@ class Controller:
             if isinstance(event, CommandEvent):
                 result = await self._handle_command(event)
                 if result.content:
-                    yield TextEvent(f"\n{result.content}\n")
+                    assistant_content += f"\n{result.content}\n"
+                    yield CommandResultEvent(
+                        command=event.command, content=result.content
+                    )
                 elif result.error:
-                    yield TextEvent(f"\n[Command Error: {result.error}]\n")
+                    assistant_content += f"\n[Command Error: {result.error}]\n"
+                    yield CommandResultEvent(command=event.command, error=result.error)
             else:
                 yield event
 

@@ -22,6 +22,7 @@ from kohakuterrarium.core.events import (
 from kohakuterrarium.core.job import JobResult
 from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode
 from kohakuterrarium.parsing import (
+    CommandResultEvent,
     SubAgentCallEvent,
     ToolCallEvent,
 )
@@ -158,9 +159,33 @@ class AgentHandlersMixin:
                         job_id=job_id,
                         direct=is_direct,
                     )
+                    # Notify output of tool activity
+                    self.output_router.default_output.on_activity(
+                        "tool_start",
+                        f"[{parse_event.name}] {job_id} ({'direct' if is_direct else 'background'})",
+                    )
                 elif isinstance(parse_event, SubAgentCallEvent):
                     job_id = await self._start_subagent_async(parse_event)
                     new_subagent_ids.append(job_id)
+                    # Notify output of sub-agent activity
+                    task_preview = parse_event.args.get("task", "")[:60]
+                    self.output_router.default_output.on_activity(
+                        "subagent_start",
+                        f"[{parse_event.name}] {job_id}: {task_preview}",
+                    )
+                elif isinstance(parse_event, CommandResultEvent):
+                    # Command results are internal feedback for the LLM,
+                    # NOT user-facing output. Route to activity/logs only.
+                    if parse_event.error:
+                        self.output_router.default_output.on_activity(
+                            "command_error",
+                            f"[{parse_event.command}] {parse_event.error}",
+                        )
+                    else:
+                        self.output_router.default_output.on_activity(
+                            "command_done",
+                            f"[{parse_event.command}] OK",
+                        )
                 else:
                     await self.output_router.route(parse_event)
 
@@ -372,17 +397,26 @@ class AgentHandlersMixin:
             if isinstance(result, Exception):
                 result_strs.append(f"## {job_id} - FAILED\n{str(result)}")
                 logger.info("Tool %s: failed", tool_name)
+                self.output_router.default_output.on_activity(
+                    "tool_error", f"[{tool_name}] FAILED: {result}"
+                )
             elif result is not None:
                 output = result.output[:TOOL_RESULT_MAX_CHARS] if result.output else ""
                 if result.error:
                     result_strs.append(f"## {job_id} - ERROR\n{result.error}\n{output}")
                     logger.info("Tool %s: error", tool_name)
+                    self.output_router.default_output.on_activity(
+                        "tool_error", f"[{tool_name}] ERROR: {result.error}"
+                    )
                 else:
                     status = (
                         "OK" if result.exit_code == 0 else f"exit={result.exit_code}"
                     )
                     result_strs.append(f"## {job_id} - {status}\n{output}")
                     logger.info("Tool %s: done", tool_name)
+                    self.output_router.default_output.on_activity(
+                        "tool_done", f"[{tool_name}] {status}"
+                    )
 
         return "\n\n".join(result_strs) if result_strs else ""
 
@@ -433,10 +467,12 @@ class AgentHandlersMixin:
             status = self.executor.get_status(job_id)
             if status:
                 if status.is_complete:
-                    # Completed - include result and DON'T add to remaining
                     result = self.executor.get_result(job_id)
                     if result and result.error:
                         status_lines.append(f"- `{job_id}`: ERROR - {result.error}")
+                        self.output_router.default_output.on_activity(
+                            "tool_error", f"[{job_id}] ERROR: {result.error}"
+                        )
                     else:
                         output = (
                             result.output[:STATUS_PREVIEW_MAX_CHARS]
@@ -444,30 +480,39 @@ class AgentHandlersMixin:
                             else ""
                         )
                         status_lines.append(f"- `{job_id}`: DONE\n{output}")
+                        self.output_router.default_output.on_activity(
+                            "tool_done", f"[{job_id}] DONE"
+                        )
                 else:
-                    # Still running - report status and keep tracking
                     status_lines.append(f"- `{job_id}`: {status.state.value}")
                     remaining_bg.append(job_id)
 
         # Check sub-agents
         for job_id in subagent_job_ids:
             if job_id.startswith("error_"):
-                # Error during spawn - don't keep tracking
                 status_lines.append(f"- `{job_id}`: ERROR - Sub-agent not registered")
+                self.output_router.default_output.on_activity(
+                    "subagent_error", f"[{job_id}] Not registered"
+                )
                 continue
 
             result = self.subagent_manager.get_result(job_id)
             if result:
-                # Completed - include result and DON'T add to remaining
                 if result.success:
                     output = result.truncated(max_chars=STATUS_PREVIEW_MAX_CHARS)
                     status_lines.append(
                         f"- `{job_id}`: DONE (turns={result.turns})\n{output}"
                     )
+                    self.output_router.default_output.on_activity(
+                        "subagent_done",
+                        f"[{job_id}] DONE (turns={result.turns})",
+                    )
                 else:
                     status_lines.append(f"- `{job_id}`: ERROR - {result.error}")
+                    self.output_router.default_output.on_activity(
+                        "subagent_error", f"[{job_id}] ERROR: {result.error}"
+                    )
             else:
-                # Still running - report status and keep tracking
                 status_lines.append(f"- `{job_id}`: RUNNING")
                 remaining_sa.append(job_id)
 
