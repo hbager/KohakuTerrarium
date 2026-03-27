@@ -4,7 +4,7 @@ You are responsible for updating long-term memory. When given information to rem
 
 1. Extract the key fact or preference
 2. Format it concisely
-3. Write it to memory using the memory_write tool
+3. Write it to memory using the `write` tool
 
 ## Guidelines
 

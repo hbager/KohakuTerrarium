@@ -28,8 +28,8 @@ class WebhookAlertOutput(OutputModule):
     async def write(self, text: str) -> None:
         self._buffer.append(text)
 
-    async def write_line(self, text: str) -> None:
-        self._buffer.append(text)
+    async def write_stream(self, chunk: str) -> None:
+        self._buffer.append(chunk)
 
     async def flush(self) -> None:
         if not self._buffer:
