@@ -6,7 +6,6 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/license-Apache--2.0-green" alt="License">
-  <img src="https://img.shields.io/badge/tests-613%20passing-brightgreen" alt="Tests">
 </p>
 
 ---
@@ -224,7 +223,6 @@ asyncio.run(main())
 - **Hot-plug**: Add/remove creatures and channels to running terrariums.
 - **TUI**: Full terminal UI with inline tool display, status panel, and animation.
 - **HTTP API**: FastAPI with 18 REST + 2 WebSocket endpoints.
-- **613 tests passing**.
 
 ## Project Structure
 
