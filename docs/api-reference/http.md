@@ -30,7 +30,7 @@ Start a terrarium from a config path.
 **Request:**
 ```json
 {
-  "config_path": "agents/novel_terrarium/"
+  "config_path": "examples/terrariums/novel_terrarium/"
 }
 ```
 
@@ -46,7 +46,7 @@ Start a terrarium from a config path.
 ```bash
 curl -X POST http://localhost:8000/api/terrariums \
   -H "Content-Type: application/json" \
-  -d '{"config_path": "agents/novel_terrarium/"}'
+  -d '{"config_path": "examples/terrariums/novel_terrarium/"}'
 ```
 
 ### List Terrariums
@@ -130,7 +130,7 @@ POST /api/terrariums/{terrarium_id}/creatures
 ```json
 {
   "name": "critic",
-  "config_path": "agents/novel_terrarium/creatures/critic/",
+  "config_path": "examples/terrariums/novel_terrarium/creatures/critic/",
   "listen_channels": ["draft"],
   "send_channels": ["feedback"]
 }
@@ -214,7 +214,7 @@ POST /api/agents
 **Request:**
 ```json
 {
-  "config_path": "agents/swe_agent/"
+  "config_path": "examples/agent-apps/swe_agent/"
 }
 ```
 

@@ -50,7 +50,7 @@ Standalone agents have a Session but no Environment. All channels are private.
 from kohakuterrarium.core.agent import Agent
 
 # Session is auto-created from config name
-agent = Agent.from_path("agents/swe_agent")
+agent = Agent.from_path("examples/agent-apps/swe_agent")
 # agent.session = Session(key="swe_agent")
 # agent.environment = None
 ```
@@ -63,7 +63,7 @@ from kohakuterrarium.core.session import Session
 
 # Create a session with a unique key (for multi-user)
 session = Session(key="user_123_swe_agent")
-agent = Agent.from_path("agents/swe_agent", session=session)
+agent = Agent.from_path("examples/agent-apps/swe_agent", session=session)
 
 # Agent uses this session's scratchpad and channels
 agent.session.scratchpad.set("task", "fix auth bug")
@@ -76,7 +76,7 @@ The terrarium runtime creates an Environment automatically. Each creature gets i
 ```python
 from kohakuterrarium.terrarium import TerrariumRuntime, load_terrarium_config
 
-config = load_terrarium_config("agents/novel_terrarium")
+config = load_terrarium_config("examples/terrariums/novel_terrarium")
 runtime = TerrariumRuntime(config)
 await runtime.start()
 
@@ -115,7 +115,7 @@ runtime = TerrariumRuntime(config, environment=env)
 await runtime.start()
 
 # Or pass to standalone agent
-agent = Agent.from_path("agents/swe_agent", environment=env, session=env.get_session("my_agent"))
+agent = Agent.from_path("examples/agent-apps/swe_agent", environment=env, session=env.get_session("my_agent"))
 ```
 
 ### Multi-User Isolation
@@ -128,10 +128,10 @@ from kohakuterrarium.serving import KohakuManager
 manager = KohakuManager()
 
 # User A creates a terrarium - gets unique environment
-tid_a = await manager.create_terrarium("agents/novel_terrarium")
+tid_a = await manager.create_terrarium("examples/terrariums/novel_terrarium")
 
 # User B creates the same terrarium - gets a DIFFERENT environment
-tid_b = await manager.create_terrarium("agents/novel_terrarium")
+tid_b = await manager.create_terrarium("examples/terrariums/novel_terrarium")
 
 # No collision: different shared channels, different creature sessions
 ```

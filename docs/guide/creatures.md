@@ -9,13 +9,13 @@ Every creature lives in the `creatures/` directory at the project root. Each cre
 - `config.yaml` -- tools, sub-agents, controller settings
 - `prompts/system.md` -- system prompt additions
 
-Agents in `agents/` point to a creature via `base_config` and inherit everything. The agent only needs to specify what differs (model, API key, input/output).
+Agents in `examples/agent-apps/` point to a creature via `base_config` and inherit everything. The agent only needs to specify what differs (model, API key, input/output).
 
 ## Creature Hierarchy
 
 ```
 creatures/
-  general/          <-- Base: 16 tools, 6 sub-agents, core personality
+  general/          <-- Base: 23 tools (16 general + 7 terrarium management), 10 sub-agents (6 core + 4 additional), core personality
     |
     +-- swe/        <-- Software engineering workflow, git safety
     +-- reviewer/   <-- Code review, severity levels, structured feedback
@@ -59,8 +59,10 @@ The prompts are joined with double newlines. The result is a single coherent sys
 
 The foundation creature. Handles 80% of tasks without specialization.
 
-- **Tools (16)**: bash, read, write, edit, glob, grep, tree, think, scratchpad, ask_user, http, json_read, json_write, send_message, wait_channel, python
-- **Sub-agents (6)**: explore, plan, worker, critic, summarize, research
+- **Tools (16 general)**: bash, read, write, edit, glob, grep, tree, think, scratchpad, ask_user, http, json_read, json_write, send_message, wait_channel, python
+  - Note: The root creature adds 7 terrarium management tools (terrarium_create, terrarium_status, terrarium_stop, terrarium_send, terrarium_observe, creature_start, creature_stop), bringing the total to 23.
+- **Sub-agents (6 core)**: explore, plan, worker, critic, summarize, research
+  - Note: 4 additional sub-agents are available (coordinator, memory_read, memory_write, response) for specialized use cases like channel coordination, memory management, and output delegation.
 - **Prompt sections**: Identity, Communication, Approaching Tasks, Progress Updates, Tool Usage, Output, Safety
 
 ### SWE
@@ -105,7 +107,7 @@ Terrarium manager. Inherits from general and adds multi-agent management tools.
 ### Minimal Agent (inheriting from a creature)
 
 ```yaml
-# agents/my_agent/config.yaml
+# examples/agent-apps/my_agent/config.yaml
 name: my_agent
 version: "1.0"
 base_config: creatures/swe
@@ -141,7 +143,7 @@ The custom tool is added on top of general's 16 tools.
 
 ### Agent with Custom Prompt Additions
 
-Create `agents/my_agent/prompts/system.md` with your additions:
+Create `examples/agent-apps/my_agent/prompts/system.md` with your additions:
 
 ```markdown
 ## My Domain

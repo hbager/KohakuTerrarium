@@ -25,7 +25,7 @@ manager = KohakuManager()
 
 ```python
 # Create and start an agent from a config path
-agent_id = await manager.create_agent(config_path="agents/swe_agent")
+agent_id = await manager.create_agent(config_path="examples/agent-apps/swe_agent")
 
 # Get status
 status = manager.get_agent_status(agent_id)
@@ -46,7 +46,7 @@ await manager.stop_agent(agent_id)
 
 ```python
 # Create and start a terrarium
-tid = await manager.create_terrarium(config_path="agents/novel_terrarium")
+tid = await manager.create_terrarium(config_path="examples/terrariums/novel_terrarium")
 
 # Get status (creatures, channels, running state)
 status = manager.get_terrarium_status(tid)
@@ -59,7 +59,7 @@ from kohakuterrarium.terrarium.config import CreatureConfig
 
 config = CreatureConfig(
     name="editor",
-    config_path="agents/editor_agent",
+    config_path="examples/agent-apps/editor_agent",
     listen_channels=["draft"],
     send_channels=["feedback"],
 )
@@ -88,7 +88,7 @@ await manager.shutdown()
 from kohakuterrarium.serving import AgentSession
 
 # Create from config path (starts the agent automatically)
-session = await AgentSession.from_path("agents/swe_agent")
+session = await AgentSession.from_path("examples/agent-apps/swe_agent")
 
 # Stream chat
 async for chunk in session.chat("What files are in this directory?"):

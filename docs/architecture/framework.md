@@ -19,7 +19,7 @@ The top-level orchestrator that wires all components together.
 
 **Lifecycle:**
 ```python
-agent = Agent.from_path("agents/my_agent")  # Load config
+agent = Agent.from_path("examples/agent-apps/my_agent")  # Load config
 await agent.start()                          # Initialize modules
 await agent.run()                            # Main event loop
 await agent.stop()                           # Cleanup

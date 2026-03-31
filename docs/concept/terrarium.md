@@ -117,4 +117,43 @@ terrarium:
 
 Creatures point to standalone agent configs. The terrarium adds the wiring. The creature configs do not change.
 
+## The Root Agent
+
+A terrarium can optionally declare a `root:` section. This is an inline agent config (same format as any creature config) that sits **outside** the terrarium:
+
+```yaml
+terrarium:
+  name: swe_team
+
+  root:
+    base_config: creatures/root
+    controller:
+      model: gpt-5.4
+      auth_mode: codex-oauth
+      tool_format: native
+    input:
+      type: tui
+    output:
+      type: tui
+      controller_direct: true
+
+  creatures:
+    - name: swe
+      base_config: creatures/swe
+      channels:
+        listen: [tasks]
+        can_send: [results]
+```
+
+The root agent is NOT a creature inside the terrarium. It does not participate in channels and the terrarium does not inject triggers or topology into it. Instead, the root agent uses terrarium management tools to control the terrarium from the outside:
+
+- `terrarium_send` -- inject messages into channels (dispatch tasks)
+- `terrarium_observe` -- watch a channel for results (runs in background)
+- `terrarium_status` -- check terrarium and creature status
+- `creature_start` / `creature_stop` -- hot-plug creatures
+
+The root agent is force-given all 7 terrarium tools regardless of its creature config. It is typically built on the `root` creature, which inherits general capabilities.
+
+The root config uses the same inheritance system as any other agent config (`base_config`, controller overrides, I/O overrides). The user talks to the root agent; the root agent orchestrates the team.
+
 See [Configuration Reference](../guide/configuration.md) for all fields. See [Channels](channels.md) for channel types and semantics.

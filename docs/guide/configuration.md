@@ -148,7 +148,9 @@ tools:
     timeout: 30
 ```
 
-**Available built-in tools:**
+**Available built-in tools (23 total):**
+
+**General tools (16):**
 
 | Name | Description | Name | Description |
 |------|-------------|------|-------------|
@@ -160,6 +162,18 @@ tools:
 | `glob` | Find files by pattern | `ask_user` | Prompt user for input |
 | `grep` | Regex search in files | `json_read` | Query JSON files |
 | `tree` | Directory structure | `json_write` | Modify JSON files |
+
+**Terrarium management tools (7):** Used by the `root` creature for managing terrariums.
+
+| Name | Description |
+|------|-------------|
+| `terrarium_create` | Create and start a terrarium |
+| `terrarium_status` | Get terrarium status |
+| `terrarium_stop` | Stop a running terrarium |
+| `terrarium_send` | Send a message to a terrarium channel |
+| `terrarium_observe` | Observe terrarium channel traffic |
+| `creature_start` | Start a creature in a terrarium |
+| `creature_stop` | Stop a creature in a terrarium |
 
 ### Sub-Agents Configuration
 
@@ -263,7 +277,7 @@ startup_trigger:
 ### Agent Folder Structure
 
 ```
-agents/my_agent/
+examples/agent-apps/my_agent/
 +-- config.yaml              # Main configuration
 +-- prompts/
 |   +-- system.md            # System prompt
@@ -292,8 +306,8 @@ The runtime looks for `terrarium.yaml` or `terrarium.yml` in the given path:
 ```python
 from kohakuterrarium.terrarium import load_terrarium_config
 
-config = load_terrarium_config("agents/novel_terrarium/")
-config = load_terrarium_config("agents/novel_terrarium/terrarium.yaml")
+config = load_terrarium_config("examples/terrariums/novel_terrarium/")
+config = load_terrarium_config("examples/terrariums/novel_terrarium/terrarium.yaml")
 ```
 
 ### Full YAML Format
@@ -324,10 +338,17 @@ terrarium:
 
 ### Creatures
 
+Creature config supports two approaches:
+- **`config`**: Path to agent config folder (relative to terrarium YAML)
+- **`base_config`**: Reference to a creature template (e.g., `creatures/swe`) with inline overrides
+
+When using `base_config`, the creature inherits tools, sub-agents, and system prompts from the referenced creature, and the terrarium YAML can specify overrides inline (model, temperature, etc.).
+
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `name` | string | Yes | - | Unique name for this creature instance |
-| `config` | path | Yes | - | Path to agent config folder, relative to terrarium YAML |
+| `config` | path | Yes* | - | Path to agent config folder, relative to terrarium YAML |
+| `base_config` | string | Yes* | - | Creature template to inherit from (alternative to `config`) |
 | `channels.listen` | list[string] | No | `[]` | Channel names to receive messages from |
 | `channels.can_send` | list[string] | No | `[]` | Channel names allowed for sending |
 | `output_log` | bool | No | `false` | Enable output log capture |

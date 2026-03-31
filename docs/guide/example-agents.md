@@ -1,8 +1,8 @@
 # Example Agents
 
-This guide walks through the example agents included in the `agents/` folder, explaining their architecture and patterns.
+This guide walks through the example agents included in the `examples/` folder, explaining their architecture and patterns.
 
-## SWE Agent (`agents/swe_agent/`)
+## SWE Agent (`examples/agent-apps/swe_agent/`)
 
 A software engineering assistant similar to Claude Code or Cursor.
 
@@ -65,7 +65,7 @@ output:
 
 ---
 
-## SWE Agent TUI (`agents/swe_agent_tui/`)
+## SWE Agent TUI (`examples/agent-apps/swe_agent_tui/`)
 
 Same as the SWE Agent but uses TUI input/output for a richer terminal experience.
 
@@ -86,7 +86,7 @@ TUI input and output share a `TUISession` instance via `Session.tui` for coordin
 
 ---
 
-## Discord Bot (`agents/discord_bot/`)
+## Discord Bot (`examples/agent-apps/discord_bot/`)
 
 A group chat bot with memory, character, and autonomous triggers.
 
@@ -119,7 +119,7 @@ Plain text = internal thinking (not sent). To send to Discord:
 
 ---
 
-## RP Agent (`agents/rp_agent/`)
+## RP Agent (`examples/agent-apps/rp_agent/`)
 
 A roleplay chatbot with output sub-agent pattern.
 
@@ -151,7 +151,7 @@ User -> Controller (orchestrator) -> memory_read -> context
 
 ---
 
-## Conversational Agent (`agents/conversational/`)
+## Conversational Agent (`examples/agent-apps/conversational/`)
 
 A streaming conversational AI with voice input/output.
 
@@ -239,7 +239,7 @@ Best for: Autonomous monitoring, background processing, event-driven agents
 1. **Choose a pattern** based on your use case
 2. **Create folder structure**:
    ```
-   agents/my_agent/
+   examples/agent-apps/my_agent/
    +-- config.yaml
    +-- prompts/
    |   +-- system.md

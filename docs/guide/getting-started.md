@@ -38,15 +38,15 @@ The fastest way to get started is running one of the included example agents:
 
 ```bash
 # Run the SWE agent (coding assistant, CLI input)
-python -m kohakuterrarium run agents/swe_agent
+kt run examples/agent-apps/swe_agent
 
 # Or with TUI input/output for a richer terminal experience
-python -m kohakuterrarium run agents/swe_agent_tui
+kt run examples/agent-apps/swe_agent_tui
 ```
 
 You'll see output like:
 ```
-[12:00:00] [agent] [INFO] Loading agent from agents/swe_agent
+[12:00:00] [agent] [INFO] Loading agent from examples/agent-apps/swe_agent
 [12:00:00] [agent] [INFO] Agent started
 >
 ```
@@ -63,13 +63,13 @@ Let's create a simple coding assistant from scratch.
 ### 1. Create Agent Folder Structure
 
 ```bash
-mkdir -p agents/my_agent/prompts
-mkdir -p agents/my_agent/memory
+mkdir -p examples/agent-apps/my_agent/prompts
+mkdir -p examples/agent-apps/my_agent/memory
 ```
 
 ### 2. Create Configuration File
 
-Create `agents/my_agent/config.yaml`:
+Create `examples/agent-apps/my_agent/config.yaml`:
 
 ```yaml
 name: my_agent
@@ -111,7 +111,7 @@ tools:
 
 ### 3. Create System Prompt
 
-Create `agents/my_agent/prompts/system.md`:
+Create `examples/agent-apps/my_agent/prompts/system.md`:
 
 ```markdown
 # My Coding Assistant
@@ -133,7 +133,7 @@ You are a helpful coding assistant. You help users with:
 ### 4. Run Your Agent
 
 ```bash
-python -m kohakuterrarium run agents/my_agent
+kt run examples/agent-apps/my_agent
 ```
 
 ## Understanding Tool Calls
@@ -276,7 +276,7 @@ Without the wrapper, text goes to stdout (internal thinking).
 
 ## Custom Tools
 
-Create a custom tool in `agents/my_agent/custom/my_tool.py`:
+Create a custom tool in `examples/agent-apps/my_agent/custom/my_tool.py`:
 
 ```python
 from kohakuterrarium.modules.tool.base import BaseTool, ToolResult, ExecutionMode
@@ -315,7 +315,7 @@ import asyncio
 from kohakuterrarium.core.agent import Agent
 
 async def main():
-    agent = Agent.from_path("agents/my_agent")
+    agent = Agent.from_path("examples/agent-apps/my_agent")
     await agent.start()
 
     try:
@@ -334,10 +334,10 @@ To run a multi-agent terrarium:
 
 ```bash
 # Run the novel writer terrarium
-python -m kohakuterrarium terrarium run agents/novel_terrarium/
+kt terrarium run examples/terrariums/novel_terrarium/
 
 # With channel observation
-python -m kohakuterrarium terrarium run agents/novel_terrarium/ --observe ideas outline
+kt terrarium run examples/terrariums/novel_terrarium/ --observe ideas outline
 ```
 
 See [Terrarium](../concept/terrarium.md) for the concepts and [Configuration Reference](configuration.md) for the terrarium YAML format.
