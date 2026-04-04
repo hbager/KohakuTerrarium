@@ -88,7 +88,9 @@ class SentenceTransformerEmbedder(BaseEmbedder):
             )
 
         logger.info("Loading SentenceTransformer", model=model_name)
-        self._model = SentenceTransformer(model_name, device=device)
+        self._model = SentenceTransformer(
+            model_name, device=device, trust_remote_code=True
+        )
         # Use Matryoshka truncation if dimensions specified
         self._truncate_dim = dimensions
         self.dimensions = dimensions or self._model.get_sentence_embedding_dimension()
