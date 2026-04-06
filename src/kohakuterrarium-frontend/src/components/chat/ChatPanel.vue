@@ -84,7 +84,7 @@
       />
 
       <!-- Messages -->
-      <div ref="messagesEl" class="flex-1 overflow-y-auto px-5 py-4">
+      <div ref="messagesEl" class="flex-1 overflow-y-auto px-5 py-4" @scroll="onMessagesScroll">
         <div class="flex flex-col gap-3">
           <template v-if="chat.currentMessages.length === 0">
             <div class="text-center py-16">
@@ -240,14 +240,50 @@ function autoResize() {
   el.style.height = Math.min(el.scrollHeight, 128) + "px";
 }
 
+// Auto-scroll: track if user is near bottom
+const isNearBottom = ref(true);
+
+function onMessagesScroll() {
+  const el = messagesEl.value;
+  if (!el) return;
+  // "Near bottom" = within 80px of the bottom
+  isNearBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+}
+
+function scrollToBottom() {
+  const el = messagesEl.value;
+  if (el) el.scrollTop = el.scrollHeight;
+}
+
+// Watch messages for changes — auto-scroll if user was at bottom
+watch(
+  () => chat.currentMessages,
+  () => {
+    if (isNearBottom.value) {
+      nextTick(scrollToBottom);
+    }
+  },
+  { deep: true },
+);
+
+// Also scroll when processing starts (KohakUwUing appears)
+watch(
+  () => chat.processing,
+  (val) => {
+    if (val && isNearBottom.value) {
+      nextTick(scrollToBottom);
+    }
+  },
+);
+
 function send() {
   if (!inputText.value.trim()) return;
   chat.send(inputText.value);
   inputText.value = "";
+  isNearBottom.value = true; // force scroll after send
   nextTick(() => {
     if (inputEl.value) inputEl.value.style.height = "auto";
-    if (messagesEl.value)
-      messagesEl.value.scrollTop = messagesEl.value.scrollHeight;
+    scrollToBottom();
   });
 }
 
