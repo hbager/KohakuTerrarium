@@ -453,8 +453,15 @@ export const useChatStore = defineStore("chat", {
       this._instanceType = instance.type;
       this.tabs = [];
       this.messagesByTab = {};
+      this.tokenUsage = {};
       this.runningJobs = {};
-      this.sessionInfo = { sessionId: "", model: "", agentName: "", compactThreshold: 0 };
+      this.unreadCounts = {};
+      this.processing = false;
+      this.sessionInfo = { sessionId: "", model: "", agentName: "", compactThreshold: 0, maxContext: 0 };
+
+      // Reset status store too
+      const statusStore = useStatusStore();
+      statusStore.reset();
 
       if (instance.type === "terrarium") {
         if (instance.has_root) {
