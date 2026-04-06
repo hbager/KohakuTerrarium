@@ -57,7 +57,9 @@ async def add_channel(terrarium_id: str, req: ChannelAdd, manager=Depends(get_ma
 
 
 @router.get("/{terrarium_id}/history/{target}")
-async def terrarium_history(terrarium_id: str, target: str, manager=Depends(get_manager)):
+async def terrarium_history(
+    terrarium_id: str, target: str, manager=Depends(get_manager)
+):
     """Get full history for a creature or root agent.
 
     target: "root" for root agent, or creature name.

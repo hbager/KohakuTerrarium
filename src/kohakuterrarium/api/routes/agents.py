@@ -91,7 +91,9 @@ async def agent_history(agent_id: str, manager=Depends(get_manager)):
 
 
 @router.post("/{agent_id}/model")
-async def switch_agent_model(agent_id: str, req: ModelSwitch, manager=Depends(get_manager)):
+async def switch_agent_model(
+    agent_id: str, req: ModelSwitch, manager=Depends(get_manager)
+):
     """Switch the agent's LLM model mid-session."""
     try:
         model = manager.agent_switch_model(agent_id, req.model)
