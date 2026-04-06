@@ -33,6 +33,9 @@
       <div v-else-if="loading" class="px-3 py-4 text-warm-400 text-center">
         Loading...
       </div>
+      <div v-else class="px-3 py-4 text-warm-400 text-center">
+        No files
+      </div>
     </div>
   </div>
 </template>
@@ -51,13 +54,39 @@ const editor = useEditorStore();
 const tree = computed(() => editor.treeData);
 const loading = ref(false);
 
+// Poll interval for auto-refresh (3 seconds)
+let _pollTimer = null;
+
 watch(
   () => props.root,
   (val) => {
-    if (val) editor.setTreeRoot(val);
+    if (val) {
+      editor.setTreeRoot(val);
+      _startPolling();
+    }
   },
   { immediate: true },
 );
+
+onUnmounted(() => {
+  _stopPolling();
+});
+
+function _startPolling() {
+  _stopPolling();
+  _pollTimer = setInterval(() => {
+    if (editor.treeRoot) {
+      editor.refreshTree();
+    }
+  }, 3000);
+}
+
+function _stopPolling() {
+  if (_pollTimer) {
+    clearInterval(_pollTimer);
+    _pollTimer = null;
+  }
+}
 
 function onSelect(path) {
   emit("select", path);

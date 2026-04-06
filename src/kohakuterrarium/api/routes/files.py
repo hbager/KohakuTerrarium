@@ -57,7 +57,7 @@ _EXT_LANG: dict[str, str] = {
     ".zig": "zig",
 }
 
-# Directories/files to skip in tree listing
+# Directories/files to skip in tree listing (exact names)
 _SKIP_NAMES: set[str] = {
     "__pycache__",
     ".git",
@@ -69,7 +69,6 @@ _SKIP_NAMES: set[str] = {
     ".pytest_cache",
     ".tox",
     ".eggs",
-    "*.egg-info",
 }
 
 # Allowed root directories for path validation
@@ -114,8 +113,6 @@ def _validate_path(path_str: str) -> Path:
 
 def _should_skip(name: str) -> bool:
     """Check if a file/dir name should be skipped in tree listing."""
-    if name.startswith("."):
-        return True
     if name in _SKIP_NAMES:
         return True
     if name.endswith(".egg-info"):
