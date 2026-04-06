@@ -244,6 +244,15 @@ class TUISession:
             SystemNotice(text, command=command, error=error), target=target
         )
 
+    def add_error_block(
+        self, error_type: str, error_msg: str, target: str = ""
+    ) -> None:
+        """Add a processing error block (red, prominent)."""
+        text = f"{error_type}: {error_msg}"
+        self.add_system_notice(
+            text, command="Processing Error", error=True, target=target
+        )
+
     def add_trigger_message(
         self, label: str, content: str = "", target: str = ""
     ) -> None:

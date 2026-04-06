@@ -140,6 +140,7 @@ class SessionOutput(OutputModule):
         "compact_start": "_handle_compact_start",
         "compact_complete": "_handle_compact_complete",
         "processing_complete": "_handle_processing_complete",
+        "processing_error": "_handle_processing_error",
     }
 
     def _record_activity(
@@ -295,6 +296,15 @@ class SessionOutput(OutputModule):
                 "activity": activity_type.replace("subagent_", ""),
                 "detail": metadata.get("detail", detail),
                 "job_id": metadata.get("job_id", ""),
+            },
+        )
+
+    def _handle_processing_error(self, name: str, detail: str, metadata: dict) -> None:
+        self._record(
+            "processing_error",
+            {
+                "error_type": metadata.get("error_type", "Error"),
+                "error": metadata.get("error", detail),
             },
         )
 

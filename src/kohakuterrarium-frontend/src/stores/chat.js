@@ -244,6 +244,14 @@ function _replayEvents(messages, events) {
         });
       } else if (at === "token_usage" || at === "processing_complete") {
         // skip
+      } else if (at === "processing_error") {
+        cur = null;
+        result.push({
+          id: "err_" + result.length, role: "error",
+          errorType: evt.error_type || "Error",
+          content: evt.error || evt.detail || "Unknown error",
+          timestamp: "",
+        });
       } else if (at === "subagent_start") {
         addTool(evt.name, "subagent", evt.args || { info: evt.detail }, evt.job_id);
       } else if (at === "subagent_done") {
@@ -325,6 +333,14 @@ function _replayEvents(messages, events) {
         round: evt.compact_round || evt.round || 0,
         summary: evt.summary || "",
         messagesCompacted: evt.messages_compacted || 0,
+        timestamp: "",
+      });
+    } else if (t === "processing_error") {
+      cur = null;
+      result.push({
+        id: "err_" + result.length, role: "error",
+        errorType: evt.error_type || "Error",
+        content: evt.error || "",
         timestamp: "",
       });
     } else if (t === "token_usage" || t === "processing_complete" || t === "compact_start") {
@@ -708,6 +724,20 @@ export const useChatStore = defineStore("chat", {
           messagesCompacted: data.messages_compacted || 0,
           timestamp: new Date().toISOString(),
         });
+        return;
+      }
+
+      if (at === "processing_error") {
+        const errorType = data.error_type || "Error";
+        const errorMsg = data.error || data.detail || "Unknown error";
+        msgs.push({
+          id: "err_" + Date.now(),
+          role: "error",
+          errorType,
+          content: errorMsg,
+          timestamp: new Date().toISOString(),
+        });
+        this.processing = false;
         return;
       }
 

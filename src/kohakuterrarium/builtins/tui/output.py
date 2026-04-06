@@ -151,6 +151,10 @@ class TUIOutput(BaseOutputModule):
                 self._handle_session_info(metadata)
             case "job_cancelled":
                 self._handle_job_cancelled(t, metadata)
+            case "processing_error":
+                error_type = metadata.get("error_type", "Error")
+                error_msg = metadata.get("error", rest)
+                self._tui.add_error_block(error_type, error_msg, target=t)
             case "interrupt":
                 self._tui.end_streaming(target=self._target)
                 # Only end streaming — do NOT clear running panel or

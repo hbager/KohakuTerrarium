@@ -172,8 +172,14 @@ class AgentHandlersMixin(AgentToolsMixin):
                 error_type=error_type,
                 error=error_msg,
             )
-            await self.output_router.default_output.write(
-                f"\n[System Error] {error_type}: {error_msg}\n"
+            # Emit as structured error activity (TUI/frontend render distinctively)
+            self.output_router.notify_activity(
+                "processing_error",
+                f"[{error_type}] {error_msg}",
+                metadata={
+                    "error_type": error_type,
+                    "error": error_msg,
+                },
             )
         finally:
             self._processing_task = None

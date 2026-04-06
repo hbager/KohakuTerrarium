@@ -7,6 +7,22 @@
     {{ message.content }}
   </div>
 
+  <!-- Processing error -->
+  <div
+    v-else-if="message.role === 'error'"
+    class="rounded-lg bg-coral/8 dark:bg-coral/12 border border-coral/25 dark:border-coral/30 px-4 py-3"
+  >
+    <div class="flex items-center gap-2 mb-1">
+      <span class="text-coral font-bold text-sm">&#x2717;</span>
+      <span class="text-coral dark:text-coral-light font-semibold text-xs">
+        {{ message.errorType || 'Processing Error' }}
+      </span>
+    </div>
+    <div class="text-xs text-coral-shadow dark:text-coral-light/80 font-mono whitespace-pre-wrap">
+      {{ message.content }}
+    </div>
+  </div>
+
   <!-- Trigger fired (expandable if has message content) -->
   <div
     v-else-if="message.role === 'trigger'"
