@@ -32,7 +32,6 @@ async def list_sessions(limit: int = 20):
         try:
             store = SessionStore(path)
             meta = store.load_meta()
-            store.close()
 
             # Read first user message for preview
             preview = ""
@@ -46,6 +45,9 @@ async def list_sessions(limit: int = 20):
                             break
             except Exception:
                 pass
+
+            # Close without updating status/timestamp (read-only access)
+            store.close(update_status=False)
 
             results.append(
                 {

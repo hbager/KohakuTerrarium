@@ -491,12 +491,19 @@ class SessionStore:
         """Flush all caches to disk."""
         self.events.flush_cache()
 
-    def close(self) -> None:
-        """Flush and close all tables."""
-        try:
-            self.update_status("paused")
-        except Exception:
-            pass
+    def close(self, update_status: bool = True) -> None:
+        """Flush and close all tables.
+
+        Args:
+            update_status: If True (default), mark session as paused and
+                update last_active. Set False for read-only access (e.g.,
+                listing sessions) to avoid corrupting timestamps.
+        """
+        if update_status:
+            try:
+                self.update_status("paused")
+            except Exception:
+                pass
         self.events.close()
         self.meta.close()
         self.state.close()
