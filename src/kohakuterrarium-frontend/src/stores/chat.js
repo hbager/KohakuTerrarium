@@ -924,16 +924,20 @@ export const useChatStore = defineStore("chat", {
     /** Promote a running direct task to background via API. */
     async promoteTask(jobId) {
       if (!this._instanceId || !this._instanceType) return;
+      // Mark locally immediately for responsiveness (button disappears)
+      if (this.runningJobs[jobId]) {
+        this.runningJobs[jobId].promotable = false;
+      }
       try {
-        const api = this._instanceType === "agent"
-          ? (await import("@/utils/api")).agentAPI
-          : (await import("@/utils/api")).terrariumAPI;
-        if (this._instanceType === "agent") {
-          await api.promote(this._instanceId, jobId);
-        }
-        // Mark locally immediately for responsiveness
-        if (this.runningJobs[jobId]) {
-          this.runningJobs[jobId].promotable = false;
+        if (this._instanceType === "terrarium") {
+          const target = this.activeTab;
+          if (target && !target.startsWith("ch:")) {
+            const { terrariumAPI } = await import("@/utils/api");
+            await terrariumAPI.promoteCreatureTask(this._instanceId, target, jobId);
+          }
+        } else {
+          const { agentAPI } = await import("@/utils/api");
+          await agentAPI.promote(this._instanceId, jobId);
         }
       } catch (e) {
         console.warn("Failed to promote task:", e);

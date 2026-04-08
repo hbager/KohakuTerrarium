@@ -83,6 +83,24 @@ async def stop_creature_task(
         raise HTTPException(404, str(e))
 
 
+@router.post("/{name}/promote/{job_id}")
+async def promote_creature_task(
+    terrarium_id: str, name: str, job_id: str, manager=Depends(get_manager)
+):
+    """Promote a running direct task to background on a creature."""
+    try:
+        runtime = manager._terrariums.get(terrarium_id)
+        if not runtime:
+            raise ValueError(f"Terrarium {terrarium_id} not found")
+        handle = runtime.get_creature(name)
+        if not handle or not handle.agent:
+            raise ValueError(f"Creature {name} not found")
+        ok = handle.agent._promote_handle(job_id)
+        return {"status": "promoted" if ok else "not_found"}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
 @router.post("/{name}/model")
 async def switch_creature_model(
     terrarium_id: str, name: str, req: ModelSwitch, manager=Depends(get_manager)

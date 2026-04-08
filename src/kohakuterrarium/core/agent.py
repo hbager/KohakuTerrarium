@@ -483,14 +483,28 @@ class Agent(AgentInitMixin, AgentHandlersMixin):
     def _promote_handle(self, job_id: str) -> bool:
         """Promote a running direct task to background.
 
-        Called from TUI click handler or frontend API.
-        Returns True if promotion succeeded.
+        Called from TUI click handler (Textual thread) or frontend API
+        (asyncio event loop). Uses ``call_soon_threadsafe`` to ensure
+        the asyncio.Event inside the handle is set on the correct loop.
         """
         handle = self._active_handles.get(job_id)
         if not handle:
             return False
-        if not handle.promote():
-            return False
+
+        # Thread-safe promotion: asyncio.Event.set() must run on the
+        # event loop thread. TUI calls this from Textual's thread.
+        try:
+            loop = asyncio.get_running_loop()
+            # Already on the event loop (API handler) — promote directly
+            if not handle.promote():
+                return False
+        except RuntimeError:
+            # Not on an event loop (TUI thread) — schedule on the agent's loop
+            try:
+                loop = asyncio.get_event_loop()
+                loop.call_soon_threadsafe(handle.promote)
+            except RuntimeError:
+                return False
 
         self.output_router.notify_activity(
             "task_promoted",

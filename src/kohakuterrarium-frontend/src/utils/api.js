@@ -111,6 +111,13 @@ export const terrariumAPI = {
     return data;
   },
 
+  async promoteCreatureTask(id, name, jobId) {
+    const { data } = await api.post(
+      `/terrariums/${id}/creatures/${name}/promote/${jobId}`,
+    );
+    return data;
+  },
+
   async stopCreatureTask(id, name, jobId) {
     const { data } = await api.post(
       `/terrariums/${id}/creatures/${name}/tasks/${jobId}/stop`,
