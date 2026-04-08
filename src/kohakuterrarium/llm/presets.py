@@ -299,7 +299,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "api_key_env": "GEMINI_API_KEY",
         "max_context": 1048576,
-        "extra_body": {"reasoning": {"enabled": True, "effort": "high"}},
+        "extra_body": {"google": {"thinking_config": {"thinking_level": "HIGH"}}},
     },
     "gemini-3-flash-direct": {
         "provider": "openai",
@@ -307,7 +307,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "api_key_env": "GEMINI_API_KEY",
         "max_context": 1048576,
-        "extra_body": {"reasoning": {"enabled": True, "effort": "high"}},
+        "extra_body": {"google": {"thinking_config": {"thinking_level": "HIGH"}}},
     },
     "gemini-3.1-flash-lite-direct": {
         "provider": "openai",
@@ -315,7 +315,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "api_key_env": "GEMINI_API_KEY",
         "max_context": 1048576,
-        "extra_body": {"reasoning": {"enabled": True, "effort": "high"}},
+        "extra_body": {"google": {"thinking_config": {"thinking_level": "HIGH"}}},
     },
     # ═══════════════════════════════════════════════════════
     #  Gemma 4 (open models, via OpenRouter)

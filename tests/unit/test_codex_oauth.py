@@ -355,6 +355,377 @@ class TestToResponsesInput:
         assert result == []
 
 
+# =========================================================================
+# _fix_tool_call_pairing — ensures Responses API tool call ordering
+# =========================================================================
+
+
+class TestFixToolCallPairing:
+    """Tests for function_call / function_call_output pairing and ordering.
+
+    The Responses API requires every function_call to be immediately followed
+    by its function_call_output with matching call_id. These tests verify that
+    _fix_tool_call_pairing enforces this invariant under all conditions
+    (normal, truncated, compacted, reordered, etc.).
+    """
+
+    @staticmethod
+    def _fix(items: list[dict]) -> list[dict]:
+        return CodexOAuthProvider._fix_tool_call_pairing(items)
+
+    @staticmethod
+    def _make_call(call_id: str, name: str = "bash") -> dict:
+        return {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": "{}",
+        }
+
+    @staticmethod
+    def _make_output(call_id: str, output: str = "ok") -> dict:
+        return {
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output,
+        }
+
+    @staticmethod
+    def _make_user(text: str = "hello") -> dict:
+        return {"role": "user", "content": [{"type": "input_text", "text": text}]}
+
+    @staticmethod
+    def _make_assistant(text: str = "sure") -> dict:
+        return {
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": text}],
+        }
+
+    # --- Normal cases (already correct) ---
+
+    def test_normal_single_tool_call(self):
+        """Correct pairing should be preserved as-is."""
+        items = [
+            self._make_user(),
+            self._make_call("c1"),
+            self._make_output("c1"),
+            self._make_assistant(),
+        ]
+        result = self._fix(items)
+        assert result == items
+
+    def test_normal_parallel_tool_calls(self):
+        """Multiple tool calls in one turn, all with outputs."""
+        items = [
+            self._make_user(),
+            self._make_call("c1", "bash"),
+            self._make_call("c2", "read"),
+            self._make_output("c1", "files"),
+            self._make_output("c2", "content"),
+            self._make_assistant(),
+        ]
+        result = self._fix(items)
+        # Each call should be immediately followed by its output
+        assert result[0] == self._make_user()
+        assert result[1] == self._make_call("c1", "bash")
+        assert result[2] == self._make_output("c1", "files")
+        assert result[3] == self._make_call("c2", "read")
+        assert result[4] == self._make_output("c2", "content")
+        assert result[5] == self._make_assistant()
+
+    def test_normal_multi_turn_tool_use(self):
+        """Multiple tool-use turns in sequence."""
+        items = [
+            self._make_user("list files"),
+            self._make_call("c1", "bash"),
+            self._make_output("c1", "a.py"),
+            self._make_call("c2", "read"),
+            self._make_output("c2", "code"),
+            self._make_assistant("done"),
+            self._make_user("thanks"),
+        ]
+        result = self._fix(items)
+        assert result == items  # Already in correct order
+
+    # --- Missing output (truncation / compaction removed tool result) ---
+
+    def test_missing_output_adds_placeholder(self):
+        """function_call without output gets a placeholder inserted."""
+        items = [
+            self._make_user(),
+            self._make_call("c1", "bash"),
+            self._make_assistant(),
+        ]
+        result = self._fix(items)
+        assert len(result) == 4
+        assert result[1] == self._make_call("c1", "bash")
+        assert result[2]["type"] == "function_call_output"
+        assert result[2]["call_id"] == "c1"
+        assert "bash" in result[2]["output"]
+        assert result[3] == self._make_assistant()
+
+    def test_missing_output_parallel_calls(self):
+        """Two calls, only one has output — placeholder added for the other."""
+        items = [
+            self._make_call("c1", "bash"),
+            self._make_call("c2", "read"),
+            self._make_output("c2", "content"),
+        ]
+        result = self._fix(items)
+        assert result[0] == self._make_call("c1", "bash")
+        assert result[1]["type"] == "function_call_output"
+        assert result[1]["call_id"] == "c1"
+        assert result[2] == self._make_call("c2", "read")
+        assert result[3] == self._make_output("c2", "content")
+
+    def test_all_outputs_missing(self):
+        """All outputs lost — placeholders for every call."""
+        items = [
+            self._make_user(),
+            self._make_call("c1"),
+            self._make_call("c2"),
+            self._make_assistant(),
+        ]
+        result = self._fix(items)
+        assert len(result) == 6
+        assert result[1]["type"] == "function_call"
+        assert result[2]["type"] == "function_call_output"
+        assert result[2]["call_id"] == "c1"
+        assert result[3]["type"] == "function_call"
+        assert result[4]["type"] == "function_call_output"
+        assert result[4]["call_id"] == "c2"
+
+    # --- Orphan outputs (truncation removed the assistant+tool_calls) ---
+
+    def test_orphan_output_dropped(self):
+        """function_call_output without matching call is removed."""
+        items = [
+            self._make_output("c_old", "stale result"),
+            self._make_user(),
+            self._make_call("c1"),
+            self._make_output("c1"),
+        ]
+        result = self._fix(items)
+        assert len(result) == 3
+        assert result[0] == self._make_user()
+        assert result[1] == self._make_call("c1")
+        assert result[2] == self._make_output("c1")
+
+    def test_multiple_orphan_outputs_dropped(self):
+        """Several orphan outputs from compacted history."""
+        items = [
+            self._make_output("old1"),
+            self._make_output("old2"),
+            self._make_output("old3"),
+            self._make_user(),
+            self._make_assistant(),
+        ]
+        result = self._fix(items)
+        assert len(result) == 2
+        assert result[0] == self._make_user()
+        assert result[1] == self._make_assistant()
+
+    # --- Reordering (output separated from call by later messages) ---
+
+    def test_output_after_later_messages_gets_reordered(self):
+        """Output displaced to after user message is pulled back next to call."""
+        items = [
+            self._make_call("c1", "bash"),
+            self._make_user("next question"),
+            self._make_assistant("answer"),
+            self._make_output("c1", "result"),
+        ]
+        result = self._fix(items)
+        assert result[0] == self._make_call("c1", "bash")
+        assert result[1] == self._make_output("c1", "result")
+        assert result[2] == self._make_user("next question")
+        assert result[3] == self._make_assistant("answer")
+
+    def test_mixed_reorder_and_missing(self):
+        """One output displaced, another missing entirely."""
+        items = [
+            self._make_call("c1", "bash"),
+            self._make_call("c2", "read"),
+            self._make_user(),
+            self._make_output("c1", "files"),
+            # c2 output is missing
+        ]
+        result = self._fix(items)
+        assert result[0] == self._make_call("c1", "bash")
+        assert result[1] == self._make_output("c1", "files")
+        assert result[2] == self._make_call("c2", "read")
+        assert result[3]["type"] == "function_call_output"
+        assert result[3]["call_id"] == "c2"  # placeholder
+        assert result[4] == self._make_user()
+
+    # --- Compact simulation (summary replaces old context) ---
+
+    def test_compact_summary_with_live_zone(self):
+        """After compaction: summary + live zone with tool calls."""
+        items = [
+            self._make_assistant("[Summary of previous context]"),
+            self._make_user("continue the task"),
+            self._make_call("c1", "bash"),
+            self._make_output("c1", "done"),
+            self._make_assistant("finished"),
+        ]
+        result = self._fix(items)
+        assert result == items  # Already correct
+
+    def test_compact_breaks_pair_live_zone_has_orphan_output(self):
+        """Compact boundary falls between call and output — orphan in live zone."""
+        # The assistant(tool_calls) was compacted away, only output remains
+        items = [
+            self._make_assistant("[Summary]"),
+            self._make_output("c_old", "stale"),  # orphan
+            self._make_user("next"),
+            self._make_call("c1"),
+            self._make_output("c1"),
+        ]
+        result = self._fix(items)
+        # Orphan output dropped
+        assert len(result) == 4
+        assert result[0] == self._make_assistant("[Summary]")
+        assert result[1] == self._make_user("next")
+        assert result[2] == self._make_call("c1")
+        assert result[3] == self._make_output("c1")
+
+    # --- Invariant checks ---
+
+    def test_invariant_every_call_followed_by_output(self):
+        """For any input, the output must satisfy the Responses API invariant:
+        every function_call is immediately followed by function_call_output."""
+        # Worst case: interleaved calls and outputs from messy truncation
+        items = [
+            self._make_output("c3"),  # orphan
+            self._make_call("c1"),
+            self._make_user(),
+            self._make_call("c2"),
+            self._make_output("c1"),
+            self._make_assistant(),
+            self._make_call("c4"),  # missing output
+        ]
+        result = self._fix(items)
+
+        # Verify invariant
+        for i, item in enumerate(result):
+            if item.get("type") == "function_call":
+                next_item = result[i + 1]
+                assert next_item["type"] == "function_call_output", (
+                    f"function_call at index {i} (call_id={item['call_id']}) "
+                    f"not followed by output, got {next_item.get('type')}"
+                )
+                assert next_item["call_id"] == item["call_id"], (
+                    f"call_id mismatch at index {i}: "
+                    f"call={item['call_id']}, output={next_item['call_id']}"
+                )
+
+    def test_invariant_no_orphan_outputs(self):
+        """No function_call_output should exist without a preceding function_call."""
+        items = [
+            self._make_output("orphan1"),
+            self._make_output("orphan2"),
+            self._make_call("c1"),
+            self._make_output("c1"),
+            self._make_output("orphan3"),
+        ]
+        result = self._fix(items)
+        for i, item in enumerate(result):
+            if item.get("type") == "function_call_output":
+                prev_item = result[i - 1]
+                assert (
+                    prev_item.get("type") == "function_call"
+                ), f"Orphan output at index {i} (call_id={item['call_id']})"
+
+    def test_empty_input(self):
+        result = self._fix([])
+        assert result == []
+
+    def test_no_tool_calls(self):
+        """Conversation without any tool use passes through unchanged."""
+        items = [
+            self._make_user("hello"),
+            self._make_assistant("hi"),
+            self._make_user("bye"),
+        ]
+        result = self._fix(items)
+        assert result == items
+
+    # --- End-to-end: _to_responses_input + _fix_tool_call_pairing ---
+
+    def test_e2e_truncated_conversation(self):
+        """Simulate _maybe_truncate removing old messages that break pairs."""
+        # Full conversation (what it was before truncation):
+        #   user, assistant(tc=[c1,c2]), tool(c1), tool(c2), user, assistant(tc=[c3]), tool(c3), assistant
+        # After truncation (lost assistant with tool_calls for c1,c2):
+        truncated_messages = [
+            {"role": "tool", "tool_call_id": "c1", "content": "orphan1"},
+            {"role": "tool", "tool_call_id": "c2", "content": "orphan2"},
+            {"role": "user", "content": "next"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": "c3", "function": {"name": "bash", "arguments": "{}"}}
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c3", "content": "result3"},
+            {"role": "assistant", "content": "done"},
+        ]
+        api_input = CodexOAuthProvider._to_responses_input(truncated_messages)
+        fixed = CodexOAuthProvider._fix_tool_call_pairing(api_input)
+
+        # Orphans c1, c2 should be gone; c3 pair intact
+        call_ids = [
+            item["call_id"] for item in fixed if item.get("type") == "function_call"
+        ]
+        output_ids = [
+            item["call_id"]
+            for item in fixed
+            if item.get("type") == "function_call_output"
+        ]
+        assert "c1" not in call_ids and "c1" not in output_ids
+        assert "c2" not in call_ids and "c2" not in output_ids
+        assert "c3" in call_ids and "c3" in output_ids
+
+        # Verify ordering invariant
+        for i, item in enumerate(fixed):
+            if item.get("type") == "function_call":
+                assert fixed[i + 1]["type"] == "function_call_output"
+                assert fixed[i + 1]["call_id"] == item["call_id"]
+
+    def test_e2e_compact_removes_old_tool_calls(self):
+        """After compact, old tool calls are summarized away but live zone intact."""
+        # Post-compact conversation: summary + live zone
+        post_compact_messages = [
+            {"role": "assistant", "content": "[Summary: used bash and read tools]"},
+            {"role": "user", "content": "now run tests"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c_new",
+                        "function": {
+                            "name": "bash",
+                            "arguments": '{"command":"pytest"}',
+                        },
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "c_new", "content": "3 passed"},
+            {"role": "assistant", "content": "All tests pass."},
+        ]
+        api_input = CodexOAuthProvider._to_responses_input(post_compact_messages)
+        fixed = CodexOAuthProvider._fix_tool_call_pairing(api_input)
+
+        # Should be clean — no orphans, pair intact
+        calls = [i for i in fixed if i.get("type") == "function_call"]
+        outputs = [i for i in fixed if i.get("type") == "function_call_output"]
+        assert len(calls) == 1 and calls[0]["call_id"] == "c_new"
+        assert len(outputs) == 1 and outputs[0]["call_id"] == "c_new"
+
+
 class TestConstants:
     """Verify critical constants are correct."""
 

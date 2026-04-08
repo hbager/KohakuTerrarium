@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
+from uuid import uuid4
 
 from kohakuterrarium.builtins.tui.output import TUIOutput
 from kohakuterrarium.builtins.tui.session import TUISession
@@ -503,7 +504,7 @@ def _run_terrarium_cli(args: argparse.Namespace) -> int:
 
         store = SessionStore(session_file)
         store.init_meta(
-            session_id=f"cli_{config.name}",
+            session_id=uuid4().hex,
             config_type="terrarium",
             config_path=str(path),
             pwd=str(Path.cwd()),

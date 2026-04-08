@@ -23,7 +23,7 @@ class AgentSession:
     """
 
     def __init__(self, agent: Agent, agent_id: str | None = None):
-        self.agent_id = agent_id or f"agent_{uuid4().hex[:8]}"
+        self.agent_id = agent_id or f"agent_{uuid4().hex}"
         self.agent = agent
         self._output_queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._running = False

@@ -13,16 +13,16 @@
 
 KohakuTerrarium is built around one design choice: **vertical coordination (inside an agent) and horizontal coordination (between agents) are different problems, and they should stay separate**.
 
-This is one of the first explicitly stated abstractions for what an "agent framework" actually needs to define: what an agent IS, how it RUNS, how it EXTENDS, and how it DEPLOYS. Most existing tools in the ecosystem (LangChain, DSPy, CrewAI, AutoGen) are useful but operate at different levels — they are LLM app libraries, optimizer/compiler layers, or multi-agent coordination patterns, not full agent frameworks. KohakuTerrarium aims to be the framework layer that those kinds of tools could be built on top of.
+Most existing tools in the ecosystem work at adjacent layers — LangChain and LangGraph are orchestration frameworks, DSPy is an optimizer for LM programs, AutoGen and CrewAI help you set up multi-agent workflows, and Claude Code, Codex CLI, and OpenCode are finished agent products. What's missing is the layer underneath: **what an agent actually is as a reusable runtime unit**. KohakuTerrarium tries to be that layer.
 
-- A **creature** is a complete agent with its own LLM controller, tools, sub-agents, memory, triggers, input, and output. Even a standalone creature is already a multi-agent system — the controller delegates to sub-agents (explore, plan, worker, critic), the same frontier architecture used by systems like Claude Code.
-- A **terrarium** is a **pure wiring layer** that connects creatures through channels, manages lifecycle, and exposes observability. It has no LLM, no reasoning, no intelligence — it is infrastructure, not another hidden planner or meta-agent.
-- The same creature config can run **standalone** or inside a terrarium **unchanged**.
-- **Five module types** (input, output, tool, trigger, sub-agent) form the extensibility primitive. Any functionality — RAG, monitoring, external integrations — can be composed from these modules. The framework doesn't need to ship every feature because the module system makes everything buildable.
+- A **creature** is that unit. It's a complete agent with its own controller, tools, sub-agents, memory, triggers, input, and output. Even a single creature is already a multi-agent system internally — the controller delegates to sub-agents like explore, plan, worker, and critic, the same pattern you see in Claude Code and similar systems.
+- A **terrarium** is a **pure wiring layer** for connecting creatures. It sets up channels between them, manages their lifecycle, and exposes observability. No LLM, no reasoning, no hidden supervisor.
+- The same creature config runs **standalone** or inside a terrarium **unchanged**. Joining a team doesn't turn a creature into a different kind of object.
+- **Five module types** — input, output, tool, trigger, and sub-agent — are the building blocks for everything. Monitoring agents, research agents, coding agents, chat bots, and real-time agents are all different compositions of these same pieces.
 
-That separation is the project's core idea, and it drives the runtime, the TUI, the web dashboard, the API, and the session system.
+That separation is the core idea, and it runs through the entire project: the runtime, the TUI, the web dashboard, the API, and the session system.
 
-This abstraction is empirically validated: frontier agent systems including Claude Code, Codex CLI, OpenCode, and even real-time applications like Neuro-sama can all be expressed within the creature/module architecture. The abstraction holds; specialized runtimes handle domain-specific concerns like latency.
+The abstraction isn't limited to coding agents. Frontier coding tools like Claude Code, Codex CLI, and OpenCode fit naturally inside the creature model, but so do trigger-driven monitoring agents, research terrariums, and Neuro-sama-style real-time agents. The goal is to be universal at the agent layer; domain-specific concerns like latency or UI are handled by specialized runtimes on top.
 
 ## Why KohakuTerrarium Is Different
 
@@ -41,9 +41,10 @@ This abstraction is empirically validated: frontier agent systems including Clau
   </tr>
 </table>
 
-This gives you a cleaner split than frameworks that blur everything into one orchestration layer:
+This gives you a cleaner split than systems that mix agent internals, orchestration, and product behavior into one layer:
 
-- **Reusable creatures**: build once, run solo or in teams
+- **Reusable creatures**: build an agent once, run it solo or in teams
+- **Real agent boundary**: a creature is a full runtime unit, not just a workflow node or a chat participant
 - **Opaque team members**: terrariums do not inspect creature internals
 - **Explicit communication**: creatures collaborate via named channels, not hidden routing magic
 - **Persistent by default**: sessions save rich runtime state, not just chat history

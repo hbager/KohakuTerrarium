@@ -284,7 +284,7 @@ class KohakuManager:
         else:
             raise ValueError("Must provide config_path or config")
 
-        terrarium_id = f"terrarium_{uuid4().hex[:8]}"
+        terrarium_id = f"terrarium_{uuid4().hex}"
         env = Environment(env_id=f"terrarium_{cfg.name}_{uuid4().hex[:8]}")
         runtime = TerrariumRuntime(cfg, environment=env, pwd=pwd)
         self._terrariums[terrarium_id] = runtime
@@ -340,7 +340,7 @@ class KohakuManager:
         self, runtime: TerrariumRuntime, store: Any = None
     ) -> str:
         """Register a pre-built terrarium (e.g. from resume). Returns terrarium_id."""
-        terrarium_id = f"terrarium_{uuid4().hex[:8]}"
+        terrarium_id = f"terrarium_{uuid4().hex}"
         self._terrariums[terrarium_id] = runtime
         if store:
             self._session_stores[terrarium_id] = store

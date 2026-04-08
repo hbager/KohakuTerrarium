@@ -2,6 +2,7 @@
 
 import asyncio
 from pathlib import Path
+from uuid import uuid4
 
 from kohakuterrarium.core.agent import Agent
 from kohakuterrarium.session.store import SessionStore
@@ -62,7 +63,7 @@ def run_agent_cli(
 
             store = SessionStore(session_file)
             store.init_meta(
-                session_id=f"cli_{id(agent):08x}",
+                session_id=uuid4().hex,
                 config_type="agent",
                 config_path=str(path),
                 pwd=str(Path.cwd()),

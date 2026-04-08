@@ -6,17 +6,16 @@ via OAuth PKCE (browser or device code flow). Billing goes to the user's
 ChatGPT Plus/Pro subscription, not API credits.
 """
 
-import asyncio
 import hashlib
 import json as _json
 from typing import Any, AsyncIterator
 
 try:
-    from openai import OpenAI
+    from openai import AsyncOpenAI
 
     HAS_OPENAI = True
 except ImportError:
-    OpenAI = None  # type: ignore[assignment,misc]
+    AsyncOpenAI = None  # type: ignore[assignment,misc]
     HAS_OPENAI = False
 
 from kohakuterrarium.llm.base import (
@@ -40,7 +39,7 @@ CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 class CodexOAuthProvider(BaseLLMProvider):
     """LLM provider using ChatGPT subscription via Codex OAuth.
 
-    Uses the OpenAI SDK's Responses API routed through the Codex backend.
+    Uses the AsyncOpenAI SDK's Responses API routed through the Codex backend.
     Supports streaming, tool calls, and auto token refresh.
 
     Usage:
@@ -66,7 +65,7 @@ class CodexOAuthProvider(BaseLLMProvider):
         self.timeout = timeout
         self.max_retries = max_retries
         self._tokens: CodexTokens | None = None
-        self._client: Any = None  # openai.OpenAI
+        self._client: Any = None  # AsyncOpenAI
         self._last_tool_calls: list[NativeToolCall] = []
         self._last_usage: dict[str, int] = {}
         self.prompt_cache_key: str | None = None
@@ -88,12 +87,12 @@ class CodexOAuthProvider(BaseLLMProvider):
         self._rebuild_client()
 
     def _rebuild_client(self) -> None:
-        """Create or recreate the OpenAI SDK client with current token."""
+        """Create or recreate the AsyncOpenAI client with current token."""
         if not HAS_OPENAI:
             raise ImportError("openai not installed. Install with: pip install openai")
         if not self._tokens:
             return
-        self._client = OpenAI(
+        self._client = AsyncOpenAI(
             api_key=self._tokens.access_token,
             base_url=CODEX_BASE_URL,
             timeout=self.timeout,
@@ -196,6 +195,67 @@ class CodexOAuthProvider(BaseLLMProvider):
 
         return items
 
+    @staticmethod
+    def _fix_tool_call_pairing(
+        api_input: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Ensure every function_call is immediately followed by its function_call_output.
+
+        The Responses API requires strict pairing: each ``function_call`` item
+        must be directly followed by a ``function_call_output`` with the same
+        ``call_id``.  Conversation truncation or compaction can break these
+        pairs.
+
+        This single-pass rebuild:
+        1. Pulls all ``function_call_output`` items into a lookup dict.
+        2. Walks the remaining items in order.
+        3. After each ``function_call``, inserts the matching output (or a
+           placeholder if the real output was lost).
+        4. Orphan outputs (no matching call) are silently dropped.
+        """
+        # Index outputs by call_id (pop them out of the stream)
+        output_by_id: dict[str, dict[str, Any]] = {}
+        other_items: list[dict[str, Any]] = []
+        for item in api_input:
+            if item.get("type") == "function_call_output":
+                output_by_id[item["call_id"]] = item
+            else:
+                other_items.append(item)
+
+        # Rebuild: insert output right after its function_call
+        result: list[dict[str, Any]] = []
+        used_ids: set[str] = set()
+        for item in other_items:
+            result.append(item)
+            if item.get("type") == "function_call":
+                call_id = item["call_id"]
+                if call_id in output_by_id:
+                    result.append(output_by_id[call_id])
+                else:
+                    # Lost output — add placeholder so API doesn't reject
+                    result.append(
+                        {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": f"[{item.get('name', '')}] Result unavailable "
+                            "(removed by context compaction).",
+                        }
+                    )
+                    logger.warning(
+                        "Added missing function_call_output", call_id=call_id
+                    )
+                used_ids.add(call_id)
+
+        # Log orphans (outputs whose call was compacted away — already dropped)
+        orphan_ids = set(output_by_id) - used_ids
+        if orphan_ids:
+            logger.warning(
+                "Dropped orphan function_call_outputs",
+                orphan_count=len(orphan_ids),
+            )
+
+        return result
+
     # ------------------------------------------------------------------
     # Streaming (called by BaseLLMProvider.chat)
     # ------------------------------------------------------------------
@@ -207,7 +267,7 @@ class CodexOAuthProvider(BaseLLMProvider):
         tools: list[ToolSchema] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        """Stream response from Codex backend using OpenAI SDK."""
+        """Stream response from Codex backend using AsyncOpenAI SDK."""
         self._last_tool_calls = []
         await self._ensure_valid_token()
 
@@ -229,64 +289,19 @@ class CodexOAuthProvider(BaseLLMProvider):
         # Build tools in Responses API format
         api_tools = None
         if tools:
-            api_tools = []
-            for t in tools:
-                api_tools.append(
-                    {
-                        "type": "function",
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    }
-                )
-
-        # Call SDK in a thread (SDK is sync, we're async)
-        loop = asyncio.get_running_loop()
-
-        # Validate: function_calls and function_call_outputs must be paired
-        call_ids = {
-            item["call_id"] for item in api_input if item.get("type") == "function_call"
-        }
-        output_ids = {
-            item["call_id"]
-            for item in api_input
-            if item.get("type") == "function_call_output"
-        }
-
-        # Add missing outputs (call without result)
-        for call_id in call_ids - output_ids:
-            name = ""
-            for item in api_input:
-                if (
-                    item.get("type") == "function_call"
-                    and item.get("call_id") == call_id
-                ):
-                    name = item.get("name", "")
-                    break
-            api_input.append(
+            api_tools = [
                 {
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": f"[{name}] Execution pending.",
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters,
                 }
-            )
-            logger.warning("Added missing function_call_output", call_id=call_id)
-
-        # Remove orphan outputs (result without call)
-        orphan_ids = output_ids - call_ids
-        if orphan_ids:
-            api_input = [
-                item
-                for item in api_input
-                if not (
-                    item.get("type") == "function_call_output"
-                    and item.get("call_id") in orphan_ids
-                )
+                for t in tools
             ]
-            logger.warning(
-                "Removed orphan function_call_outputs",
-                orphan_count=len(orphan_ids),
-            )
+
+        # Validate: function_call must be immediately followed by function_call_output
+        # with matching call_id. Reorder, add placeholders, remove orphans.
+        api_input = self._fix_tool_call_pairing(api_input)
 
         logger.debug(
             "Codex API request",
@@ -311,8 +326,8 @@ class CodexOAuthProvider(BaseLLMProvider):
             or hashlib.sha256(instr_text.encode()).hexdigest()[:32]
         )
 
-        def _create_stream() -> Any:
-            return self._client.responses.create(
+        try:
+            stream = await self._client.responses.create(
                 model=self.model,
                 instructions=instr_text,
                 input=api_input,
@@ -322,96 +337,45 @@ class CodexOAuthProvider(BaseLLMProvider):
                 prompt_cache_key=cache_key,
                 **extra_params,
             )
-
-        try:
-            stream = await loop.run_in_executor(None, _create_stream)
         except Exception as e:
             logger.error("Codex API request failed", error=str(e))
             raise
 
-        # Process events in a thread and push to queue
-        text_queue: asyncio.Queue[str | None] = asyncio.Queue()
+        # Process async stream events directly
         collected_tool_calls: list[NativeToolCall] = []
 
-        def _consume_stream() -> None:
-            # Track tool call names from output_item events
-            # (arguments.done has name=None, output_item.done has full info)
-            pending_names: dict[str, str] = {}  # item_id -> name
-            try:
-                for event in stream:
-                    match event.type:
-                        case "response.output_text.delta":
-                            text_queue.put_nowait(event.delta)
-                        case "response.output_item.added":
-                            item = event.item
-                            if hasattr(item, "name") and item.name:
-                                item_id = getattr(item, "id", "")
-                                pending_names[item_id] = item.name
-                        case "response.output_item.done":
-                            item = event.item
-                            if getattr(item, "type", "") == "function_call":
-                                collected_tool_calls.append(
-                                    NativeToolCall(
-                                        id=getattr(item, "call_id", ""),
-                                        name=getattr(item, "name", "") or "",
-                                        arguments=getattr(item, "arguments", ""),
-                                    )
-                                )
-                        case "response.completed":
-                            # Extract usage from completed response
-                            resp = getattr(event, "response", None)
-                            if resp:
-                                u = getattr(resp, "usage", None)
-                                logger.debug(
-                                    "Response completed",
-                                    has_response=resp is not None,
-                                    has_usage=u is not None,
-                                    usage_type=type(u).__name__ if u else "None",
-                                )
-                                if u:
-                                    cached = 0
-                                    # Responses API: input_tokens_details
-                                    details = getattr(u, "input_tokens_details", None)
-                                    if details:
-                                        cached = (
-                                            getattr(details, "cached_tokens", 0) or 0
-                                        )
-                                    text_queue.put_nowait(
-                                        (
-                                            "__usage__",
-                                            {
-                                                "prompt_tokens": getattr(
-                                                    u, "input_tokens", 0
-                                                ),
-                                                "completion_tokens": getattr(
-                                                    u, "output_tokens", 0
-                                                ),
-                                                "total_tokens": getattr(
-                                                    u, "total_tokens", 0
-                                                ),
-                                                "cached_tokens": cached,
-                                            },
-                                        )
-                                    )
-            except Exception as e:
-                logger.error("Stream error", error=str(e))
-            finally:
-                text_queue.put_nowait(None)  # signal done
+        async for event in stream:
+            match event.type:
+                case "response.output_text.delta":
+                    yield event.delta
+                case "response.output_item.done":
+                    item = event.item
+                    if getattr(item, "type", "") == "function_call":
+                        collected_tool_calls.append(
+                            NativeToolCall(
+                                id=getattr(item, "call_id", ""),
+                                name=getattr(item, "name", "") or "",
+                                arguments=getattr(item, "arguments", ""),
+                            )
+                        )
+                case "response.completed":
+                    # Extract usage from completed response
+                    resp = getattr(event, "response", None)
+                    if resp:
+                        u = getattr(resp, "usage", None)
+                        if u:
+                            cached = 0
+                            # Responses API: input_tokens_details
+                            details = getattr(u, "input_tokens_details", None)
+                            if details:
+                                cached = getattr(details, "cached_tokens", 0) or 0
+                            self._last_usage = {
+                                "prompt_tokens": getattr(u, "input_tokens", 0),
+                                "completion_tokens": getattr(u, "output_tokens", 0),
+                                "total_tokens": getattr(u, "total_tokens", 0),
+                                "cached_tokens": cached,
+                            }
 
-        consume_task = loop.run_in_executor(None, _consume_stream)
-
-        # Yield text chunks as they arrive
-        while True:
-            chunk = await text_queue.get()
-            if chunk is None:
-                break
-            # Handle usage tuple from response.completed
-            if isinstance(chunk, tuple) and chunk[0] == "__usage__":
-                self._last_usage = chunk[1]
-                continue
-            yield chunk
-
-        await consume_task
         self._last_tool_calls = collected_tool_calls
 
     # ------------------------------------------------------------------
@@ -434,4 +398,6 @@ class CodexOAuthProvider(BaseLLMProvider):
 
     async def close(self) -> None:
         """Cleanup."""
+        if self._client:
+            await self._client.close()
         self._client = None
