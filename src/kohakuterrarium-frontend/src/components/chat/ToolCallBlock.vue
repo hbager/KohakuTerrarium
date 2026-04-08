@@ -37,6 +37,12 @@
         class="text-[10px] text-warm-400 font-mono shrink-0"
         >{{ elapsed }}</span
       >
+      <button
+        v-if="canPromote"
+        class="text-[10px] px-1.5 py-0.5 rounded bg-iolite/15 text-iolite hover:bg-iolite/25 shrink-0 font-mono"
+        title="Move to background — agent continues working"
+        @click.stop="chat.promoteTask(tc.jobId || tc.id)"
+      >→ bg</button>
       <span
         v-if="tc.result || tc.tools_used?.length || tc.children?.length || tc.status === 'running'"
         class="i-carbon-chevron-down text-warm-400 transition-transform text-[10px] shrink-0"
@@ -166,6 +172,18 @@ watch(
     }
   },
 );
+
+// Show "→ bg" button for running direct tasks after 1 second
+const canPromote = computed(() => {
+  if (props.tc.status !== "running") return false;
+  const jobId = props.tc.jobId || props.tc.id;
+  const job = chat.runningJobs[jobId];
+  if (!job || !job.promotable) return false;
+  // Show after 1 second elapsed
+  void chat._jobTick;
+  const elapsed = Date.now() - (props.tc.startedAt || 0);
+  return elapsed > 1000;
+});
 
 const statusIcon = computed(() => {
   if (props.tc.status === "running")

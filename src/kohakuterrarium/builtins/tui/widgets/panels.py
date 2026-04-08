@@ -9,15 +9,20 @@ from kohakuterrarium.builtins.tui.widgets.helpers import _fmt_tokens
 
 
 class RunningPanel(Static):
-    """Live list of running tools/sub-agents. Click to cancel a job."""
+    """Live list of running tools/sub-agents. Click to cancel or promote."""
 
     class CancelRequested(Message):
-        """Posted when the user clicks a running job to cancel it."""
-
         def __init__(self, job_id: str, job_name: str) -> None:
             super().__init__()
             self.job_id = job_id
             self.job_name = job_name
+
+    class PromoteRequested(Message):
+        """Posted when the user clicks [→bg] to promote a task."""
+
+        def __init__(self, job_id: str) -> None:
+            super().__init__()
+            self.job_id = job_id
 
     DEFAULT_CSS = """
     RunningPanel {
@@ -33,11 +38,14 @@ class RunningPanel(Static):
     }
     """
 
+    # Threshold (seconds) before showing [→bg] indicator
+    PROMOTE_THRESHOLD = 1.0
+
     def __init__(self, **kwargs):
         super().__init__("(idle)", **kwargs)
         self.border_title = "Running"
-        self._items: dict[str, tuple[str, float]] = {}
-        # Ordered list of job IDs for click position mapping
+        # (label, start_time, promotable)
+        self._items: dict[str, tuple[str, float, bool]] = {}
         self._ordered_ids: list[str] = []
 
     def on_mount(self) -> None:
@@ -47,8 +55,8 @@ class RunningPanel(Static):
         if self._items:
             self._refresh_display()
 
-    def add_item(self, item_id: str, label: str) -> None:
-        self._items[item_id] = (label, time.monotonic())
+    def add_item(self, item_id: str, label: str, promotable: bool = False) -> None:
+        self._items[item_id] = (label, time.monotonic(), promotable)
         self._rebuild_order()
         self._refresh_display()
 
@@ -63,31 +71,29 @@ class RunningPanel(Static):
         self._refresh_display()
 
     def _rebuild_order(self) -> None:
-        """Keep ordered ID list in sync with _items."""
         self._ordered_ids = list(self._items.keys())
 
     def on_click(self, event) -> None:
-        """Click on the panel to request cancellation of a running job.
-
-        With a single job, cancels immediately. With multiple jobs, uses
-        click Y-offset to pick which line was clicked.
-        """
+        """Click handler: right side [→bg] = promote, left side = cancel."""
         if not self._items:
             return
 
+        idx = 0
         if len(self._items) == 1:
-            job_id = self._ordered_ids[0]
-            label, _ = self._items[job_id]
-            self.post_message(self.CancelRequested(job_id, label))
-            return
+            idx = 0
+        else:
+            idx = min(event.y, len(self._ordered_ids) - 1)
+            idx = max(idx, 0)
 
-        # Multiple items: map click Y position to a line index
-        y = event.y
-        idx = min(y, len(self._ordered_ids) - 1)
-        idx = max(idx, 0)
         job_id = self._ordered_ids[idx]
-        label, _ = self._items[job_id]
-        self.post_message(self.CancelRequested(job_id, label))
+        label, start, promotable = self._items[job_id]
+        elapsed = time.monotonic() - start
+
+        # Right side of the line → promote (if eligible)
+        if promotable and elapsed >= self.PROMOTE_THRESHOLD and event.x > 35:
+            self.post_message(self.PromoteRequested(job_id))
+        else:
+            self.post_message(self.CancelRequested(job_id, label))
 
     def _refresh_display(self) -> None:
         if not self._items:
@@ -96,11 +102,13 @@ class RunningPanel(Static):
             return
         lines = []
         for item_id in self._ordered_ids:
-            label, start = self._items[item_id]
+            label, start, promotable = self._items[item_id]
             elapsed = time.monotonic() - start
-            lines.append(f"\u25cb {label}  ({elapsed:.0f}s)")
-        hint = "  [click to cancel]" if self._items else ""
-        self.border_title = f"Running{hint}"
+            if promotable and elapsed >= self.PROMOTE_THRESHOLD:
+                lines.append(f"○ {label}  ({elapsed:.0f}s)  [→bg]")
+            else:
+                lines.append(f"○ {label}  ({elapsed:.0f}s)")
+        self.border_title = f"Running ({len(self._items)})"
         self.update("\n".join(lines))
 
 

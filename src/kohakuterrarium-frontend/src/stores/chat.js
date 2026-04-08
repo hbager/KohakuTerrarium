@@ -845,12 +845,16 @@ export const useChatStore = defineStore("chat", {
           children: [],
           startedAt: Date.now(),
         });
-        // Track all sub-agents and background tools as running jobs
-        if (data.background || at === "subagent_start") {
-          const runKey = jobId || toolId;
-          this.runningJobs[runKey] = { name, type: at === "subagent_start" ? "subagent" : "tool", startedAt: Date.now() };
-          this._ensureJobTimer();
-        }
+        // Track all tasks as running jobs (direct tasks are promotable)
+        const runKey = jobId || toolId;
+        const isBg = data.background || false;
+        this.runningJobs[runKey] = {
+          name,
+          type: at === "subagent_start" ? "subagent" : "tool",
+          startedAt: Date.now(),
+          promotable: !isBg,
+        };
+        this._ensureJobTimer();
       } else if (at === "tool_done" || at === "subagent_done") {
         const tc = this._findToolPart(msgs, name, data.job_id);
         if (tc) {
@@ -908,6 +912,31 @@ export const useChatStore = defineStore("chat", {
             if (child) { child.status = "error"; child.result = data.detail || ""; }
           }
         }
+      } else if (at === "task_promoted") {
+        // Task promoted to background — mark as no longer promotable
+        const promJobId = data.job_id || "";
+        if (promJobId && this.runningJobs[promJobId]) {
+          this.runningJobs[promJobId].promotable = false;
+        }
+      }
+    },
+
+    /** Promote a running direct task to background via API. */
+    async promoteTask(jobId) {
+      if (!this._instanceId || !this._instanceType) return;
+      try {
+        const api = this._instanceType === "agent"
+          ? (await import("@/api")).agentAPI
+          : (await import("@/api")).terrariumAPI;
+        if (this._instanceType === "agent") {
+          await api.promote(this._instanceId, jobId);
+        }
+        // Mark locally immediately for responsiveness
+        if (this.runningJobs[jobId]) {
+          this.runningJobs[jobId].promotable = false;
+        }
+      } catch (e) {
+        console.warn("Failed to promote task:", e);
       }
     },
 

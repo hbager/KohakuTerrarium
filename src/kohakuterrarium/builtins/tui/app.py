@@ -82,6 +82,7 @@ class AgentTUI(App):
         self._thinking_thread: threading.Thread | None = None
         self.on_interrupt: Any = None
         self.on_cancel_job: Any = None  # Callable[[str, str], None] or None
+        self.on_promote_job: Any = None  # Callable[[str], bool] or None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -193,6 +194,13 @@ class AgentTUI(App):
         """Handle click-to-cancel on a running job."""
         if self.on_cancel_job:
             self.on_cancel_job(event.job_id, event.job_name)
+
+    def on_running_panel_promote_requested(
+        self, event: RunningPanel.PromoteRequested
+    ) -> None:
+        """Handle click-to-promote on a running direct job."""
+        if self.on_promote_job:
+            self.on_promote_job(event.job_id)
 
     def _get_active_chat(self) -> VerticalScroll | None:
         """Get the currently visible chat scroll widget."""

@@ -496,7 +496,13 @@ class TUISession:
 
     # ── Right panel ─────────────────────────────────────────────
 
-    def update_running(self, item_id: str, label: str, remove: bool = False) -> None:
+    def update_running(
+        self,
+        item_id: str,
+        label: str,
+        remove: bool = False,
+        promotable: bool = False,
+    ) -> None:
         if not self._app or not self._app.is_running:
             return
 
@@ -506,7 +512,7 @@ class TUISession:
                 if remove:
                     panel.remove_item(item_id)
                 else:
-                    panel.add_item(item_id, label)
+                    panel.add_item(item_id, label, promotable=promotable)
             except Exception:
                 pass
 

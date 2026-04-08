@@ -193,9 +193,10 @@ class Agent(AgentInitMixin, AgentHandlersMixin):
         if tui_input and tui_input._app:
             tui_input._app.on_interrupt = self.interrupt
 
-        # Wire click-to-cancel on TUI running panel
+        # Wire click-to-cancel and click-to-promote on TUI running panel
         if tui_input:
             tui_input.on_cancel_job = self._cancel_job
+            tui_input.on_promote_job = self._promote_handle
 
         self._wire_trigger_notifications()
         await self.trigger_manager.start_all()

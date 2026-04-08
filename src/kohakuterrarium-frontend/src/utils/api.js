@@ -189,6 +189,12 @@ export const agentAPI = {
     return data;
   },
 
+  /** Promote a running direct task to background */
+  async promote(id, jobId) {
+    const { data } = await api.post(`/agents/${id}/promote/${jobId}`);
+    return data;
+  },
+
   /** Switch the model for a running agent */
   async switchModel(id, model) {
     const { data } = await api.post(`/agents/${id}/model`, { model });

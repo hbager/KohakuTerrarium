@@ -60,6 +60,19 @@ async def interrupt_agent(agent_id: str, manager=Depends(get_manager)):
         raise HTTPException(404, str(e))
 
 
+@router.post("/{agent_id}/promote/{job_id}")
+async def promote_task(agent_id: str, job_id: str, manager=Depends(get_manager)):
+    """Promote a running direct task to background."""
+    try:
+        session = manager._agents.get(agent_id)
+        if not session:
+            raise ValueError(f"Agent {agent_id} not found")
+        ok = session.agent._promote_handle(job_id)
+        return {"status": "promoted" if ok else "not_found"}
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
 @router.get("/{agent_id}/jobs")
 async def agent_jobs(agent_id: str, manager=Depends(get_manager)):
     """List running background jobs for an agent."""

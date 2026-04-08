@@ -151,6 +151,9 @@ class TUIOutput(BaseOutputModule):
                 self._handle_session_info(metadata)
             case "job_cancelled":
                 self._handle_job_cancelled(t, metadata)
+            case "task_promoted":
+                # Task promoted to background — keep in running panel (now bg)
+                pass
             case "context_cleared":
                 msgs_cleared = metadata.get("messages_cleared", 0)
                 self._tui.add_system_notice(
@@ -184,8 +187,8 @@ class TUIOutput(BaseOutputModule):
         self._turn_started = False
         args_preview = _format_args_preview(name, args) or rest[:60]
         self._tui.add_tool_block(name, args_preview, job_id, target=t)
-        if metadata.get("background"):
-            self._tui.update_running(job_id or name, name)
+        is_bg = metadata.get("background", False)
+        self._tui.update_running(job_id or name, name, promotable=not is_bg)
 
     def _handle_tool_done(
         self, name: str, rest: str, job_id: str, t: str, metadata: dict
