@@ -193,8 +193,17 @@ def main() -> int:
     web_parser = subparsers.add_parser(
         "web", help="Serve web UI + API (single process)"
     )
-    web_parser.add_argument("--host", default="0.0.0.0", help="Bind host")
-    web_parser.add_argument("--port", type=int, default=8001, help="Bind port")
+    web_parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind host (default: 127.0.0.1, use 0.0.0.0 for LAN)",
+    )
+    web_parser.add_argument(
+        "--port",
+        type=int,
+        default=8001,
+        help="Bind port (auto-increments if busy)",
+    )
     web_parser.add_argument(
         "--dev",
         action="store_true",

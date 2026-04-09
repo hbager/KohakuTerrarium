@@ -6,6 +6,7 @@ Web server and desktop app launcher for KohakuTerrarium.
 """
 
 import os
+import socket
 import sys
 import threading
 from pathlib import Path
@@ -63,8 +64,27 @@ def _resolve_config_dirs() -> tuple[list[str], list[str]]:
     return creatures, terrariums
 
 
+def find_free_port(
+    start: int = 8001, host: str = "127.0.0.1", max_tries: int = 50
+) -> int:
+    """Find a free TCP port starting from ``start``.
+
+    Tries ``start``, ``start+1``, ... up to ``max_tries`` ports.
+    Returns the first port that can be bound. Raises RuntimeError if none.
+    """
+    for offset in range(max_tries):
+        port = start + offset
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            try:
+                sock.bind((host, port))
+                return port
+            except OSError:
+                continue
+    raise RuntimeError(f"No free port found in range {start}-{start + max_tries - 1}")
+
+
 def run_web_server(
-    host: str = "0.0.0.0",
+    host: str = "127.0.0.1",
     port: int = 8001,
     dev: bool = False,
 ) -> None:
@@ -96,6 +116,13 @@ def run_web_server(
         terrariums_dirs=terrariums_dirs,
         static_dir=static_dir,
     )
+
+    # Auto-find port if requested port is busy
+    try:
+        port = find_free_port(start=port, host=host)
+    except RuntimeError as e:
+        logger.error("Port allocation failed", error=str(e))
+        sys.exit(1)
 
     if dev:
         print(f"API-only mode on http://{host}:{port}")
@@ -179,6 +206,13 @@ def _run_desktop_app_blocking(port: int = 8001) -> None:
         terrariums_dirs=terrariums_dirs,
         static_dir=WEB_DIST_DIR,
     )
+
+    # Auto-find free port (multi-instance safe)
+    try:
+        port = find_free_port(start=port, host="127.0.0.1")
+    except RuntimeError as e:
+        logger.error("Port allocation failed", error=str(e))
+        sys.exit(1)
 
     # Uvicorn in a daemon thread — dies when the main thread (webview) exits
     server_thread = threading.Thread(
