@@ -13,15 +13,8 @@
 
     <div class="seg-sep" />
 
-    <!-- Model + dropdown arrow (phase 6 wires the dropdown) -->
-    <button
-      class="status-seg flex items-center gap-1 hover:text-warm-700 dark:hover:text-warm-300 transition-colors"
-      :title="model"
-    >
-      <span class="i-carbon-chip text-[11px]" />
-      <span class="truncate max-w-40">{{ model || 'default' }}</span>
-      <span class="i-carbon-chevron-down text-[9px] opacity-50" />
-    </button>
+    <!-- Model quick switcher (functional dropdown) -->
+    <ModelSwitcher />
 
     <div class="seg-sep" />
 
@@ -68,6 +61,7 @@
 <script setup>
 import { computed, onMounted, onUnmounted, ref } from "vue";
 
+import ModelSwitcher from "@/components/chrome/ModelSwitcher.vue";
 import StatusDot from "@/components/common/StatusDot.vue";
 import { useChatStore } from "@/stores/chat";
 import { useInstancesStore } from "@/stores/instances";

@@ -318,6 +318,20 @@ export const sessionAPI = {
     return data;
   },
 
+  /**
+   * Search a saved session's memory (Phase 1 read-only endpoint).
+   * @param {string} sessionName
+   * @param {{q: string, mode?: string, k?: number, agent?: string}} opts
+   */
+  async searchMemory(sessionName, { q, mode = "auto", k = 10, agent = null } = {}) {
+    const params = { q, mode, k };
+    if (agent) params.agent = agent;
+    const { data } = await api.get(`/sessions/${sessionName}/memory/search`, {
+      params,
+    });
+    return data;
+  },
+
   async delete(sessionName) {
     const { data } = await api.delete(`/sessions/${sessionName}`);
     return data;

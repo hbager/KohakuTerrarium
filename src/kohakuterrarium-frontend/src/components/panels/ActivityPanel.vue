@@ -12,7 +12,46 @@
       >{{ jobCount }}</span>
     </div>
 
-    <!-- Body: running jobs list, read straight from chat store. -->
+    <!-- Turn header — current-turn status, model, elapsed, token bar -->
+    <div
+      class="px-3 py-2 border-b border-warm-200/70 dark:border-warm-700/70 text-[11px] flex flex-col gap-1"
+    >
+      <div class="flex items-center gap-2">
+        <span
+          class="inline-block w-2 h-2 rounded-full shrink-0"
+          :class="statusDotClass"
+        />
+        <span class="font-medium text-warm-700 dark:text-warm-300 truncate">{{ statusLabel }}</span>
+        <span class="text-warm-400">·</span>
+        <span class="font-mono text-iolite truncate">{{ model || '—' }}</span>
+        <span class="flex-1" />
+        <span class="text-warm-400 font-mono">{{ elapsedStr }}</span>
+      </div>
+      <div class="flex items-center gap-2 text-[10px] text-warm-500">
+        <span class="shrink-0">in</span>
+        <div
+          class="relative flex-1 h-1.5 rounded-full bg-warm-100 dark:bg-warm-800 overflow-hidden"
+        >
+          <div
+            class="absolute left-0 top-0 h-full rounded-full"
+            :class="contextPct >= 80 ? 'bg-coral' : contextPct >= 60 ? 'bg-amber' : 'bg-aquamarine'"
+            :style="{ width: Math.min(contextPct, 100) + '%' }"
+          />
+        </div>
+        <span class="font-mono shrink-0">
+          {{ formatTokens(totals.lastPrompt) }}{{ maxContext ? '/' + formatTokens(maxContext) : '' }}
+          <span v-if="maxContext"> ({{ contextPct }}%)</span>
+        </span>
+      </div>
+      <div class="flex items-center gap-3 text-[10px] text-warm-500">
+        <span>
+          <span class="i-carbon-arrow-up text-[9px]" />
+          out <span class="font-mono text-warm-600 dark:text-warm-400">{{ formatTokens(totals.completion) }}</span>
+        </span>
+      </div>
+    </div>
+
+    <!-- Running jobs list -->
     <div class="flex-1 overflow-y-auto px-3 py-2 text-xs">
       <div
         v-if="jobCount === 0"
@@ -44,11 +83,27 @@
         </div>
       </div>
     </div>
+
+    <!-- Session totals (pinned bottom) -->
+    <div
+      class="px-3 py-1.5 border-t border-warm-200 dark:border-warm-700 text-[10px] text-warm-500 flex items-center gap-3 shrink-0"
+    >
+      <span class="text-warm-400 uppercase tracking-wider text-[9px]">Σ</span>
+      <span>
+        in <span class="font-mono text-warm-600 dark:text-warm-400">{{ formatTokens(totals.prompt) }}</span>
+      </span>
+      <span>
+        out <span class="font-mono text-warm-600 dark:text-warm-400">{{ formatTokens(totals.completion) }}</span>
+      </span>
+      <span v-if="totals.cached > 0">
+        cache <span class="font-mono text-aquamarine">{{ formatTokens(totals.cached) }}</span>
+      </span>
+    </div>
   </div>
 </template>
 
 <script setup>
-import { computed } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 
 import { useChatStore } from "@/stores/chat";
 import { agentAPI } from "@/utils/api";
@@ -60,6 +115,71 @@ const props = defineProps({
 const chat = useChatStore();
 
 const jobCount = computed(() => Object.keys(chat.runningJobs || {}).length);
+const model = computed(() => chat.sessionInfo.model || props.instance?.model || "");
+const maxContext = computed(
+  () => chat.sessionInfo.maxContext || props.instance?.max_context || 0,
+);
+
+const totals = computed(() => {
+  let prompt = 0;
+  let completion = 0;
+  let cached = 0;
+  let lastPrompt = 0;
+  for (const u of Object.values(chat.tokenUsage || {})) {
+    prompt += u.prompt || 0;
+    completion += u.completion || 0;
+    cached += u.cached || 0;
+    if ((u.lastPrompt || 0) > lastPrompt) lastPrompt = u.lastPrompt;
+  }
+  return { prompt, completion, cached, lastPrompt };
+});
+
+const contextPct = computed(() => {
+  if (!maxContext.value) return 0;
+  return Math.round((totals.value.lastPrompt / maxContext.value) * 100);
+});
+
+const statusLabel = computed(() => {
+  if (jobCount.value > 0) return "running";
+  return "idle";
+});
+
+const statusDotClass = computed(() =>
+  jobCount.value > 0 ? "bg-amber kohaku-pulse" : "bg-warm-400",
+);
+
+// Elapsed since the most recent job started (or 0 if idle).
+const now = ref(Date.now());
+let tick = null;
+onMounted(() => {
+  tick = setInterval(() => (now.value = Date.now()), 1000);
+});
+onUnmounted(() => {
+  if (tick) clearInterval(tick);
+});
+
+const elapsedStr = computed(() => {
+  const jobs = Object.values(chat.runningJobs || {});
+  if (jobs.length === 0) return "—";
+  let minStart = Infinity;
+  for (const j of jobs) {
+    const s = j.startedAt || j.started_at || Date.now();
+    const ts = typeof s === "number" ? s : Date.parse(s);
+    if (Number.isFinite(ts) && ts < minStart) minStart = ts;
+  }
+  if (!Number.isFinite(minStart)) return "—";
+  const secs = Math.max(0, Math.floor((now.value - minStart) / 1000));
+  const m = Math.floor(secs / 60);
+  const s = secs % 60;
+  return m > 0 ? `${m}m ${s}s` : `${s}s`;
+});
+
+function formatTokens(n) {
+  if (!n) return "0";
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + "M";
+  if (n >= 1_000) return (n / 1_000).toFixed(1) + "k";
+  return String(n);
+}
 
 async function stopJob(jobId, name) {
   const agentId = props.instance?.id;
