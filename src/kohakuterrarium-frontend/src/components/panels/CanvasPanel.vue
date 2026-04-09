@@ -1,0 +1,143 @@
+<template>
+  <div class="h-full flex flex-col bg-white dark:bg-warm-900 overflow-hidden">
+    <!-- Tab strip (one per artifact) -->
+    <div
+      class="flex items-center gap-0.5 px-2 h-8 border-b border-warm-200 dark:border-warm-700 overflow-x-auto shrink-0 text-[11px]"
+    >
+      <div
+        v-if="canvas.artifacts.length === 0"
+        class="text-warm-400 italic"
+      >
+        No artifacts yet
+      </div>
+      <button
+        v-for="a in canvas.artifacts"
+        :key="a.id"
+        class="flex items-center gap-1 px-2 py-0.5 rounded transition-colors"
+        :class="canvas.activeId === a.id
+          ? 'bg-iolite/15 text-iolite'
+          : 'text-warm-500 hover:text-warm-700 dark:hover:text-warm-300 hover:bg-warm-100 dark:hover:bg-warm-800'"
+        :title="`${a.name} · ${a.type} · v${a.versions.length}`"
+        @click="canvas.setActive(a.id)"
+      >
+        <span :class="typeIcon(a.type)" class="text-[11px]" />
+        <span class="truncate max-w-32">{{ a.name }}</span>
+        <span
+          v-if="a.versions.length > 1"
+          class="text-[9px] font-mono opacity-60"
+        >v{{ a.versions.length }}</span>
+      </button>
+    </div>
+
+    <!-- Viewer -->
+    <div class="flex-1 min-h-0 overflow-hidden">
+      <div
+        v-if="!canvas.activeArtifact"
+        class="h-full flex items-center justify-center text-warm-400 text-xs"
+      >
+        <div class="text-center">
+          <div class="i-carbon-canvas text-3xl mb-2 mx-auto opacity-30" />
+          <p>Artifacts appear here automatically.</p>
+          <p class="text-[10px] mt-1 opacity-70">
+            Long code blocks (>= 15 lines) or
+            <code class="font-mono">##canvas##</code> markers.
+          </p>
+        </div>
+      </div>
+
+      <CodeViewer
+        v-else-if="viewerType === 'code' || viewerType === 'svg' || viewerType === 'diagram'"
+        :content="canvas.activeVersion.content"
+        :lang="canvas.activeVersion.lang"
+      />
+      <MarkdownViewer
+        v-else-if="viewerType === 'markdown'"
+        :content="canvas.activeVersion.content"
+      />
+      <HtmlViewer
+        v-else-if="viewerType === 'html'"
+        :content="canvas.activeVersion.content"
+      />
+      <CodeViewer
+        v-else
+        :content="canvas.activeVersion.content"
+        :lang="canvas.activeVersion.lang"
+      />
+    </div>
+
+    <!-- Version strip (bottom) -->
+    <div
+      v-if="canvas.activeArtifact && canvas.activeArtifact.versions.length > 1"
+      class="flex items-center gap-1 px-2 h-6 border-t border-warm-200 dark:border-warm-700 text-[10px] text-warm-500 shrink-0"
+    >
+      <span class="text-[9px] uppercase tracking-wider mr-1">Versions</span>
+      <span
+        v-for="(v, i) in canvas.activeArtifact.versions"
+        :key="i"
+        class="px-1.5 py-0.5 rounded font-mono"
+        :class="i === canvas.activeArtifact.versions.length - 1
+          ? 'bg-iolite/10 text-iolite'
+          : 'bg-warm-100 dark:bg-warm-800'"
+      >v{{ i + 1 }}</span>
+    </div>
+  </div>
+</template>
+
+<script setup>
+import { computed, onMounted, onUnmounted, watch } from "vue";
+
+import CodeViewer from "@/components/panels/canvas/CodeViewer.vue";
+import HtmlViewer from "@/components/panels/canvas/HtmlViewer.vue";
+import MarkdownViewer from "@/components/panels/canvas/MarkdownViewer.vue";
+import { useCanvasStore } from "@/stores/canvas";
+import { useChatStore } from "@/stores/chat";
+
+const canvas = useCanvasStore();
+const chat = useChatStore();
+
+const viewerType = computed(() => canvas.activeArtifact?.type || "code");
+
+function typeIcon(t) {
+  return {
+    code: "i-carbon-code",
+    markdown: "i-carbon-document",
+    html: "i-carbon-html",
+    svg: "i-carbon-image",
+    diagram: "i-carbon-flow-connection",
+    table: "i-carbon-data-table",
+  }[t] || "i-carbon-document";
+}
+
+// When the panel mounts, do one full pass over existing messages to
+// pick up any artifacts that arrived before the panel was visible.
+onMounted(() => {
+  canvas.syncFromChatStore();
+});
+
+// Watch new messages landing in the active tab and scan only the tail.
+// This keeps the work incremental instead of rescanning the whole tab.
+let lastLen = 0;
+const stopWatch = watch(
+  () => {
+    const tab = chat.activeTab;
+    if (!tab) return 0;
+    return chat.messagesByTab?.[tab]?.length || 0;
+  },
+  (len, prev) => {
+    if (len <= (prev ?? 0)) {
+      lastLen = len;
+      return;
+    }
+    const tab = chat.activeTab;
+    const msgs = chat.messagesByTab?.[tab] || [];
+    for (let i = lastLen; i < msgs.length; i++) {
+      canvas.scanMessage(msgs[i]);
+    }
+    lastLen = len;
+  },
+);
+
+onUnmounted(() => {
+  stopWatch();
+});
+</script>

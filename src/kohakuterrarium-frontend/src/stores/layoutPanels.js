@@ -13,6 +13,7 @@ import EditorMain from "@/components/editor/EditorMain.vue";
 import EditorStatus from "@/components/editor/EditorStatus.vue";
 import FileTree from "@/components/editor/FileTree.vue";
 import ActivityPanel from "@/components/panels/ActivityPanel.vue";
+import CanvasPanel from "@/components/panels/CanvasPanel.vue";
 import CreaturesPanel from "@/components/panels/CreaturesPanel.vue";
 import FilesPanel from "@/components/panels/FilesPanel.vue";
 import StatePanel from "@/components/panels/StatePanel.vue";
@@ -294,6 +295,15 @@ export function registerBuiltinPanels() {
     component: CreaturesPanel,
     preferredZones: ["left-sidebar", "right-sidebar"],
     orientation: "tall-narrow",
+    supportsDetach: true,
+  });
+
+  layout.registerPanel({
+    id: "canvas",
+    label: "Canvas",
+    component: CanvasPanel,
+    preferredZones: ["main", "right-aux"],
+    orientation: "tall-wide",
     supportsDetach: true,
   });
 
