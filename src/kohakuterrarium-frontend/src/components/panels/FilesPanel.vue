@@ -103,9 +103,10 @@
 </template>
 
 <script setup>
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 
 import FileTree from "@/components/editor/FileTree.vue";
+import { useChatStore } from "@/stores/chat";
 import { useFilesStore } from "@/stores/files";
 
 const props = defineProps({
@@ -113,10 +114,23 @@ const props = defineProps({
   onSelect: { type: Function, default: () => {} },
 });
 
+const chat = useChatStore();
 const files = useFilesStore();
 
 const view = ref("tree");
 const treeRef = ref(null);
+
+// Auto-refresh file tree when tool calls complete (file writes).
+watch(
+  () => Object.keys(chat.runningJobs).length,
+  (count, prev) => {
+    if (count < (prev ?? 0)) {
+      // A job finished — refresh tree after a short delay to let
+      // the filesystem settle.
+      setTimeout(() => treeRef.value?.refresh(), 500);
+    }
+  },
+);
 
 const touchedCount = computed(() => files.touched.length);
 

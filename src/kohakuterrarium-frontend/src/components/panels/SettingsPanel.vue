@@ -2,7 +2,7 @@
   <div class="h-full flex bg-warm-50 dark:bg-warm-900 overflow-hidden">
     <!-- Vertical tab strip on the left -->
     <div
-      class="flex flex-col gap-0.5 py-2 px-1 border-r border-warm-200 dark:border-warm-700 shrink-0 w-28"
+      class="flex flex-col gap-0.5 py-2 px-1 border-r border-warm-200 dark:border-warm-700 shrink-0 min-w-24 w-auto"
     >
       <button
         v-for="t in tabs"

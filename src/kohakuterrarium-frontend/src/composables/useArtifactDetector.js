@@ -1,11 +1,14 @@
 /**
- * useArtifactDetector — watches the chat store for new assistant
- * messages and scans them for canvas artifacts. Runs globally
- * (called from App.vue) so detection works regardless of which
- * preset is active.
+ * useArtifactDetector — watches the chat store for assistant messages
+ * and scans them for canvas artifacts. Runs globally (App.vue) so
+ * detection works regardless of which preset is active.
+ *
+ * Rescans when:
+ *   - New messages arrive (message count changes)
+ *   - Processing ends (streaming complete — final scan of the last message)
  */
 
-import { onMounted, watch } from "vue";
+import { watch } from "vue";
 
 import { useCanvasStore } from "@/stores/canvas";
 import { useChatStore } from "@/stores/chat";
@@ -14,35 +17,34 @@ export function useArtifactDetector() {
   const chat = useChatStore();
   const canvas = useCanvasStore();
 
-  let lastScanned = 0;
-
-  function scanNewMessages() {
+  function scanAll() {
     const tab = chat.activeTab;
     if (!tab) return;
     const msgs = chat.messagesByTab?.[tab] || [];
-    // Only scan messages we haven't seen yet.
-    for (let i = lastScanned; i < msgs.length; i++) {
-      canvas.scanMessage(msgs[i]);
+    for (const m of msgs) {
+      canvas.scanMessage(m);
     }
-    lastScanned = msgs.length;
   }
 
-  onMounted(() => {
-    // Full scan on first mount.
-    canvas.syncFromChatStore();
-    const tab = chat.activeTab;
-    lastScanned = (chat.messagesByTab?.[tab] || []).length;
-  });
+  // Rescan all messages when processing ends (the last streamed
+  // message is now complete with full content).
+  watch(
+    () => chat.processing,
+    (processing, prev) => {
+      if (!processing && prev) scanAll();
+    },
+  );
 
-  // Watch for new messages.
+  // Also scan when new messages arrive.
   watch(
     () => {
       const tab = chat.activeTab;
       if (!tab) return 0;
       return chat.messagesByTab?.[tab]?.length || 0;
     },
-    (len) => {
-      if (len > lastScanned) scanNewMessages();
-    },
+    () => scanAll(),
   );
+
+  // Scan when the active tab changes (e.g. switching creatures).
+  watch(() => chat.activeTab, () => scanAll());
 }
