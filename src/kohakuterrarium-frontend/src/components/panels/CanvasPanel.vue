@@ -22,10 +22,6 @@
       >
         <span :class="typeIcon(a.type)" class="text-[11px]" />
         <span class="truncate max-w-32">{{ a.name }}</span>
-        <span
-          v-if="a.versions.length > 1"
-          class="text-[9px] font-mono opacity-60"
-        >v{{ a.versions.length }}</span>
       </button>
 
       <div class="flex-1" />
