@@ -20,7 +20,9 @@ export function useFileWatcher(agentIdRef) {
 
   let ws = null;
   let retryTimer = null;
-  let retryDelay = 1000;
+  let retryDelay = 2000;
+  let retryCount = 0;
+  const MAX_RETRIES = 5;
   let closed = false;
 
   function connect(agentId) {
@@ -37,7 +39,8 @@ export function useFileWatcher(agentIdRef) {
 
     ws.onopen = () => {
       connected.value = true;
-      retryDelay = 1000;
+      retryDelay = 2000;
+      retryCount = 0;
     };
 
     ws.onmessage = (ev) => {
@@ -64,9 +67,11 @@ export function useFileWatcher(agentIdRef) {
   }
 
   function scheduleRetry(agentId) {
+    if (retryCount >= MAX_RETRIES) return; // stop retrying
+    retryCount++;
     if (retryTimer) clearTimeout(retryTimer);
     retryTimer = setTimeout(() => {
-      retryDelay = Math.min(retryDelay * 1.5, 10000);
+      retryDelay = Math.min(retryDelay * 2, 30000);
       connect(agentId);
     }, retryDelay);
   }

@@ -27,8 +27,14 @@ logger = get_logger(__name__)
 router = APIRouter()
 
 
-def _find_shell() -> str:
-    """Find a suitable shell binary."""
+def _find_shell() -> str | list[str]:
+    """Find a suitable shell binary. Returns path or [cmd, args] list."""
+    if sys.platform == "win32":
+        # Prefer PowerShell, fall back to cmd.exe
+        pwsh = shutil.which("pwsh") or shutil.which("powershell")
+        if pwsh:
+            return pwsh
+        return os.environ.get("COMSPEC", "cmd.exe")
     for sh in ("bash", "sh", "zsh"):
         path = shutil.which(sh)
         if path:
@@ -136,13 +142,13 @@ async def _pty_session(websocket: WebSocket, cwd: str) -> None:
 async def _subprocess_session(websocket: WebSocket, cwd: str) -> None:
     """Fallback for Windows — uses asyncio subprocess (no PTY)."""
     shell = _find_shell()
+    logger.info("Starting subprocess terminal", shell=shell, cwd=cwd)
     proc = await asyncio.create_subprocess_exec(
         shell,
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         cwd=cwd,
-        env={**os.environ, "TERM": "dumb"},
     )
 
     await websocket.send_json({"type": "output", "data": ""})

@@ -96,9 +96,10 @@ async def watch_files(websocket: WebSocket, agent_id: str):
         await _watch_directory(str(root), websocket)
     except WebSocketDisconnect:
         pass
-    except Exception:
-        logger.debug("file watch WS error", exc_info=True)
+    except Exception as e:
+        logger.warning("file watch WS error", error=str(e), exc_info=True)
         try:
+            await websocket.send_json({"type": "error", "text": str(e)})
             await websocket.close()
         except Exception:
             pass
