@@ -240,7 +240,7 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, ref, watch } from "vue";
 
 import { useChatStore } from "@/stores/chat";
 import { useScratchpadStore } from "@/stores/scratchpad";
@@ -386,21 +386,12 @@ const compactions = computed(() => {
   return msgs.filter((m) => m.role === "compact");
 });
 
-// ── Polling ───────────────────────────────────────────────────
-watch(
-  agentId,
-  (id, prev) => {
-    if (prev) scratchpad.stopPolling(prev);
-    if (id) scratchpad.startPolling(id);
-  },
-  { immediate: true },
-);
+// Fetch once on mount and when agentId changes.
+watch(agentId, (id) => {
+  if (id) scratchpad.fetch(id);
+}, { immediate: true });
 
 onMounted(() => {
-  if (agentId.value) scratchpad.startPolling(agentId.value);
-});
-
-onUnmounted(() => {
-  if (agentId.value) scratchpad.stopPolling(agentId.value);
+  if (agentId.value) scratchpad.fetch(agentId.value);
 });
 </script>

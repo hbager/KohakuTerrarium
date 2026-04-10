@@ -31,6 +31,7 @@ import { computed, onMounted, provide, ref, watch } from "vue";
 
 import WorkspaceShell from "@/components/layout/WorkspaceShell.vue";
 import { useChatStore } from "@/stores/chat";
+import { useEditorStore } from "@/stores/editor";
 import { useInstancesStore } from "@/stores/instances";
 import { useLayoutStore } from "@/stores/layout";
 
@@ -38,6 +39,7 @@ const route = useRoute();
 const router = useRouter();
 const instances = useInstancesStore();
 const chat = useChatStore();
+const editor = useEditorStore();
 const layout = useLayoutStore();
 
 const instance = computed(() => instances.current);
@@ -56,7 +58,11 @@ const panelProps = computed(() => ({
   creatures: { instance: instance.value },
   files: {
     root: instance.value?.pwd || "",
-    onSelect: (path) => {},
+    onSelect: (path) => editor.openFile(path),
+  },
+  "file-tree": {
+    root: instance.value?.pwd || "",
+    onSelect: (path) => editor.openFile(path),
   },
   settings: { instance: instance.value },
   debug: { instance: instance.value },

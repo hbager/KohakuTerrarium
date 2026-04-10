@@ -1,16 +1,42 @@
 <template>
   <!-- Leaf node: render the panel -->
-  <div v-if="node.type === 'leaf'" class="layout-leaf h-full w-full overflow-hidden">
-    <component
-      :is="panel?.component"
-      v-if="panel?.component"
-      v-bind="panelRuntimeProps"
-    />
+  <div v-if="node.type === 'leaf'" class="layout-leaf h-full w-full overflow-hidden flex flex-col">
+    <!-- Edit mode: show panel label bar with replace/close -->
     <div
-      v-else
-      class="h-full w-full flex items-center justify-center text-[11px] text-warm-400"
+      v-if="layout.editMode"
+      class="flex items-center gap-1 px-2 h-6 border-b border-amber/30 bg-amber/10 text-[10px] shrink-0"
     >
-      {{ node.panelId ? `no such panel: ${node.panelId}` : 'empty' }}
+      <span class="font-medium text-amber-shadow dark:text-amber-light truncate flex-1">
+        {{ panel?.label || node.panelId }}
+      </span>
+      <button
+        class="px-1.5 py-0.5 rounded text-warm-500 hover:text-warm-700 dark:hover:text-warm-300 hover:bg-warm-100 dark:hover:bg-warm-800"
+        title="Replace panel"
+        @click="$emit('replace', node)"
+      >
+        <div class="i-carbon-switcher text-[11px]" />
+      </button>
+      <button
+        class="px-1.5 py-0.5 rounded text-warm-500 hover:text-coral hover:bg-warm-100 dark:hover:bg-warm-800"
+        title="Close panel"
+        @click="$emit('close', node)"
+      >
+        <div class="i-carbon-close text-[11px]" />
+      </button>
+    </div>
+
+    <div class="flex-1 min-h-0">
+      <component
+        :is="panel?.component"
+        v-if="panel?.component"
+        v-bind="panelRuntimeProps"
+      />
+      <div
+        v-else
+        class="h-full w-full flex items-center justify-center text-[11px] text-warm-400"
+      >
+        {{ node.panelId ? `no such panel: ${node.panelId}` : 'empty' }}
+      </div>
     </div>
   </div>
 
@@ -67,6 +93,8 @@ const props = defineProps({
   instanceId: { type: String, default: null },
   panelPropsMap: { type: Object, default: null },
 });
+
+defineEmits(["replace", "close"]);
 
 const layout = useLayoutStore();
 

@@ -1,7 +1,6 @@
 /**
  * Scratchpad store — talks to the Phase 1 read-only API to fetch and
- * patch an agent's scratchpad. Polls on a short interval while the
- * panel is mounted so values stay in sync.
+ * patch an agent's scratchpad. Fetch-on-demand only (no polling).
  */
 
 import { defineStore } from "pinia";
@@ -13,7 +12,6 @@ export const useScratchpadStore = defineStore("scratchpad", () => {
   const byAgent = ref(/** @type {Record<string, Record<string, string>>} */ ({}));
   const loading = ref(/** @type {Record<string, boolean>} */ ({}));
   const error = ref(/** @type {Record<string, string>} */ ({}));
-  const pollTimers = ref(/** @type {Record<string, any>} */ ({}));
 
   async function fetch(agentId) {
     if (!agentId) return;
@@ -38,34 +36,9 @@ export const useScratchpadStore = defineStore("scratchpad", () => {
     return data;
   }
 
-  function startPolling(agentId, intervalMs = 4000) {
-    stopPolling(agentId);
-    fetch(agentId);
-    pollTimers.value[agentId] = setInterval(() => fetch(agentId), intervalMs);
-  }
-
-  function stopPolling(agentId) {
-    const t = pollTimers.value[agentId];
-    if (t) {
-      clearInterval(t);
-      const next = { ...pollTimers.value };
-      delete next[agentId];
-      pollTimers.value = next;
-    }
-  }
-
   function getFor(agentId) {
     return byAgent.value[agentId] || {};
   }
 
-  return {
-    byAgent,
-    loading,
-    error,
-    fetch,
-    patch,
-    startPolling,
-    stopPolling,
-    getFor,
-  };
+  return { byAgent, loading, error, fetch, patch, getFor };
 });
