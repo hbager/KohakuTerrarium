@@ -951,7 +951,10 @@ export const useChatStore = defineStore("chat", {
       }
       try {
         const { agentAPI } = await import("@/utils/api");
+        // Re-fetch history BEFORE triggering regen so the frontend
+        // state matches the backend's truncated conversation.
         await agentAPI.regenerate(this._instanceId);
+        await this._resyncHistory();
       } catch (e) {
         console.warn("Failed to regenerate:", e);
       }
@@ -964,6 +967,7 @@ export const useChatStore = defineStore("chat", {
       try {
         const { agentAPI } = await import("@/utils/api");
         await agentAPI.editMessage(this._instanceId, messageIdx, newContent);
+        await this._resyncHistory();
       } catch (e) {
         console.warn("Failed to edit message:", e);
       }
@@ -975,8 +979,28 @@ export const useChatStore = defineStore("chat", {
       try {
         const { agentAPI } = await import("@/utils/api");
         await agentAPI.rewindTo(this._instanceId, messageIdx);
+        await this._resyncHistory();
       } catch (e) {
         console.warn("Failed to rewind:", e);
+      }
+    },
+
+    /** Re-fetch conversation history from the backend and rebuild the
+     *  local message list. Called after edit/regenerate/rewind so the
+     *  frontend matches the backend's truncated conversation. */
+    async _resyncHistory() {
+      if (!this._instanceId) return;
+      try {
+        const { agentAPI } = await import("@/utils/api");
+        const data = await agentAPI.getHistory(this._instanceId);
+        const tab = this.activeTab;
+        if (!tab || !data?.events) return;
+        // Rebuild messages from the event history.
+        const events = data.events;
+        const { messages } = _replayEvents([], events);
+        this.messagesByTab[tab] = messages;
+      } catch (e) {
+        console.warn("Failed to resync history:", e);
       }
     },
 
