@@ -14,7 +14,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.session.store import SessionStore, iter_kv_keys
+
+
+def _all_keys(table):
+    return iter_kv_keys(table)
 
 
 def print_meta(store: SessionStore) -> None:
@@ -90,7 +94,7 @@ def print_channels(store: SessionStore) -> None:
     print("=== Channels ===")
     # Scan for all channel prefixes
     seen_channels = set()
-    for key_bytes in store.channels.keys():
+    for key_bytes in _all_keys(store.channels):
         key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
         parts = key.rsplit(":m", 1)
         if len(parts) == 2:
@@ -109,7 +113,7 @@ def print_channels(store: SessionStore) -> None:
 def print_subagents(store: SessionStore) -> None:
     print("=== Sub-Agent Runs ===")
     seen = set()
-    for key_bytes in store.subagents.keys():
+    for key_bytes in _all_keys(store.subagents):
         key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
         if key.endswith(":meta"):
             prefix = key[: -len(":meta")]
@@ -132,7 +136,7 @@ def print_subagents(store: SessionStore) -> None:
 
 def print_state(store: SessionStore) -> None:
     print("=== Agent State ===")
-    for key_bytes in sorted(store.state.keys()):
+    for key_bytes in sorted(_all_keys(store.state)):
         key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
         val = store.state[key_bytes]
         if isinstance(val, dict):
@@ -144,7 +148,7 @@ def print_state(store: SessionStore) -> None:
 
 def print_conversations(store: SessionStore) -> None:
     print("=== Conversation Snapshots ===")
-    for key_bytes in sorted(store.conversation.keys()):
+    for key_bytes in sorted(_all_keys(store.conversation)):
         key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
         messages = store.load_conversation(key)
         if messages:
@@ -192,7 +196,7 @@ def print_summary(store: SessionStore) -> None:
 
     # Count channels
     seen_channels = set()
-    for key_bytes in store.channels.keys():
+    for key_bytes in _all_keys(store.channels):
         key = key_bytes.decode() if isinstance(key_bytes, bytes) else key_bytes
         parts = key.rsplit(":m", 1)
         if len(parts) == 2:
@@ -203,7 +207,7 @@ def print_summary(store: SessionStore) -> None:
     # Count sub-agent runs
     sa_count = sum(
         1
-        for k in store.subagents.keys()
+        for k in _all_keys(store.subagents)
         if (k.decode() if isinstance(k, bytes) else k).endswith(":meta")
     )
     print(f"Sub-agent runs: {sa_count}")

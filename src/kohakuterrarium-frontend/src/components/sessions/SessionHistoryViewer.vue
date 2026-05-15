@@ -1,6 +1,6 @@
 <template>
-  <div class="h-full min-h-0 flex flex-col overflow-hidden">
-    <div v-if="!embedded" class="container-page max-w-6xl py-4 flex items-center gap-3 shrink-0">
+  <div class="h-full w-full min-h-0 flex flex-col overflow-hidden">
+    <div v-if="!embedded" class="container-page w-full max-w-6xl py-4 flex items-center gap-3 shrink-0">
       <button class="btn-secondary" @click="goBack"><span class="i-carbon-arrow-left mr-1" /> Back</button>
       <div class="min-w-0">
         <h1 class="text-xl font-bold text-warm-800 dark:text-warm-200 truncate">{{ sessionName }}</h1>
@@ -8,8 +8,8 @@
       </div>
     </div>
 
-    <div :class="embedded ? 'px-3 py-3' : 'container-page max-w-6xl pb-4'" class="flex-1 min-h-0 overflow-hidden">
-      <div class="h-full min-h-0 flex flex-col gap-3 lg:gap-4">
+    <div :class="embedded ? 'px-3 py-3' : 'container-page w-full max-w-6xl pb-4'" class="flex-1 w-full min-w-0 min-h-0 overflow-hidden">
+      <div class="h-full w-full min-w-0 min-h-0 flex flex-col gap-3 lg:gap-4">
         <div v-if="embedded" class="flex items-center gap-3 shrink-0">
           <button class="btn-secondary" @click="goBack"><span class="i-carbon-arrow-left mr-1" /> Back</button>
           <div class="min-w-0">
@@ -27,7 +27,7 @@
           </div>
         </div>
 
-        <div class="flex-1 min-h-0 overflow-hidden">
+        <div class="flex-1 w-full min-w-0 min-h-0 overflow-hidden">
           <div v-if="loading" class="card h-full flex items-center justify-center text-secondary">Loading history...</div>
           <div v-else-if="error" class="card h-full flex flex-col items-center justify-center text-center p-6">
             <div class="i-carbon-warning-alt text-2xl text-coral mb-3" />
@@ -35,7 +35,7 @@
             <div class="text-secondary text-xs mb-4">{{ error }}</div>
             <button class="btn-secondary" @click="loadSession">Retry</button>
           </div>
-          <div v-else class="h-full min-h-0 overflow-hidden">
+          <div v-else class="h-full w-full min-w-0 min-h-0 overflow-hidden">
             <ChatPanel :instance="viewerInstance" :read-only="true" empty-title="No saved messages" empty-subtitle="This target has no persisted history yet" />
           </div>
         </div>

@@ -139,7 +139,7 @@ class SessionMemory:
         """Clear FTS entries for an agent (before full re-index)."""
         try:
             to_delete = []
-            for row_id in self._fts.keys():
+            for row_id in self._fts.keys(limit=len(self._fts) + 1):
                 _, val = self._fts.get_by_id(row_id)
                 if isinstance(val, dict) and val.get("agent") == agent:
                     to_delete.append(row_id)
