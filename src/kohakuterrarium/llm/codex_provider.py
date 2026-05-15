@@ -44,6 +44,7 @@ from kohakuterrarium.llm.codex_rate_limits import (
     UsageSnapshot,
     set_cached,
 )
+from kohakuterrarium.llm.openai import ROOCODE_USER_AGENT
 from kohakuterrarium.llm.openai_sanitize import strip_surrogates
 from kohakuterrarium.llm.recovery import (
     ErrorClass,
@@ -166,6 +167,7 @@ class CodexOAuthProvider(BaseLLMProvider):
             base_url=CODEX_BASE_URL,
             timeout=self.timeout,
             max_retries=self.max_retries,
+            default_headers={"User-Agent": ROOCODE_USER_AGENT},
             http_client=http_client,
         )
 

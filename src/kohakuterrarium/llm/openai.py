@@ -22,6 +22,7 @@ from kohakuterrarium.llm.base import (
     ToolSchema,
 )
 from kohakuterrarium.llm.openai_helpers import (
+    apply_request_controls,
     delta_field,
     delta_field_present,
     extract_usage,
@@ -53,6 +54,7 @@ _pack_reasoning_fields = pack_reasoning_fields
 # Default API endpoints
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+ROOCODE_USER_AGENT = "RooCode/3.52.1"
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -86,6 +88,8 @@ class OpenAIProvider(BaseLLMProvider):
         *,
         temperature: float = 0.7,
         max_tokens: int | None = None,
+        reasoning_effort: str = "",
+        service_tier: str | None = None,
         timeout: float = 120.0,
         extra_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
@@ -101,6 +105,8 @@ class OpenAIProvider(BaseLLMProvider):
             base_url: API base URL (change for OpenRouter, etc.)
             temperature: Sampling temperature
             max_tokens: Maximum tokens to generate
+            reasoning_effort: Optional top-level OpenAI reasoning effort.
+            service_tier: Optional top-level OpenAI service tier.
             timeout: Request timeout in seconds
             extra_headers: Additional headers (e.g., for OpenRouter HTTP-Referer)
             extra_body: Additional fields merged into every API request body
@@ -125,6 +131,8 @@ class OpenAIProvider(BaseLLMProvider):
         )
 
         self.extra_body = extra_body or {}
+        self.reasoning_effort = reasoning_effort or ""
+        self.service_tier = service_tier
         self.echo_reasoning = bool(echo_reasoning)
         self._retry_policy = RetryPolicy.from_value(retry_policy)
         self._api_key_pool = api_key if isinstance(api_key, KeyPool) else None
@@ -153,7 +161,7 @@ class OpenAIProvider(BaseLLMProvider):
             base_url=base_url,
             timeout=timeout,
             max_retries=max_retries,
-            default_headers=extra_headers or {},
+            default_headers={"User-Agent": ROOCODE_USER_AGENT, **(extra_headers or {})},
         )
 
         # Log whether auto-caching will be engaged for this provider. One
@@ -194,6 +202,8 @@ class OpenAIProvider(BaseLLMProvider):
             ),
         )
         clone.extra_body = dict(self.extra_body)
+        clone.reasoning_effort = self.reasoning_effort
+        clone.service_tier = self.service_tier
         clone.echo_reasoning = self.echo_reasoning
         clone._retry_policy = self._retry_policy
         clone._api_key_pool = self._api_key_pool
@@ -369,6 +379,13 @@ class OpenAIProvider(BaseLLMProvider):
         if "extra_body" in kwargs:
             merged_extra.update(kwargs["extra_body"])
         merged_extra = self._sanitize_extra_body(merged_extra)
+        merged_extra = apply_request_controls(
+            create_kwargs,
+            merged_extra,
+            base_url=self.base_url,
+            reasoning_effort=kwargs.get("reasoning_effort", self.reasoning_effort),
+            service_tier=kwargs.get("service_tier", self.service_tier),
+        )
         if merged_extra:
             create_kwargs["extra_body"] = merged_extra
 
@@ -555,6 +572,13 @@ class OpenAIProvider(BaseLLMProvider):
         if "extra_body" in kwargs:
             merged_extra.update(kwargs["extra_body"])
         merged_extra = self._sanitize_extra_body(merged_extra)
+        merged_extra = apply_request_controls(
+            create_kwargs,
+            merged_extra,
+            base_url=self.base_url,
+            reasoning_effort=kwargs.get("reasoning_effort", self.reasoning_effort),
+            service_tier=kwargs.get("service_tier", self.service_tier),
+        )
         if merged_extra:
             create_kwargs["extra_body"] = merged_extra
 

@@ -296,6 +296,8 @@ def test_inline_provider_anthropic_keeps_openai_compat_without_auth_mode():
         model="claude-openai-compat",
         temperature=0.7,
         max_tokens=None,
+        reasoning_effort="medium",
+        service_tier=None,
         extra_body=None,
         retry_policy=None,
     )

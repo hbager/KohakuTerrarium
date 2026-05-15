@@ -160,6 +160,8 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
             model=profile.model,
             temperature=profile.temperature,
             max_tokens=profile.max_output or None,
+            reasoning_effort=profile.reasoning_effort or "",
+            service_tier=profile.service_tier or None,
             extra_body=profile.extra_body or None,
             retry_policy=retry_policy,
         )
@@ -253,6 +255,8 @@ def _create_from_inline(config: AgentConfig) -> LLMProvider:
         model=config.model,
         temperature=config.temperature,
         max_tokens=config.max_tokens,
+        reasoning_effort=config.reasoning_effort,
+        service_tier=config.service_tier or None,
         extra_body=config.extra_body or None,
         retry_policy=config.retry_policy,
     )

@@ -212,6 +212,8 @@ class TestBootstrapLLM:
             model="gpt-4o",
             temperature=0.5,
             max_tokens=2048,
+            reasoning_effort="high",
+            service_tier=None,
             extra_body=None,
             retry_policy=None,
         )

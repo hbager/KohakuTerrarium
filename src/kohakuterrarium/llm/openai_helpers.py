@@ -2,6 +2,7 @@
 
 from typing import Any
 
+from kohakuterrarium.llm.anthropic_cache import is_anthropic_endpoint
 from kohakuterrarium.llm.base import NativeToolCall
 from kohakuterrarium.utils.logging import get_logger
 
@@ -81,6 +82,73 @@ def pack_reasoning_fields(
     for k, v in (extra or {}).items():
         packed[k] = v
     return packed
+
+
+def lift_legacy_reasoning_effort(
+    extra: dict[str, Any],
+    *,
+    base_url: str,
+) -> tuple[dict[str, Any], str]:
+    """Promote legacy ``extra_body.reasoning.effort`` for OpenAI endpoints.
+
+    Older local configs sometimes stored OpenAI reasoning effort under
+    ``extra_body: {reasoning: {effort: ...}}``. The official OpenAI SDK
+    expects that as a top-level ``reasoning_effort`` parameter for chat
+    completions. Keep OpenAI proper compatible while leaving provider-
+    specific ``reasoning`` bodies intact for OpenAI-compatible services
+    that use their own schema.
+    """
+    base = (base_url or "").lower()
+    if is_anthropic_endpoint(base_url, None):
+        return extra, ""
+    if any(
+        host in base
+        for host in (
+            "openrouter.ai",
+            "generativelanguage.googleapis.com",
+            "xiaomimimo.com",
+        )
+    ):
+        return extra, ""
+
+    reasoning = extra.get("reasoning")
+    if not isinstance(reasoning, dict) or reasoning.get("enabled") is False:
+        return extra, ""
+
+    effort = reasoning.get("effort")
+    if not isinstance(effort, str) or not effort:
+        return extra, ""
+
+    remaining = {
+        k: v for k, v in reasoning.items() if k not in {"enabled", "effort"}
+    }
+    next_extra = dict(extra)
+    if remaining:
+        next_extra["reasoning"] = remaining
+    else:
+        next_extra.pop("reasoning", None)
+    return next_extra, effort
+
+
+def apply_request_controls(
+    create_kwargs: dict[str, Any],
+    merged_extra: dict[str, Any],
+    *,
+    base_url: str,
+    reasoning_effort: str = "",
+    service_tier: str | None = None,
+) -> dict[str, Any]:
+    """Apply OpenAI-style reasoning/service controls to a request."""
+    merged_extra, promoted_effort = lift_legacy_reasoning_effort(
+        merged_extra,
+        base_url=base_url,
+    )
+    effort = reasoning_effort or promoted_effort
+    if service_tier:
+        create_kwargs["service_tier"] = service_tier
+    if effort:
+        create_kwargs["reasoning_effort"] = effort
+    return merged_extra
 
 
 _STATEFUL_ASSISTANT_FIELD_DEFAULTS: dict[str, Any] = {
