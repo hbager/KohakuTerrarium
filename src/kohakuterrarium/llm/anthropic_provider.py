@@ -17,6 +17,7 @@ except ImportError:  # pragma: no cover - exercised when dependency absent
     Omit = None  # type: ignore[assignment,misc]
     HAS_ANTHROPIC = False
 
+from kohakuterrarium.llm.api_keys import KeyPool
 from kohakuterrarium.llm.anthropic_format import (
     ANTHROPIC_KNOWN_BODY_FIELDS,
     INTERNAL_EXTRA_KEYS,
@@ -62,7 +63,7 @@ class AnthropicProvider(BaseLLMProvider):
 
     def __init__(
         self,
-        api_key: str | None = None,
+        api_key: str | KeyPool | None = None,
         model: str = "",
         base_url: str | None = ANTHROPIC_BASE_URL,
         *,
@@ -88,7 +89,9 @@ class AnthropicProvider(BaseLLMProvider):
             raise ImportError(
                 "anthropic not installed. Install with: pip install anthropic"
             )
-        if not api_key:
+        api_key_pool = api_key if isinstance(api_key, KeyPool) else None
+        api_key_for_client = api_key.first if isinstance(api_key, KeyPool) else api_key
+        if not api_key_for_client:
             raise ValueError(
                 "API key is required. Set ANTHROPIC_API_KEY or configure a "
                 "provider key with 'kt login <provider>'."
@@ -96,7 +99,8 @@ class AnthropicProvider(BaseLLMProvider):
 
         self.extra_body = dict(extra_body or {})
         self._retry_policy = RetryPolicy.from_value(retry_policy)
-        self._api_key = api_key
+        self._api_key_pool = api_key_pool
+        self._api_key = api_key_for_client
         self.base_url = base_url or ANTHROPIC_BASE_URL
         self._timeout = timeout
         self._extra_headers = dict(extra_headers or {})
@@ -118,8 +122,8 @@ class AnthropicProvider(BaseLLMProvider):
         if self.auth_as_bearer:
             default_headers.setdefault("X-Api-Key", Omit())
         self._client = AsyncAnthropic(
-            api_key=None if self.auth_as_bearer else api_key,
-            auth_token=api_key if self.auth_as_bearer else None,
+            api_key=None if self.auth_as_bearer else api_key_for_client,
+            auth_token=api_key_for_client if self.auth_as_bearer else None,
             base_url=self.base_url,
             timeout=timeout,
             max_retries=max_retries,
@@ -151,6 +155,7 @@ class AnthropicProvider(BaseLLMProvider):
         )
         clone.extra_body = dict(self.extra_body)
         clone._retry_policy = self._retry_policy
+        clone._api_key_pool = self._api_key_pool
         clone._api_key = self._api_key
         clone.base_url = self.base_url
         clone._timeout = self._timeout
@@ -374,6 +379,20 @@ class AnthropicProvider(BaseLLMProvider):
             model=getattr(response, "model", None) or create_kwargs["model"],
         )
 
+    def _apply_request_api_key(self, create_kwargs: dict[str, Any]) -> None:
+        """Attach per-request auth headers when a key pool is configured."""
+        if not self._api_key_pool:
+            return
+        key = self._api_key_pool.next()
+        if not key:
+            return
+        headers = dict(create_kwargs.get("extra_headers") or {})
+        if self.auth_as_bearer:
+            headers["Authorization"] = f"Bearer {key}"
+        else:
+            headers["X-Api-Key"] = key
+        create_kwargs["extra_headers"] = headers
+
     def _log_token_usage(self) -> None:
         if not self._last_usage:
             return
@@ -441,4 +460,5 @@ class AnthropicProvider(BaseLLMProvider):
             create_kwargs = self._with_prompt_cache_markers(create_kwargs)
         if merged_extra:
             create_kwargs["extra_body"] = merged_extra
+        self._apply_request_api_key(create_kwargs)
         return create_kwargs

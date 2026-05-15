@@ -161,13 +161,13 @@ class SettingsOverlay:
                     }
                 )
                 continue
-            key = get_api_key(name)
-            masked = _mask_key(key) if key else ""
+            key_pool = get_api_key(name)
+            masked = _mask_key(key_pool.first) if key_pool else ""
             rows.append(
                 {
                     "provider": name,
                     "masked": masked or "(not set)",
-                    "has_key": bool(key),
+                    "has_key": bool(key_pool),
                     "env": backend.api_key_env or PROVIDER_KEY_MAP.get(name, ""),
                     "readonly": False,
                 }
@@ -346,16 +346,19 @@ class SettingsOverlay:
             if row.get("readonly"):
                 self._flash = f"{row['provider']}: OAuth — run /login codex"
                 return
+            env_hint = f"env fallback: {row['env']}" if row["env"] else ""
+            pool_hint = "Multiple keys: separate with comma for round-robin"
+            hint = f"{env_hint}  |  {pool_hint}" if env_hint else pool_hint
             self._form = FormState(
                 title=f"Set API key · {row['provider']}",
                 action="set_key",
                 fields=[
                     FormField(
-                        label="API Key",
+                        label="API Key(s)",
                         key="key",
                         value="",
                         secret=True,
-                        hint=(f"env fallback: {row['env']}" if row["env"] else ""),
+                        hint=hint,
                     ),
                 ],
                 context={"provider": row["provider"]},
@@ -586,10 +589,15 @@ class SettingsOverlay:
         try:
             if action == "set_key":
                 provider = ctx["provider"]
-                if not values.get("key"):
+                raw = values.get("key", "")
+                if not raw:
                     self._form.message = "Key cannot be empty"
                     return
-                save_api_key(provider, values["key"])
+                keys = [key.strip() for key in raw.split(",") if key.strip()]
+                if not keys:
+                    self._form.message = "Key cannot be empty"
+                    return
+                save_api_key(provider, keys if len(keys) > 1 else keys[0])
                 self._flash = f"API key saved for {provider}"
                 self._refresh_tab("Keys")
             elif action in ("add_provider", "edit_provider"):

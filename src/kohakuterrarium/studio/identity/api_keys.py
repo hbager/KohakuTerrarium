@@ -59,13 +59,26 @@ def list_keys_for_cli() -> list[dict[str, Any]]:
     return rows
 
 
-def set_key(provider: str, key: str) -> None:
-    """Persist an API key. Raises ``ValueError`` for missing/unknown provider."""
-    if not provider or not key:
+def set_key(provider: str, key: str | list[str]) -> None:
+    """Persist an API key or comma-separated key pool.
+
+    A single key is stored as a string for backward compatibility; multiple
+    keys are stored as a list and consumed by the round-robin KeyPool.
+    """
+    if isinstance(key, str):
+        normalized: str | list[str] = [
+            part.strip() for part in key.split(",") if part.strip()
+        ]
+    else:
+        normalized = [str(part).strip() for part in key if str(part).strip()]
+    if isinstance(normalized, list) and len(normalized) == 1:
+        normalized = normalized[0]
+
+    if not provider or not normalized:
         raise ValueError("Provider and key are required")
     if provider not in load_backends():
         raise LookupError(f"Provider not found: {provider}")
-    save_api_key(provider, key)
+    save_api_key(provider, normalized)
 
 
 def remove_key(provider: str) -> None:
@@ -76,5 +89,5 @@ def remove_key(provider: str) -> None:
 
 
 def get_existing_key(provider: str) -> str:
-    """Return the currently stored key (for masked display only)."""
-    return get_api_key(provider)
+    """Return the first currently configured key (for masked display only)."""
+    return get_api_key(provider).first

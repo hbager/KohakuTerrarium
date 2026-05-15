@@ -14,6 +14,7 @@ from kohakuterrarium.llm.anthropic_cache import (
     apply_anthropic_cache_markers,
     is_anthropic_endpoint,
 )
+from kohakuterrarium.llm.api_keys import KeyPool
 from kohakuterrarium.llm.base import (
     BaseLLMProvider,
     ChatResponse,
@@ -79,7 +80,7 @@ class OpenAIProvider(BaseLLMProvider):
 
     def __init__(
         self,
-        api_key: str | None = None,
+        api_key: str | KeyPool | None = None,
         model: str = "",
         base_url: str = OPENAI_BASE_URL,
         *,
@@ -126,7 +127,9 @@ class OpenAIProvider(BaseLLMProvider):
         self.extra_body = extra_body or {}
         self.echo_reasoning = bool(echo_reasoning)
         self._retry_policy = RetryPolicy.from_value(retry_policy)
-        self._api_key = api_key
+        self._api_key_pool = api_key if isinstance(api_key, KeyPool) else None
+        api_key_for_client = api_key.first if isinstance(api_key, KeyPool) else api_key
+        self._api_key = api_key_for_client
         self._base_url_input = base_url
         self._timeout = timeout
         self._extra_headers = extra_headers or {}
@@ -139,14 +142,14 @@ class OpenAIProvider(BaseLLMProvider):
         # which is fine for ``"anthropic.com" in ...`` matching.
         self.base_url: str = base_url or ""
 
-        if not api_key:
+        if not api_key_for_client:
             raise ValueError(
                 "API key is required. "
                 "Set OPENROUTER_API_KEY or OPENAI_API_KEY environment variable."
             )
 
         self._client = AsyncOpenAI(
-            api_key=api_key,
+            api_key=api_key_for_client,
             base_url=base_url,
             timeout=timeout,
             max_retries=max_retries,
@@ -193,6 +196,7 @@ class OpenAIProvider(BaseLLMProvider):
         clone.extra_body = dict(self.extra_body)
         clone.echo_reasoning = self.echo_reasoning
         clone._retry_policy = self._retry_policy
+        clone._api_key_pool = self._api_key_pool
         clone._api_key = self._api_key
         clone._base_url_input = self._base_url_input
         clone._timeout = self._timeout
@@ -240,6 +244,27 @@ class OpenAIProvider(BaseLLMProvider):
         if self.extra_body.get("disable_prompt_caching"):
             return messages
         return apply_anthropic_cache_markers(messages)
+
+    def _next_api_key(self) -> str:
+        """Return the API key for this request.
+
+        A KeyPool rotates keys per request; single-key providers keep the
+        initialized SDK client's key.
+        """
+        if self._api_key_pool:
+            return self._api_key_pool.next()
+        return self._api_key or ""
+
+    def _apply_request_api_key(self, create_kwargs: dict[str, Any]) -> None:
+        """Attach per-request auth headers when a key pool is configured."""
+        if not self._api_key_pool:
+            return
+        key = self._api_key_pool.next()
+        if not key:
+            return
+        headers = dict(create_kwargs.get("extra_headers") or {})
+        headers["Authorization"] = f"Bearer {key}"
+        create_kwargs["extra_headers"] = headers
 
     def _sanitize_extra_body(self, extra: dict[str, Any]) -> dict[str, Any]:
         """Strip KT-internal knobs before sending to the provider.
@@ -350,6 +375,8 @@ class OpenAIProvider(BaseLLMProvider):
         # Prompt cache key: first-class SDK parameter for routing stickiness
         if self.prompt_cache_key:
             create_kwargs["prompt_cache_key"] = self.prompt_cache_key
+
+        self._apply_request_api_key(create_kwargs)
 
         log_request_shape(
             "Starting streaming request",
@@ -533,6 +560,8 @@ class OpenAIProvider(BaseLLMProvider):
 
         if self.prompt_cache_key:
             create_kwargs["prompt_cache_key"] = self.prompt_cache_key
+
+        self._apply_request_api_key(create_kwargs)
 
         log_request_shape(
             "Starting non-streaming request",

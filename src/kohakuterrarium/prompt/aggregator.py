@@ -38,6 +38,7 @@ from kohakuterrarium.prompt.framework_hints import (
     HINT_OUTPUT_MODEL,
     get_framework_hint,
 )
+from kohakuterrarium.prompt.rules import append_rule_prompt
 from kohakuterrarium.modules.plugin.base import PluginContext as RuntimePluginContext
 from kohakuterrarium.modules.plugin.manager import PluginManager
 from kohakuterrarium.prompt.plugins import (
@@ -253,6 +254,30 @@ def aggregate_system_prompt(
         ]
 
     rendered_base = render_template_safe(base_prompt, **context)
+
+    # Add user rule.md files through the central prompt aggregator so the
+    # feature follows the upstream prompt architecture instead of patching
+    # individual agent/sub-agent boot paths. Main agents pass ``pwd`` via
+    # extra_context; sub-agents expose their working directory through the
+    # runtime plugin context.
+    project_dir = None
+    agent_path = None
+    if context.get("pwd"):
+        project_dir = Path(str(context["pwd"]))
+    if plugin_context is not None:
+        working_dir = getattr(plugin_context, "working_dir", None)
+        if working_dir is not None:
+            if project_dir is None:
+                project_dir = Path(working_dir)
+            agent_path = Path(working_dir)
+        plugin_agent_path = getattr(plugin_context, "agent_path", None)
+        if plugin_agent_path is not None:
+            agent_path = Path(plugin_agent_path)
+    rendered_base = append_rule_prompt(
+        rendered_base,
+        project_dir=project_dir,
+        agent_path=agent_path,
+    )
     parts.append(rendered_base)
 
     # Add tool documentation based on skill_mode

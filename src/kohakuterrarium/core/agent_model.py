@@ -63,6 +63,18 @@ class AgentModelMixin:
         self._llm_identifier = identifier
         self.llm = new_llm
         self.controller.llm = new_llm
+
+        # Keep sub-agents on the same live-switched provider as the parent.
+        # Stateless sub-agents are constructed from ``subagent_manager.llm`` at
+        # spawn time; interactive sub-agents are long-lived instances and need
+        # their bound provider updated in place.
+        subagent_manager = getattr(self, "subagent_manager", None)
+        if subagent_manager is not None:
+            subagent_manager.llm = new_llm
+            for subagent in getattr(subagent_manager, "_interactive", {}).values():
+                if hasattr(subagent, "llm"):
+                    subagent.llm = new_llm
+
         if self.compact_manager:
             compact_llm = self._build_compact_llm(self.compact_manager.config)
             self.compact_manager._llm = compact_llm

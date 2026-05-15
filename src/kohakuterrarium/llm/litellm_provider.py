@@ -14,6 +14,7 @@ from typing import Any, AsyncIterator
 
 import litellm
 
+from kohakuterrarium.llm.api_keys import KeyPool
 from kohakuterrarium.llm.base import (
     BaseLLMProvider,
     ChatResponse,
@@ -44,7 +45,7 @@ class LiteLLMProvider(BaseLLMProvider):
     def __init__(
         self,
         model: str = "openai/gpt-4o",
-        api_key: str | None = None,
+        api_key: str | KeyPool | None = None,
         config: LLMConfig | None = None,
         **kwargs: Any,
     ) -> None:
@@ -52,7 +53,8 @@ class LiteLLMProvider(BaseLLMProvider):
         if not effective_config.model:
             effective_config.model = model
         super().__init__(effective_config)
-        self._api_key = api_key
+        self._api_key_pool = api_key if isinstance(api_key, KeyPool) else None
+        self._api_key = api_key.first if isinstance(api_key, KeyPool) else api_key
         self._extra_kwargs = kwargs
 
     def with_model(self, name: str) -> "LiteLLMProvider":
@@ -168,6 +170,11 @@ class LiteLLMProvider(BaseLLMProvider):
             logger.error("LiteLLM completion error", error=str(e))
             raise
 
+    def _next_api_key(self) -> str | None:
+        if self._api_key_pool:
+            return self._api_key_pool.next() or None
+        return self._api_key
+
     def _build_params(
         self,
         messages: list[dict[str, Any]],
@@ -184,8 +191,9 @@ class LiteLLMProvider(BaseLLMProvider):
             "drop_params": True,
         }
 
-        if self._api_key:
-            params["api_key"] = self._api_key
+        api_key = self._next_api_key()
+        if api_key:
+            params["api_key"] = api_key
 
         max_tokens = kwargs.get("max_tokens", self.config.max_tokens)
         if max_tokens is not None:
