@@ -199,6 +199,15 @@ def test_stream_delta_helpers_collect_tool_use():
     assert json.loads(calls[0].arguments) == {"command": "ls"}
 
 
+def test_anthropic_provider_sets_default_headers(anthropic_provider):
+    assert anthropic_provider._client.kwargs["default_headers"] == {
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+    }
+
+
+
 def test_build_create_kwargs_maps_extra_body_and_prompt_cache(anthropic_provider):
     anthropic_provider.extra_body = {
         "thinking": {"type": "enabled", "budget_tokens": 1024},

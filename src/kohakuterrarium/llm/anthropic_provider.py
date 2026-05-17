@@ -118,7 +118,12 @@ class AnthropicProvider(BaseLLMProvider):
         if auth_as_bearer is None and looks_like_bearer_endpoint(self.base_url):
             self.auth_as_bearer = True
 
-        default_headers = dict(self._extra_headers)
+        default_headers = {
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            **self._extra_headers,
+        }
         if self.auth_as_bearer:
             default_headers.setdefault("X-Api-Key", Omit())
         self._client = AsyncAnthropic(

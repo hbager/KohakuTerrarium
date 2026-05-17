@@ -54,7 +54,8 @@ _pack_reasoning_fields = pack_reasoning_fields
 # Default API endpoints
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-ROOCODE_USER_AGENT = "RooCode/3.52.1"
+# ROOCODE_USER_AGENT = "RooCode/3.52.1"
+ROOCODE_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 
 
 class OpenAIProvider(BaseLLMProvider):
