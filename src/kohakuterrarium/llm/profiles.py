@@ -89,18 +89,46 @@ def save_backend(backend: LLMBackend) -> None:
 
 
 def delete_backend(name: str) -> bool:
+    """Delete a user-defined provider and cascade-delete its presets.
+
+    Any user presets whose ``provider`` matches *name* are removed
+    together with the backend entry.  If the current ``default_model``
+    references one of the removed presets it is cleared as well.
+    """
     if name in _BUILTIN_PROVIDER_NAMES:
         raise ValueError(f"Cannot delete built-in provider: {name}")
     data = _load_yaml()
     existing = data.get("backends", {}) or data.get("providers", {})
     if name not in existing:
         return False
+
     presets = load_presets()
-    if any(provider == name for provider, _ in presets):
-        raise ValueError(f"Provider still in use by one or more presets: {name}")
+    removed_preset_names = {
+        preset_name for provider, preset_name in presets if provider == name
+    }
+    # Cascade: drop every preset that belongs to this provider
+    cleaned_presets = {
+        key: preset for key, preset in presets.items()
+        if key[0] != name
+    }
+
     backends = load_backends()
     backends.pop(name, None)
-    _save_yaml(_serialize_user_data(presets, backends, data.get("default_model", "")))
+
+    # Clear default_model if it pointed to a preset under this provider.
+    # Newer configs store "provider/name"; older ones may still store
+    # the bare preset name, so clear that too when it belonged to the
+    # removed provider.
+    default_model = data.get("default_model", "")
+    if default_model:
+        if "/" in default_model:
+            dm_provider, _ = default_model.split("/", 1)
+            if dm_provider == name:
+                default_model = ""
+        elif default_model in removed_preset_names:
+            default_model = ""
+
+    _save_yaml(_serialize_user_data(cleaned_presets, backends, default_model))
     save_api_key(name, "")
     return True
 
