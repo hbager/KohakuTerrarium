@@ -146,10 +146,12 @@
 </template>
 
 <script setup>
+import { onMounted, onUnmounted } from "vue"
 import StatusDot from "@/components/common/StatusDot.vue"
 import { useChatStore } from "@/stores/chat"
 import { useI18n } from "@/utils/i18n"
 import { agentAPI, configAPI, terrariumAPI } from "@/utils/api"
+import { LAYOUT_EVENTS, onLayoutEvent } from "@/utils/layoutEvents"
 
 const props = defineProps({
   instance: { type: Object, default: null },
@@ -164,8 +166,13 @@ const modelsLoading = ref(false)
 const modelSwitchError = ref("")
 const availableModels = ref([])
 
+let cleanupModelCatalog = null
 onMounted(() => {
   loadModels()
+  cleanupModelCatalog = onLayoutEvent(LAYOUT_EVENTS.MODEL_CATALOG_CHANGED, loadModels)
+})
+onUnmounted(() => {
+  if (cleanupModelCatalog) cleanupModelCatalog()
 })
 
 const totalUsage = computed(() => {

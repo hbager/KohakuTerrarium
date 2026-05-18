@@ -124,6 +124,7 @@ import { ElMessage, ElMessageBox } from "element-plus"
 
 import GemBadge from "@/components/common/GemBadge.vue"
 import { useInstancesStore } from "@/stores/instances"
+import { useVisibilityInterval } from "@/composables/useVisibilityInterval"
 import { GEM } from "@/utils/colors"
 import { useI18n } from "@/utils/i18n"
 import { sessionAPI } from "@/utils/api"
@@ -158,6 +159,7 @@ const loading = ref(false)
 const error = ref(null)
 const resuming = ref(null)
 const searchQuery = ref("")
+const refreshing = ref(false)
 let searchTimer = null
 
 watch(searchQuery, () => {
@@ -171,8 +173,9 @@ watch(searchQuery, () => {
 const hasMore = computed(() => currentOffset.value + pageSize < totalSessions.value)
 const hasPrev = computed(() => currentOffset.value > 0)
 
-async function fetchSessions(forceRefresh = false) {
-  loading.value = true
+async function fetchSessions(forceRefresh = false, { silent = false } = {}) {
+  if (silent) refreshing.value = true
+  else loading.value = true
   error.value = null
   try {
     // ``refresh: true`` forces the backend to re-scan + re-parse every
@@ -191,7 +194,8 @@ async function fetchSessions(forceRefresh = false) {
   } catch (err) {
     error.value = err.response?.data?.detail || err.message
   } finally {
-    loading.value = false
+    if (silent) refreshing.value = false
+    else loading.value = false
   }
 }
 
@@ -244,7 +248,9 @@ async function deleteSession(session) {
   try {
     await sessionAPI.delete(session.name)
     ElMessage.success(t("sessions.deleted"))
-    await fetchSessions()
+    const wasLastItemOnPage = sessions.value.length <= 1 && currentOffset.value > 0
+    if (wasLastItemOnPage) currentOffset.value = Math.max(0, currentOffset.value - pageSize)
+    await fetchSessions(true)
   } catch (err) {
     ElMessage.error(t("sessions.deleteFailed", { message: err.response?.data?.detail || err.message }))
   }
@@ -278,4 +284,5 @@ function formatDate(dateStr) {
 }
 
 fetchSessions()
+useVisibilityInterval(() => fetchSessions(false, { silent: true }), 5000)
 </script>

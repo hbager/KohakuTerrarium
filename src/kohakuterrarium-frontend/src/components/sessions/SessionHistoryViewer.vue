@@ -45,8 +45,10 @@
 </template>
 
 <script setup>
-import ChatPanel from "@/components/chat/ChatPanel.vue"
+import { useRoute, useRouter } from "vue-router"
 import { useDensity } from "@/composables/useDensity"
+import { useVisibilityInterval } from "@/composables/useVisibilityInterval"
+import ChatPanel from "@/components/chat/ChatPanel.vue"
 import { useChatStore, _convertHistory, _replayEvents } from "@/stores/chat"
 import { useSessionDetailStore } from "@/stores/sessionDetail"
 import { sessionAPI } from "@/utils/api"
@@ -77,6 +79,7 @@ const loading = ref(false)
 const error = ref("")
 const viewerMeta = ref(null)
 const historyTargets = ref([])
+const refreshingTarget = ref(false)
 
 const viewerInstance = computed(() => {
   const meta = viewerMeta.value || {}
@@ -177,6 +180,20 @@ watch(
   },
   { immediate: true },
 )
+
+async function refreshActiveTarget() {
+  if (loading.value || refreshingTarget.value || !chat.activeTab || !sessionName.value) return
+  refreshingTarget.value = true
+  try {
+    await loadTarget(chat.activeTab)
+  } catch (err) {
+    error.value = err?.response?.data?.detail || err?.message || String(err)
+  } finally {
+    refreshingTarget.value = false
+  }
+}
+
+useVisibilityInterval(refreshActiveTarget, 2000)
 
 // The viewer borrows the live chat store as its render surface (it
 // writes saved-session events into ``messagesByTab`` / ``tabs`` and

@@ -88,6 +88,7 @@
 </template>
 
 <script setup>
+import { useRoute } from "vue-router"
 import { computed, ref, reactive, watch, onMounted, onUnmounted } from "vue"
 import { ElMessage } from "element-plus"
 import { ArrowDown } from "@element-plus/icons-vue"
@@ -362,7 +363,11 @@ watch(currentModel, () => {
 let _cleanup = null
 onMounted(() => {
   loadModels()
-  _cleanup = onLayoutEvent(LAYOUT_EVENTS.MODEL_CONFIG_OPEN, () => (popoverVisible.value = true))
+  const cleanups = [
+    onLayoutEvent(LAYOUT_EVENTS.MODEL_CONFIG_OPEN, () => (popoverVisible.value = true)),
+    onLayoutEvent(LAYOUT_EVENTS.MODEL_CATALOG_CHANGED, loadModels),
+  ]
+  _cleanup = () => cleanups.forEach((cleanup) => cleanup())
 })
 onUnmounted(() => {
   if (_cleanup) _cleanup()

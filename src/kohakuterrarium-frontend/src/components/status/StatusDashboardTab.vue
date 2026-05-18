@@ -92,12 +92,13 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref, watch } from "vue"
+import { computed, onMounted, onUnmounted, ref, watch } from "vue"
 
 import ModulesPanel from "@/components/panels/modules/ModulesPanel.vue"
 import { useChatStore } from "@/stores/chat"
 import { useI18n } from "@/utils/i18n"
 import { agentAPI, configAPI, terrariumAPI } from "@/utils/api"
+import { LAYOUT_EVENTS, onLayoutEvent } from "@/utils/layoutEvents"
 
 const props = defineProps({
   instance: { type: Object, default: null },
@@ -125,8 +126,13 @@ const agentLabel = computed(() => chat.sessionInfo.agentName || props.instance?.
 const modelLabel = computed(() => chat.modelDisplay || props.instance?.llm_name || props.instance?.model || "--")
 const sessionIdLabel = computed(() => chat.sessionInfo.sessionId || props.instance?.session_id || props.instance?.id || "--")
 
+let cleanupModelCatalog = null
 onMounted(() => {
   loadModels()
+  cleanupModelCatalog = onLayoutEvent(LAYOUT_EVENTS.MODEL_CATALOG_CHANGED, loadModels)
+})
+onUnmounted(() => {
+  if (cleanupModelCatalog) cleanupModelCatalog()
 })
 
 watch(

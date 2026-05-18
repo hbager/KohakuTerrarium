@@ -382,6 +382,7 @@ import { useDensity } from "@/composables/useDensity"
 import { LOCALE_DISPLAY_NAMES, SUPPORTED_LOCALES, useLocaleStore } from "@/stores/locale"
 import { DEFAULT_DESKTOP_ZOOM, DEFAULT_MOBILE_ZOOM, MAX_UI_ZOOM, MIN_UI_ZOOM, useThemeStore } from "@/stores/theme"
 import { useI18n } from "@/utils/i18n"
+import { fireModelCatalogChanged } from "@/utils/layoutEvents"
 import { configAPI, settingsAPI } from "@/utils/api"
 
 const theme = useThemeStore()
@@ -427,6 +428,7 @@ async function saveKey(provider) {
     await loadKeys()
     await loadBackends()
     await loadPresets()
+    fireModelCatalogChanged({ reason: "key-saved", provider })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || t("settings.keys.saveFailed"))
   }
@@ -441,6 +443,8 @@ async function runCodexLogin() {
     ElMessage.success("Codex login successful")
     await loadKeys()
     await loadBackends()
+    await loadPresets()
+    fireModelCatalogChanged({ reason: "codex-login" })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || "Codex login failed")
   } finally {
@@ -548,6 +552,8 @@ async function saveBackend() {
     closeBackendForm()
     await loadBackends()
     await loadKeys()
+    await loadPresets()
+    fireModelCatalogChanged({ reason: "backend-saved", provider: backendName })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || "Failed to save provider")
   }
@@ -560,6 +566,8 @@ async function deleteBackend(name) {
     if (editingBackendName.value === name) closeBackendForm()
     await loadBackends()
     await loadKeys()
+    await loadPresets()
+    fireModelCatalogChanged({ reason: "backend-deleted", provider: name })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || "Failed to delete provider")
   }
@@ -590,6 +598,10 @@ async function loadPresets() {
       const match = allPresets.value.find((p) => presetKey(p) === selectedPresetKey.value)
       if (match) {
         editorPreset.value = match
+      } else {
+        selectedPresetKey.value = ""
+        editorPreset.value = null
+        showEditor.value = false
       }
     }
   } catch {
@@ -674,6 +686,7 @@ async function handleSavePreset(payload) {
     // variation_groups) without requiring a manual re-click.
     selectedPresetKey.value = `${payload.provider}/${payload.name}`
     await loadPresets()
+    fireModelCatalogChanged({ reason: "profile-saved", provider: payload.provider, name: payload.name })
     const saved = allPresets.value.find((p) => presetKey(p) === selectedPresetKey.value)
     if (saved) selectPreset(saved)
   } catch (err) {
@@ -703,6 +716,7 @@ async function confirmDeletePreset(name) {
     ElMessage.success(t("settings.models.deleted", { name }))
     cancelEdit()
     await loadPresets()
+    fireModelCatalogChanged({ reason: "profile-deleted", provider: preset.provider, name })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || t("settings.models.deleteFailed"))
   }

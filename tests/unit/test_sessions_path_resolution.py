@@ -188,6 +188,64 @@ def test_listing_dedupes_v1_v2_under_same_canonical_name(session_dir):
     assert foo["filename"] == "foo.kohakutr.v2"
 
 
+def test_listing_sorts_by_last_active_not_file_mtime(session_dir):
+    """The workspace session list displays last_active, so ordering
+    must use the same timestamp instead of SQLite file mtime.
+    """
+    from kohakuterrarium.session.store import SessionStore
+    from kohakuterrarium.studio.persistence.store import build_session_index
+
+    older_path = session_dir / "older.kohakutr"
+    newer_path = session_dir / "newer.kohakutr"
+    _touch_session_file(older_path)
+    _touch_session_file(newer_path)
+
+    newer = SessionStore(newer_path)
+    newer.meta["created_at"] = "2024-01-01T00:00:00"
+    newer.meta["last_active"] = "2024-01-02T00:00:00"
+    newer.close(update_status=False)
+
+    older = SessionStore(older_path)
+    older.meta["created_at"] = "2024-01-01T00:00:00"
+    older.meta["last_active"] = "2024-01-01T00:00:00"
+    older.close(update_status=False)
+
+    index = build_session_index()
+
+    assert [entry["name"] for entry in index[:2]] == ["newer", "older"]
+
+
+def test_cached_listing_rebuilds_when_session_files_change(session_dir):
+    """Workspace polling should see changed sessions before the TTL expires."""
+    from kohakuterrarium.session.store import SessionStore
+    from kohakuterrarium.studio.persistence.store import build_session_index, get_session_index
+
+    older_path = session_dir / "older.kohakutr"
+    newer_path = session_dir / "newer.kohakutr"
+    _touch_session_file(older_path)
+    _touch_session_file(newer_path)
+
+    older = SessionStore(older_path)
+    older.meta["created_at"] = "2024-01-01T00:00:00"
+    older.meta["last_active"] = "2024-01-01T00:00:00"
+    older.close(update_status=False)
+
+    newer = SessionStore(newer_path)
+    newer.meta["created_at"] = "2024-01-01T00:00:00"
+    newer.meta["last_active"] = "2024-01-02T00:00:00"
+    newer.close(update_status=False)
+
+    assert [entry["name"] for entry in build_session_index()[:2]] == ["newer", "older"]
+
+    older = SessionStore(older_path)
+    older.meta["last_active"] = "2024-01-03T00:00:00"
+    older.close(update_status=False)
+
+    index = get_session_index(max_age=3600)
+
+    assert [entry["name"] for entry in index[:2]] == ["older", "newer"]
+
+
 @pytest.mark.asyncio
 async def test_delete_session_removes_both_v1_and_v2(session_dir):
     from kohakuterrarium.api.routes.persistence.saved import delete_session

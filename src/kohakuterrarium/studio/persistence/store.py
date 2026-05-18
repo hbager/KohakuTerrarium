@@ -11,7 +11,7 @@ import os
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +37,7 @@ _SESSION_DIR = Path.home() / ".kohakuterrarium" / "sessions"
 # In-memory session index (built once, refreshed on demand)
 _session_index: list[dict] = []
 _index_built_at: float = 0
+_index_signature: tuple[tuple[str, float], ...] = ()
 
 
 def _session_dir() -> Path:
@@ -192,6 +193,35 @@ def _read_session_entry(path: Path) -> dict:
         }
 
 
+def _entry_time_ts(entry: dict, fallback: float = 0.0) -> float:
+    """Sortable timestamp matching the session-list display time."""
+    for key in ("last_active", "created_at"):
+        value = entry.get(key)
+        if not value:
+            continue
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except ValueError:
+                continue
+    return fallback
+
+
+def _session_file_signature(session_dir: Path | None = None) -> tuple[list[Path], tuple[tuple[str, float], ...]]:
+    """Return canonical files plus a cheap change signature."""
+    session_dir = session_dir or _session_dir()
+    if not session_dir.exists():
+        return [], ()
+    session_files = pick_canonical_per_session(session_dir)
+    signature = tuple((str(path), _max_mtime(path)) for path in session_files)
+    return session_files, signature
+
+
 # Cap thread count: SQLite-over-network is GIL-friendly for I/O but
 # a runaway pool also opens too many file handles. ``min(32, cpus*4)``
 # matches Python's default ThreadPoolExecutor heuristic.
@@ -213,11 +243,13 @@ def build_session_index() -> list[dict]:
        serialise the wait. Workers are capped at
        :data:`_MAX_INDEX_WORKERS`.
     """
-    global _session_index, _index_built_at
+    global _session_index, _index_built_at, _index_signature
 
     session_dir = _session_dir()
-    if not session_dir.exists():
+    session_files, signature = _session_file_signature(session_dir)
+    if not session_files:
         _session_index = []
+        _index_signature = signature
         _index_built_at = time.time()
         return _session_index
 
@@ -241,9 +273,8 @@ def build_session_index() -> list[dict]:
     ordered_paths = [p for p, _ in sortable]
 
     # Phase 2: parallel SQLite opens to extract meta + preview for
-    # display. ``ThreadPoolExecutor.map`` preserves input order, so
-    # the mtime-derived sort survives. SQLite open + a handful of
-    # point queries is I/O-bound, so the GIL doesn't serialise.
+    # display. ``ThreadPoolExecutor.map`` preserves input order, so we
+    # can pair each result with the mtime fallback collected above.
     if not ordered_paths:
         results = []
     else:
@@ -251,14 +282,30 @@ def build_session_index() -> list[dict]:
         with ThreadPoolExecutor(max_workers=worker_count) as pool:
             results = list(pool.map(_read_session_entry, ordered_paths))
 
+    # Final sort uses the same timestamp the workspace list displays.
+    # File/WAL/SHM mtime is only a fallback for corrupt/legacy entries
+    # without meta timestamps; using mtime first made the visible order
+    # disagree with ``last_active``.
+    mtime_by_path = {p: mt for p, mt in sortable}
+    results = [
+        entry
+        for entry, _path in sorted(
+            zip(results, ordered_paths),
+            key=lambda pair: _entry_time_ts(pair[0], mtime_by_path.get(pair[1], 0.0)),
+            reverse=True,
+        )
+    ]
+
     _session_index = results
+    _index_signature = signature
     _index_built_at = time.time()
     return results
 
 
 def get_session_index(max_age: float = 30.0) -> list[dict]:
-    """Get cached session index, rebuild if stale."""
-    if time.time() - _index_built_at > max_age:
+    """Get cached session index, rebuild if stale or files changed."""
+    _files, signature = _session_file_signature()
+    if signature != _index_signature or time.time() - _index_built_at > max_age:
         return build_session_index()
     return _session_index
 

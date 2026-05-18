@@ -34,11 +34,12 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from "vue"
+import { computed, onMounted, onUnmounted, ref } from "vue"
 
 import ModelSwitcher from "@/components/chrome/ModelSwitcher.vue"
 import { useChatStore } from "@/stores/chat"
 import { configAPI } from "@/utils/api"
+import { LAYOUT_EVENTS, onLayoutEvent } from "@/utils/layoutEvents"
 
 const props = defineProps({
   instance: { type: Object, default: null },
@@ -69,7 +70,14 @@ async function loadProfile() {
   }
 }
 
-onMounted(loadProfile)
+let cleanupModelCatalog = null
+onMounted(() => {
+  loadProfile()
+  cleanupModelCatalog = onLayoutEvent(LAYOUT_EVENTS.MODEL_CATALOG_CHANGED, loadProfile)
+})
+onUnmounted(() => {
+  if (cleanupModelCatalog) cleanupModelCatalog()
+})
 
 function formatTokens(n) {
   if (!n) return "—"

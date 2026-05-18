@@ -15,6 +15,7 @@ const LAYOUT_EVENTS = Object.freeze({
   SAVE_AS_REQUESTED: "layout:save-as-requested",
   PALETTE_OPEN: "palette:open",
   MODEL_CONFIG_OPEN: "model:config-open",
+  MODEL_CATALOG_CHANGED: "model:catalog-changed",
 })
 
 function _dispatch(name, detail) {
@@ -36,6 +37,10 @@ export function firePaletteOpen(detail = {}) {
 
 export function fireModelConfigOpen(detail = {}) {
   _dispatch(LAYOUT_EVENTS.MODEL_CONFIG_OPEN, detail)
+}
+
+export function fireModelCatalogChanged(detail = {}) {
+  _dispatch(LAYOUT_EVENTS.MODEL_CATALOG_CHANGED, detail)
 }
 
 export function onLayoutEvent(name, handler) {
