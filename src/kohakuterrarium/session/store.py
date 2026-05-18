@@ -806,6 +806,9 @@ class SessionStore:
         self.jobs.close()
         self.conversation.close()
         self.turn_rollup.close()
+        fts_close = getattr(self.fts, "close", None)
+        if callable(fts_close):
+            fts_close()
         logger.debug("SessionStore closed", path=self._path)
 
     # ─── Fork / Branch (Wave E) ─────────────────────────────────────

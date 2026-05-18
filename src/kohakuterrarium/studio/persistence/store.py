@@ -554,6 +554,17 @@ def delete_session_files(session_name: str) -> list[Path]:
     if not targets:
         return []
 
+    global _index_built_at, _session_index, _index_signature
+    deleted: list[Path] = []
+    deleted_names = {normalize_session_stem(path) for path in targets}
     for path in targets:
-        path.unlink()
-    return targets
+        path.unlink(missing_ok=True)
+        deleted.append(path)
+        # Also remove SQLite WAL/SHM sidecars so Windows doesn't leave
+        # orphaned lock files that prevent future operations.
+        for suffix in ("-wal", "-shm"):
+            Path(str(path) + suffix).unlink(missing_ok=True)
+    _session_index = [s for s in _session_index if s.get("name") not in deleted_names]
+    _index_signature = ()
+    _index_built_at = 0
+    return deleted

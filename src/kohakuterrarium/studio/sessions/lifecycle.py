@@ -384,7 +384,23 @@ async def stop_session(engine: Terrarium, session_id: str) -> None:
             pass
 
     _meta.pop(session_id, None)
-    _session_stores.pop(session_id, None)
+    stores = [
+        _session_stores.pop(session_id, None),
+        getattr(engine, "_session_stores", {}).pop(session_id, None),
+    ]
+    seen_store_ids: set[int] = set()
+    for store in stores:
+        if store is None or id(store) in seen_store_ids:
+            continue
+        seen_store_ids.add(id(store))
+        try:
+            store.close()
+        except Exception:
+            logger.debug(
+                "Failed to close session store on stop",
+                session_id=session_id,
+                exc_info=True,
+            )
     logger.info("Session stopped", session_id=session_id)
 
 
