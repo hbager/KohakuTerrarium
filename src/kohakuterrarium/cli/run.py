@@ -17,6 +17,7 @@ from uuid import uuid4
 import kohakuterrarium.terrarium.channels as _channels
 import kohakuterrarium.terrarium.topology as _topo
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.studio.persistence import session_index
 from kohakuterrarium.terrarium.config import load_terrarium_config
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.terrarium.engine_cli import run_engine_with_tui
@@ -354,6 +355,18 @@ async def _attach_session_store(
         pwd=str(Path.cwd()),
         agents=[c.name for c in engine.list_creatures() if c.graph_id == graph_id],
     )
+    try:
+        session_index.upsert_session_meta(
+            session_file,
+            session_index.snapshot_store_meta(store),
+            session_dir=session_file.parent,
+        )
+    except Exception as e:  # pragma: no cover - index must not break CLI runs
+        logger.debug(
+            "Saved-session index update skipped after CLI attach",
+            error=str(e),
+            exc_info=True,
+        )
     await engine.attach_session(graph_id, store)
     return store
 

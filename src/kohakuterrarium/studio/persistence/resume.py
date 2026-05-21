@@ -34,6 +34,7 @@ from kohakuterrarium.session.migrations import (
     path_for_version,
 )
 from kohakuterrarium.session.resume import _open_store_with_migration
+from kohakuterrarium.studio.persistence import session_index
 from kohakuterrarium.studio.sessions.handles import Session
 from kohakuterrarium.studio.sessions.lifecycle import (
     _build_session_handle,
@@ -118,6 +119,19 @@ async def resume_session(
     }
     if store is not None:
         _session_stores[sid] = store
+        try:
+            index_path = Path(store.path)
+            session_index.upsert_session_meta(
+                index_path,
+                meta,
+                session_dir=index_path.parent,
+            )
+        except Exception as e:  # pragma: no cover - index must not break resume
+            logger.debug(
+                "Saved-session index update skipped after resume",
+                error=str(e),
+                exc_info=True,
+            )
 
     logger.info(
         "Resumed session registered with studio",

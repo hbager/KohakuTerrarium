@@ -11,10 +11,9 @@ import asyncio
 from fastapi import APIRouter, HTTPException
 
 from kohakuterrarium.studio.persistence.store import (
-    build_session_index,
     delete_session_files,
     disk_usage,
-    get_session_index,
+    list_sessions_page,
     session_stats,
 )
 
@@ -35,11 +34,10 @@ async def get_disk_usage():
 
 @router.get("/stats")
 async def get_session_stats():
-    """Aggregations over the cached session index.
+    """Aggregations over the persistent saved-session index.
 
-    Cheap — reads the in-memory index built by ``get_session_index``
-    (30s TTL). Does not force a rebuild. Run in a thread because a
-    cold cache triggers the same blocking rebuild as ``list_sessions``.
+    Cheap after first-run lightweight backfill. Run in a thread because
+    the very first call may initialize ``sessions_index.sqlite``.
     """
     return await asyncio.to_thread(session_stats)
 
@@ -53,62 +51,17 @@ async def list_sessions(
 ):
     """List saved sessions with search and pagination.
 
-    Args:
-        limit: Max sessions to return (default 20)
-        offset: Skip first N sessions (for pagination)
-        search: Filter by name, config, agents, preview (case-insensitive)
-        refresh: Force rebuild the session index
-
-    Index build opens every session SQLite to extract a preview, so
-    we run the whole fetch+filter pipeline on a worker thread to keep
-    other API calls responsive while the rail loads.
+    Normal calls query ``sessions_index.sqlite`` directly, so ``limit``
+    is now a real SQL page rather than a slice after opening every
+    session DB. ``refresh=True`` explicitly repairs/backfills the index.
     """
-    if refresh:
-        await asyncio.to_thread(build_session_index)
-
-    all_sessions = await asyncio.to_thread(get_session_index)
-
-    # Server-side search
-    if search:
-        q = search.lower()
-
-        def _as_str(v):
-            """Defensive coerce — session metadata fields are usually strings
-            but recent recordings may contain a list (e.g. multimodal
-            preview blocks). Flatten anything to a single space-joined
-            string for the search haystack.
-            """
-            if v is None:
-                return ""
-            if isinstance(v, str):
-                return v
-            if isinstance(v, list):
-                return " ".join(_as_str(x) for x in v)
-            if isinstance(v, dict):
-                return " ".join(_as_str(x) for x in v.values())
-            return str(v)
-
-        all_sessions = [
-            s
-            for s in all_sessions
-            if q
-            in " ".join(
-                _as_str(s.get(k, ""))
-                for k in (
-                    "name",
-                    "config_path",
-                    "config_type",
-                    "terrarium_name",
-                    "preview",
-                    "pwd",
-                    "agents",
-                )
-            ).lower()
-        ]
-
-    total = len(all_sessions)
-    page = all_sessions[offset : offset + limit]
-    return {"sessions": page, "total": total, "offset": offset, "limit": limit}
+    return await asyncio.to_thread(
+        list_sessions_page,
+        limit=limit,
+        offset=offset,
+        search=search,
+        refresh=refresh,
+    )
 
 
 @router.delete("/{session_name}")

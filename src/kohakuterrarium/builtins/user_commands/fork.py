@@ -25,6 +25,7 @@ from kohakuterrarium.modules.user_command.base import (
     UserCommandResult,
 )
 from kohakuterrarium.session.migrations import path_for_version, FORMAT_VERSION
+from kohakuterrarium.studio.persistence import session_index
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -109,7 +110,24 @@ class ForkCommand(BaseUserCommand):
             logger.warning("Fork failed", error=str(e), exc_info=True)
             return UserCommandResult(error=f"Fork failed: {e}")
         child_path = child.path
+        try:
+            child_meta = session_index.snapshot_store_meta(child)
+        except Exception:
+            child_meta = {}
         child.close(update_status=False)
+        try:
+            index_path = Path(child_path)
+            session_index.upsert_session_meta(
+                index_path,
+                child_meta,
+                session_dir=index_path.parent,
+            )
+        except Exception as e:  # pragma: no cover - index must not break fork
+            logger.debug(
+                "Saved-session index update skipped after fork",
+                error=str(e),
+                exc_info=True,
+            )
         return UserCommandResult(
             output=(
                 f"Forked at event {event_id} → {child_path}\n"

@@ -10,13 +10,13 @@ share one implementation.
 import os
 import threading
 import time
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.studio.persistence import session_index as persistent_index
 from kohakuterrarium.studio.persistence.viewer.paths import (
     all_session_files,
     all_versions_for_session,
@@ -330,12 +330,35 @@ def all_session_files_default() -> list[Path]:
     return all_session_files(_session_dir())
 
 
-def session_stats() -> dict[str, Any]:
-    """Aggregations over the cached session index.
+def list_sessions_page(
+    *,
+    limit: int = 20,
+    offset: int = 0,
+    search: str = "",
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """Page saved sessions via the persistent materialized index.
 
-    Pure read of :func:`get_session_index` — does not force a rebuild,
-    so it's cheap (server returns sub-millisecond after the first
-    index build). Returns:
+    Unlike the legacy in-memory index, this does not open every session
+    SQLite database on normal list calls. ``refresh=True`` performs an
+    explicit repair/backfill of ``sessions_index.sqlite`` first.
+    """
+    session_dir = _session_dir()
+    if refresh:
+        persistent_index.refresh_index(session_dir)
+    return persistent_index.query_sessions(
+        session_dir,
+        limit=limit,
+        offset=offset,
+        search=search,
+    )
+
+
+def session_stats() -> dict[str, Any]:
+    """Aggregations over the persistent saved-session index.
+
+    Pure read of ``sessions_index.sqlite`` after first-run lightweight
+    backfill. Returns:
 
         {
             "count": int,
@@ -347,71 +370,7 @@ def session_stats() -> dict[str, Any]:
             "average_age_seconds": float | None,
         }
     """
-    sessions = get_session_index()
-    if not sessions:
-        return {
-            "count": 0,
-            "by_config_type": {},
-            "by_status": {},
-            "by_recency": {"1d": 0, "7d": 0, "30d": 0, "older": 0},
-            "by_format_version": {},
-            "agents_top": [],
-            "average_age_seconds": None,
-        }
-
-    by_config_type: Counter = Counter()
-    by_status: Counter = Counter()
-    by_format: Counter = Counter()
-    agents: Counter = Counter()
-    by_recency = {"1d": 0, "7d": 0, "30d": 0, "older": 0}
-
-    now = time.time()
-    age_total = 0.0
-    age_count = 0
-
-    def _to_ts(s: str) -> float | None:
-        if not s:
-            return None
-        try:
-            return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
-        except ValueError:
-            return None
-
-    for entry in sessions:
-        if entry.get("error"):
-            continue
-        by_config_type[entry.get("config_type", "unknown")] += 1
-        by_status[entry.get("status", "unknown") or "unknown"] += 1
-        by_format[str(entry.get("format_version", 1))] += 1
-
-        for agent in entry.get("agents") or []:
-            if agent:
-                agents[agent] += 1
-
-        ts = _to_ts(entry.get("last_active") or entry.get("created_at") or "")
-        if ts is not None:
-            age = now - ts
-            if age >= 0:
-                age_total += age
-                age_count += 1
-                if age < 86400:
-                    by_recency["1d"] += 1
-                elif age < 86400 * 7:
-                    by_recency["7d"] += 1
-                elif age < 86400 * 30:
-                    by_recency["30d"] += 1
-                else:
-                    by_recency["older"] += 1
-
-    return {
-        "count": len(sessions),
-        "by_config_type": dict(by_config_type),
-        "by_status": dict(by_status),
-        "by_recency": by_recency,
-        "by_format_version": dict(by_format),
-        "agents_top": [list(p) for p in agents.most_common(5)],
-        "average_age_seconds": (age_total / age_count) if age_count else None,
-    }
+    return persistent_index.query_stats(_session_dir())
 
 
 def disk_usage() -> dict[str, Any]:
@@ -582,4 +541,6 @@ def delete_session_files(session_name: str) -> list[Path]:
     _session_index = [s for s in _session_index if s.get("name") not in deleted_names]
     _index_signature = ()
     _index_built_at = 0
+    for name in deleted_names:
+        persistent_index.delete_session_name(name, session_dir=_session_dir())
     return deleted

@@ -18,6 +18,7 @@ from typing import Any
 import kohakuterrarium.terrarium.channels as channel_module
 from kohakuterrarium.packages.resolve import is_package_ref, resolve_package_path
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.studio.persistence import session_index
 from kohakuterrarium.studio.sessions.handles import Session, SessionListing
 from kohakuterrarium.terrarium.config import (
     CreatureConfig,
@@ -56,6 +57,25 @@ def _now_iso() -> str:
 def _session_dir() -> str:
     default = str(Path.home() / ".kohakuterrarium" / "sessions")
     return os.environ.get("KT_SESSION_DIR", default)
+
+
+def _upsert_saved_session_index(store: SessionStore | None) -> None:
+    """Best-effort update of the persistent saved-session summary row."""
+    if store is None:
+        return
+    try:
+        path = Path(store.path)
+        session_index.upsert_session_meta(
+            path,
+            session_index.snapshot_store_meta(store),
+            session_dir=path.parent,
+        )
+    except Exception as e:  # pragma: no cover - index must not break runtime
+        logger.debug(
+            "Saved-session index update skipped",
+            error=str(e),
+            exc_info=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -152,6 +172,7 @@ def attach_session_store_for_creature(
                     existing.meta["agents"] = meta_agents
                     if len(meta_agents) > 1:
                         existing.meta["config_type"] = "terrarium"
+                    _upsert_saved_session_index(existing)
             except Exception:
                 logger.debug("meta agent-list update skipped", exc_info=True)
             _retro_install_channel_persistence(engine, sid)
@@ -174,6 +195,7 @@ def attach_session_store_for_creature(
         _session_stores[sid] = store
         # Mirror to engine map so channel-persistence callback finds it.
         engine._session_stores[sid] = store
+        _upsert_saved_session_index(store)
         _retro_install_channel_persistence(engine, sid)
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("Session store creation failed", error=str(e))
@@ -247,6 +269,7 @@ async def start_terrarium(
         )
         await engine.attach_session(sid, store)
         _session_stores[sid] = store
+        _upsert_saved_session_index(store)
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("Session store creation failed", error=str(e))
 
@@ -394,7 +417,16 @@ async def stop_session(engine: Terrarium, session_id: str) -> None:
             continue
         seen_store_ids.add(id(store))
         try:
-            store.close()
+            store.update_status("paused")
+            _upsert_saved_session_index(store)
+        except Exception:
+            logger.debug(
+                "Failed to update saved-session index on stop",
+                session_id=session_id,
+                exc_info=True,
+            )
+        try:
+            store.close(update_status=False)
         except Exception:
             logger.debug(
                 "Failed to close session store on stop",
