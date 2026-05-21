@@ -204,7 +204,21 @@ async def _run(
                 if session is not None:
                     print(f"\nSession saved. To resume:")
                     print(f"  kt resume {Path(store.path).stem}")
-                store.close()
+                try:
+                    store.update_status("paused")
+                    session_file = Path(store.path)
+                    session_index.upsert_session_meta(
+                        session_file,
+                        session_index.snapshot_store_meta(store),
+                        session_dir=session_file.parent,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        "Saved-session index update skipped before CLI close",
+                        error=str(e),
+                        exc_info=True,
+                    )
+                store.close(update_status=False)
         return 0
 
 

@@ -5,7 +5,15 @@ from pathlib import Path
 import pytest
 
 
-def _make_session(path: Path, *, name: str, last_active: str, status: str = "paused") -> None:
+def _make_session(
+    path: Path,
+    *,
+    name: str,
+    last_active: str,
+    status: str = "paused",
+    user_input: str | None = None,
+    legacy_preview: bool = False,
+) -> None:
     from kohakuterrarium.session.store import SessionStore
 
     store = SessionStore(path)
@@ -20,6 +28,17 @@ def _make_session(path: Path, *, name: str, last_active: str, status: str = "pau
         store.meta["created_at"] = "2024-01-01T00:00:00+00:00"
         store.meta["last_active"] = last_active
         store.meta["status"] = status
+        if user_input:
+            store.append_event(name, "user_input", {"content": user_input})
+            if legacy_preview:
+                try:
+                    del store.meta["preview"]
+                except KeyError:
+                    pass
+            # Preserve the supplied timestamp order in list tests while still
+            # exercising the preview capture path.
+            store.meta["last_active"] = last_active
+            store.meta["status"] = status
     finally:
         store.close(update_status=False)
 
@@ -140,3 +159,110 @@ def test_persistent_index_delete_removes_row(session_dir):
     assert [path.name for path in deleted] == ["gone.kohakutr"]
     assert page["total"] == 0
     assert page["sessions"] == []
+
+
+def test_persistent_index_refresh_backfills_first_user_preview(session_dir):
+    from kohakuterrarium.studio.persistence import session_index
+
+    _make_session(
+        session_dir / "task.kohakutr",
+        name="task",
+        last_active="2024-01-01T00:00:00+00:00",
+        user_input="請幫我檢查 workspace 前端為什麼很卡",
+        legacy_preview=True,
+    )
+
+    session_index.refresh_index(session_dir)
+    page = session_index.query_sessions(session_dir, limit=10, offset=0)
+
+    assert page["total"] == 1
+    assert page["sessions"][0]["preview"] == "請幫我檢查 workspace 前端為什麼很卡"
+
+
+def test_persistent_index_query_lazily_fills_legacy_empty_page_preview(
+    session_dir, monkeypatch
+):
+    from kohakuterrarium.studio.persistence import session_index
+
+    path = session_dir / "legacy.kohakutr"
+    _make_session(
+        path,
+        name="legacy",
+        last_active="2024-01-01T00:00:00+00:00",
+        user_input="這是一個舊索引沒有保存的任務摘要",
+        legacy_preview=True,
+    )
+
+    # Simulate the previous fast index implementation: row exists, preview is
+    # empty, and it has never been event-scanned for preview.
+    session_index.upsert_session_meta(
+        path,
+        {
+            "session_id": "legacy",
+            "config_type": "agent",
+            "config_path": "configs/legacy.yaml",
+            "pwd": str(session_dir),
+            "agents": ["legacy"],
+            "created_at": "2024-01-01T00:00:00+00:00",
+            "last_active": "2024-01-01T00:00:00+00:00",
+            "status": "paused",
+            "preview": "",
+        },
+        session_dir=session_dir,
+    )
+
+    calls: list[tuple[list[Path], bool]] = []
+    real_read = session_index.read_session_index_entries
+
+    def spy(paths, *, include_preview=True):
+        calls.append(([Path(p) for p in paths], include_preview))
+        return real_read(paths, include_preview=include_preview)
+
+    monkeypatch.setattr(session_index, "read_session_index_entries", spy)
+
+    page = session_index.query_sessions(session_dir, limit=1, offset=0)
+
+    assert calls == [([path], True)]
+    assert page["sessions"][0]["preview"] == "這是一個舊索引沒有保存的任務摘要"
+
+
+def test_first_list_backfills_metadata_only_then_lazily_fills_visible_preview(
+    session_dir, monkeypatch
+):
+    from kohakuterrarium.studio.persistence import session_index
+
+    older = session_dir / "older.kohakutr"
+    newer = session_dir / "newer.kohakutr"
+    _make_session(
+        older,
+        name="older",
+        last_active="2024-01-01T00:00:00+00:00",
+        user_input="older preview",
+        legacy_preview=True,
+    )
+    _make_session(
+        newer,
+        name="newer",
+        last_active="2024-01-02T00:00:00+00:00",
+        user_input="newer preview",
+        legacy_preview=True,
+    )
+
+    calls: list[tuple[list[Path], bool]] = []
+    real_read = session_index.read_session_index_entries
+
+    def spy(paths, *, include_preview=True):
+        calls.append(([Path(p) for p in paths], include_preview))
+        return real_read(paths, include_preview=include_preview)
+
+    monkeypatch.setattr(session_index, "read_session_index_entries", spy)
+
+    page = session_index.query_sessions(session_dir, limit=1, offset=0)
+
+    assert len(calls) == 2
+    assert set(calls[0][0]) == {older, newer}
+    assert calls[0][1] is False
+    assert calls[1] == ([newer], True)
+    assert page["total"] == 2
+    assert [row["name"] for row in page["sessions"]] == ["newer"]
+    assert page["sessions"][0]["preview"] == "newer preview"

@@ -274,6 +274,10 @@ class SessionStore:
             except Exception as e:
                 logger.debug("FTS indexing failed", error=str(e), exc_info=True)
 
+        # Cache the first user prompt in meta so saved-session lists can show
+        # a task preview from sessions_index.sqlite without scanning events.
+        self._capture_preview_from_event(event_type, data)
+
         # Fan out to live subscribers. Each callback is isolated — a
         # slow or failing listener must not block the appending agent.
         for cb in tuple(self._event_subscribers):
@@ -289,6 +293,57 @@ class SessionStore:
         self._maybe_flush_events()
 
         return key, event_id
+
+    def _preview_text(self, value: Any, limit: int = 200) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return " ".join(value.split())[:limit]
+        if isinstance(value, list):
+            bits: list[str] = []
+            for part in value:
+                if isinstance(part, str):
+                    bits.append(part)
+                elif isinstance(part, dict):
+                    kind = str(part.get("type") or "")
+                    if kind == "text" or "text" in part:
+                        bits.append(str(part.get("text") or ""))
+                    elif kind in {"image", "image_url"}:
+                        bits.append("[image]")
+                    elif kind == "file":
+                        bits.append("[file]")
+                    else:
+                        bits.append(f"[{kind or 'attachment'}]")
+                elif part is not None:
+                    bits.append(str(part))
+            return " ".join(" ".join(bits).split())[:limit]
+        if isinstance(value, dict):
+            if "content" in value:
+                return self._preview_text(value.get("content"), limit)
+            if "text" in value:
+                return self._preview_text(value.get("text"), limit)
+            kind = str(value.get("type") or "")
+            if kind in {"image", "image_url"}:
+                return "[image]"[:limit]
+            if kind == "file":
+                return "[file]"[:limit]
+        return " ".join(str(value).split())[:limit]
+
+    def _capture_preview_from_event(self, event_type: str, data: dict) -> None:
+        if event_type != "user_input":
+            return
+        try:
+            existing = self.meta.get("preview") if "preview" in self.meta else ""
+            if existing:
+                return
+            content = data.get("content")
+            if content is None:
+                content = data.get("text") or data.get("input")
+            preview = self._preview_text(content)
+            if preview:
+                self.meta["preview"] = preview
+        except Exception as e:
+            logger.debug("Failed to capture session preview", error=str(e), exc_info=True)
 
     def _maybe_flush_events(self) -> None:
         """Flush the events cache when either durability gate trips."""

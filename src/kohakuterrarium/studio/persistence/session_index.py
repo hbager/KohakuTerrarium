@@ -40,6 +40,7 @@ logger = get_logger(__name__)
 
 _INDEX_DB_NAME = "sessions_index.sqlite"
 _INDEX_LOCK = threading.RLock()
+_KV_KEYS_LIMIT = 2**31 - 1
 
 
 def index_db_path(session_dir: Path) -> Path:
@@ -96,6 +97,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
             created_at TEXT,
             last_active TEXT,
             preview TEXT,
+            preview_scanned INTEGER NOT NULL DEFAULT 0,
             pwd TEXT,
             format_version INTEGER,
 
@@ -114,6 +116,12 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions_index)")}
+    if "preview_scanned" not in columns:
+        conn.execute(
+            "ALTER TABLE sessions_index "
+            "ADD COLUMN preview_scanned INTEGER NOT NULL DEFAULT 0"
+        )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_sessions_index_sort "
         "ON sessions_index(sort_ts DESC, file_mtime DESC)"
@@ -187,7 +195,7 @@ def _load_meta_only(path: Path) -> dict[str, Any]:
     meta = _meta_table(path)
     try:
         result: dict[str, Any] = {}
-        for key_bytes in meta.keys(limit=2**31 - 1):
+        for key_bytes in meta.keys(limit=_KV_KEYS_LIMIT):
             key = (
                 key_bytes.decode("utf-8", errors="replace")
                 if isinstance(key_bytes, bytes)
@@ -206,6 +214,110 @@ def _load_meta_only(path: Path) -> dict[str, Any]:
         return result
     finally:
         close = getattr(meta, "close", None)
+        if callable(close):
+            close()
+
+
+def _compact_preview_text(value: Any, limit: int) -> str:
+    return " ".join(str(value).split())[:limit]
+
+
+def _extract_text_preview(content: Any, limit: int = 200) -> str:
+    """Flatten event content into the short session-list preview string."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return _compact_preview_text(content, limit)
+    if isinstance(content, list):
+        bits: list[str] = []
+        for part in content:
+            if isinstance(part, str):
+                bits.append(part)
+            elif isinstance(part, dict):
+                kind = str(part.get("type") or "")
+                if kind == "text":
+                    bits.append(str(part.get("text") or ""))
+                elif kind in {"image", "image_url"}:
+                    bits.append("[image]")
+                elif kind == "file":
+                    bits.append("[file]")
+                elif "text" in part:
+                    bits.append(str(part.get("text") or ""))
+                else:
+                    bits.append(f"[{kind or 'attachment'}]")
+            elif part is not None:
+                bits.append(str(part))
+        return _compact_preview_text(" ".join(b for b in bits if b), limit)
+    if isinstance(content, dict):
+        kind = str(content.get("type") or "")
+        if kind == "text" or "text" in content:
+            return _compact_preview_text(content.get("text") or "", limit)
+        if kind in {"image", "image_url"}:
+            return "[image]"[:limit]
+        if kind == "file":
+            return "[file]"[:limit]
+        if "content" in content:
+            return _extract_text_preview(content.get("content"), limit)
+        return _extract_text_preview([content], limit)
+    return _compact_preview_text(content, limit)
+
+
+def _events_table(path: Path) -> KVault:
+    events = KVault(str(path), table="events")
+    events.enable_auto_pack()
+    return events
+
+
+def _event_preview_sort_key(key: str, event: dict[str, Any]) -> tuple[int, float, str]:
+    event_id = event.get("event_id")
+    if isinstance(event_id, (int, float)):
+        return (0, float(event_id), key)
+    ts = event.get("ts")
+    if isinstance(ts, (int, float)):
+        return (1, float(ts), key)
+    return (2, 0.0, key)
+
+
+def _extract_first_user_preview(path: Path) -> str:
+    """Read the first user_input preview from one session DB.
+
+    This is only called in the short-lived subprocess backfill/lazy-fill path,
+    never on the normal parent-process list/stats hot path.
+    """
+    events = _events_table(path)
+    best: tuple[tuple[int, float, str], str] | None = None
+    try:
+        for key_bytes in events.keys(limit=_KV_KEYS_LIMIT):
+            key = (
+                key_bytes.decode("utf-8", errors="replace")
+                if isinstance(key_bytes, bytes)
+                else str(key_bytes)
+            )
+            try:
+                event = events[key_bytes]
+            except Exception as e:
+                logger.debug(
+                    "Failed to read session event for preview",
+                    path=str(path),
+                    key=key,
+                    error=str(e),
+                    exc_info=True,
+                )
+                continue
+            if not isinstance(event, dict) or event.get("type") != "user_input":
+                continue
+            content = event.get("content")
+            if content is None:
+                content = event.get("text") or event.get("input")
+            preview = _extract_text_preview(content)
+            if not preview:
+                continue
+            sort_key = _event_preview_sort_key(key, event)
+            if best is None or sort_key < best[0]:
+                best = (sort_key, preview)
+        return best[1] if best else ""
+    finally:
+        close = getattr(events, "close", None)
         if callable(close):
             close()
 
@@ -232,6 +344,7 @@ def _error_entry(path: Path, error: Exception | str) -> dict[str, Any]:
         "created_at": "",
         "last_active": "",
         "preview": "",
+        "preview_scanned": 1,
         "pwd": "",
         "format_version": 1,
         "parent_session_id": None,
@@ -260,6 +373,7 @@ def _entry_from_meta(path: Path, meta: dict[str, Any]) -> dict[str, Any]:
         agents = [str(agents)] if agents else []
     last_active = meta.get("last_active", "")
     created_at = meta.get("created_at", "")
+    preview = str(meta.get("preview") or meta.get("first_user_preview") or "")
     sort_ts = _to_ts(last_active) or _to_ts(created_at) or stat.st_mtime
     return {
         "name": normalize_session_stem(path),
@@ -272,11 +386,11 @@ def _entry_from_meta(path: Path, meta: dict[str, Any]) -> dict[str, Any]:
         "status": meta.get("status", ""),
         "created_at": created_at,
         "last_active": last_active,
-        # Do not scan events here; avoiding that scan is the whole point of
-        # the persistent summary index. New/live sessions can persist a
-        # preview into meta, and old sessions simply show an empty preview
-        # until a future writer fills it.
-        "preview": meta.get("preview", "") or meta.get("first_user_preview", ""),
+        # Backfill/refresh can fill this from events in the short-lived
+        # subprocess. Runtime/live upserts use only meta and preserve any
+        # existing indexed preview when this value is still empty.
+        "preview": preview,
+        "preview_scanned": 1 if preview else 0,
         "pwd": meta.get("pwd", ""),
         "format_version": meta.get("format_version", 1),
         "parent_session_id": (
@@ -311,7 +425,7 @@ def snapshot_store_meta(store: Any) -> dict[str, Any]:
     """
     result: dict[str, Any] = {}
     meta_table = getattr(store, "meta")
-    for key_bytes in meta_table.keys(limit=2**31 - 1):
+    for key_bytes in meta_table.keys(limit=_KV_KEYS_LIMIT):
         key = (
             key_bytes.decode("utf-8", errors="replace")
             if isinstance(key_bytes, bytes)
@@ -321,7 +435,11 @@ def snapshot_store_meta(store: Any) -> dict[str, Any]:
     return result
 
 
-def _read_session_index_entry_local(path: Path) -> dict[str, Any]:
+def _read_session_index_entry_local(
+    path: Path,
+    *,
+    include_preview: bool = True,
+) -> dict[str, Any]:
     """Read one session DB in the current process.
 
     This is intentionally private. Public refresh/backfill reads run in a
@@ -330,7 +448,12 @@ def _read_session_index_entry_local(path: Path) -> dict[str, Any]:
     """
     path = Path(path)
     try:
-        return _entry_from_meta(path, _load_meta_only(path))
+        meta = _load_meta_only(path)
+        entry = _entry_from_meta(path, meta)
+        if include_preview and not entry.get("preview"):
+            entry["preview"] = _extract_first_user_preview(path)
+        entry["preview_scanned"] = 1 if include_preview else int(bool(entry.get("preview")))
+        return entry
     except Exception as e:
         logger.debug(
             "Failed to build session index entry",
@@ -341,7 +464,11 @@ def _read_session_index_entry_local(path: Path) -> dict[str, Any]:
         return _error_entry(path, e)
 
 
-def _read_entries_in_subprocess(paths: list[Path]) -> list[dict[str, Any]]:
+def _read_entries_in_subprocess(
+    paths: list[Path],
+    *,
+    include_preview: bool = True,
+) -> list[dict[str, Any]]:
     if not paths:
         return []
     script = """
@@ -349,8 +476,10 @@ import json
 import sys
 from pathlib import Path
 from kohakuterrarium.studio.persistence import session_index as si
-paths = [Path(p) for p in json.load(sys.stdin)]
-entries = [si._read_session_index_entry_local(p) for p in paths]
+payload = json.load(sys.stdin)
+include_preview = bool(payload.get("include_preview", True))
+paths = [Path(p) for p in payload.get("paths", [])]
+entries = [si._read_session_index_entry_local(p, include_preview=include_preview) for p in paths]
 json.dump(entries, sys.stdout, ensure_ascii=False, default=str)
 """.strip()
     env = os.environ.copy()
@@ -364,7 +493,13 @@ json.dump(entries, sys.stdout, ensure_ascii=False, default=str)
         )
     proc = subprocess.run(
         [sys.executable, "-c", script],
-        input=json.dumps([str(p) for p in paths], ensure_ascii=False),
+        input=json.dumps(
+            {
+                "paths": [str(p) for p in paths],
+                "include_preview": include_preview,
+            },
+            ensure_ascii=False,
+        ),
         text=True,
         capture_output=True,
         env=env,
@@ -376,7 +511,11 @@ json.dump(entries, sys.stdout, ensure_ascii=False, default=str)
     return json.loads(proc.stdout or "[]")
 
 
-def read_session_index_entries(paths: list[Path]) -> list[dict[str, Any]]:
+def read_session_index_entries(
+    paths: list[Path],
+    *,
+    include_preview: bool = True,
+) -> list[dict[str, Any]]:
     """Build summary rows for legacy/backfill paths.
 
     Normal list/stats requests do not call this after the index has rows. When
@@ -386,7 +525,7 @@ def read_session_index_entries(paths: list[Path]) -> list[dict[str, Any]]:
     """
     paths = [Path(p) for p in paths]
     try:
-        return _read_entries_in_subprocess(paths)
+        return _read_entries_in_subprocess(paths, include_preview=include_preview)
     except Exception as e:
         logger.warning(
             "Subprocess session-index backfill failed; returning error rows",
@@ -402,7 +541,7 @@ def read_session_index_entries(paths: list[Path]) -> list[dict[str, Any]]:
 
 def read_session_index_entry(path: Path) -> dict[str, Any]:
     """Build one summary row from one session path."""
-    entries = read_session_index_entries([Path(path)])
+    entries = read_session_index_entries([Path(path)], include_preview=True)
     return entries[0] if entries else _error_entry(Path(path), "empty index read")
 
 
@@ -412,14 +551,16 @@ def _upsert_entry(conn: sqlite3.Connection, entry: dict[str, Any]) -> None:
         INSERT INTO sessions_index (
             name, filename, path,
             config_type, config_path, terrarium_name, agents_json,
-            status, created_at, last_active, preview, pwd, format_version,
+            status, created_at, last_active, preview, preview_scanned,
+            pwd, format_version,
             parent_session_id, fork_point_json, forked_children_json,
             migrated_from_version, file_mtime, wal_mtime, shm_mtime,
             file_size, sort_ts, indexed_at, error
         ) VALUES (
             :name, :filename, :path,
             :config_type, :config_path, :terrarium_name, :agents_json,
-            :status, :created_at, :last_active, :preview, :pwd, :format_version,
+            :status, :created_at, :last_active, :preview, :preview_scanned,
+            :pwd, :format_version,
             :parent_session_id, :fork_point_json, :forked_children_json,
             :migrated_from_version, :file_mtime, :wal_mtime, :shm_mtime,
             :file_size, :sort_ts, :indexed_at, :error
@@ -434,7 +575,11 @@ def _upsert_entry(conn: sqlite3.Connection, entry: dict[str, Any]) -> None:
             status=excluded.status,
             created_at=excluded.created_at,
             last_active=excluded.last_active,
-            preview=excluded.preview,
+            preview=COALESCE(NULLIF(excluded.preview, ''), sessions_index.preview, ''),
+            preview_scanned=CASE
+                WHEN excluded.preview_scanned THEN 1
+                ELSE sessions_index.preview_scanned
+            END,
             pwd=excluded.pwd,
             format_version=excluded.format_version,
             parent_session_id=excluded.parent_session_id,
@@ -454,6 +599,7 @@ def _upsert_entry(conn: sqlite3.Connection, entry: dict[str, Any]) -> None:
             "agents_json": _json_dumps(entry.get("agents"), []),
             "fork_point_json": _json_dumps(entry.get("fork_point"), None),
             "forked_children_json": _json_dumps(entry.get("forked_children"), []),
+            "preview_scanned": int(bool(entry.get("preview_scanned"))),
         },
     )
 
@@ -505,7 +651,11 @@ def delete_session_name(name: str, *, session_dir: Path) -> None:
             conn.commit()
 
 
-def refresh_index(session_dir: Path) -> list[dict[str, Any]]:
+def refresh_index(
+    session_dir: Path,
+    *,
+    include_preview: bool = True,
+) -> list[dict[str, Any]]:
     """Rebuild/repair the persistent index from canonical session files.
 
     This is used for first-run backfill and explicit Refresh.  Normal list and
@@ -513,7 +663,7 @@ def refresh_index(session_dir: Path) -> list[dict[str, Any]]:
     """
     session_dir = Path(session_dir)
     canonical = pick_canonical_per_session(session_dir)
-    entries = read_session_index_entries(canonical)
+    entries = read_session_index_entries(canonical, include_preview=include_preview)
     live_names = {entry["name"] for entry in entries}
     with _INDEX_LOCK:
         with _connection(session_dir) as conn:
@@ -547,7 +697,7 @@ def ensure_index(session_dir: Path) -> None:
             _init_schema(conn)
             count = _row_count(conn)
     if count == 0 and pick_canonical_per_session(session_dir):
-        refresh_index(session_dir)
+        refresh_index(session_dir, include_preview=False)
 
 
 def _public_entry(entry: dict[str, Any]) -> dict[str, Any]:
@@ -589,6 +739,58 @@ def _entry_sort_key(entry: dict[str, Any]) -> tuple[float, float, str]:
         float(entry.get("file_mtime") or 0.0),
         str(entry.get("name") or ""),
     )
+
+
+def _fill_missing_page_previews(session_dir: Path, rows: list[sqlite3.Row]) -> bool:
+    """Populate preview for current-page rows only.
+
+    Existing indexes created before preview backfill have empty preview fields.
+    Rebuilding every session would make the dashboard slow again, so normal
+    list calls only repair rows that are actually visible on the current page.
+    """
+    missing_paths: list[Path] = []
+    seen_names: set[str] = set()
+    for row in rows:
+        preview = str(row["preview"] or "")
+        preview_scanned = int(row["preview_scanned"] or 0)
+        if preview or preview_scanned:
+            continue
+        raw_path = str(row["path"] or "")
+        if not raw_path:
+            continue
+        name = str(row["name"] or normalize_session_stem(Path(raw_path)))
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        missing_paths.append(Path(raw_path))
+    if not missing_paths:
+        return False
+
+    rows_by_name = {
+        str(row["name"] or normalize_session_stem(Path(str(row["path"] or "")))): row
+        for row in rows
+    }
+    entries = read_session_index_entries(missing_paths, include_preview=True)
+    with _INDEX_LOCK:
+        with _connection(session_dir) as conn:
+            _init_schema(conn)
+            for entry in entries:
+                name = str(entry.get("name") or "")
+                row = rows_by_name.get(name)
+                if row is None:
+                    continue
+                conn.execute(
+                    """
+                    UPDATE sessions_index
+                    SET preview = COALESCE(NULLIF(?, ''), preview, ''),
+                        preview_scanned = 1,
+                        indexed_at = ?
+                    WHERE name = ?
+                    """,
+                    (entry.get("preview", ""), time.time(), name),
+                )
+            conn.commit()
+    return True
 
 
 def query_sessions(
@@ -636,6 +838,27 @@ def query_sessions(
                 """,
                 [*params, limit, offset],
             ).fetchall()
+
+    if _fill_missing_page_previews(session_dir, rows):
+        with _INDEX_LOCK:
+            with _connection(session_dir) as conn:
+                _init_schema(conn)
+                total = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM sessions_index {where}",
+                        params,
+                    ).fetchone()[0]
+                )
+                rows = conn.execute(
+                    f"""
+                    SELECT * FROM sessions_index
+                    {where}
+                    ORDER BY sort_ts DESC, file_mtime DESC, name ASC
+                    LIMIT ? OFFSET ?
+                    """,
+                    [*params, limit, offset],
+                ).fetchall()
+
     return {
         "sessions": [_row_to_public(row) for row in rows],
         "total": total,
