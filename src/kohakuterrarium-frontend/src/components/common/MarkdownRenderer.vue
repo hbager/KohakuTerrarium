@@ -7,7 +7,37 @@
 import { onBeforeUnmount, ref, shallowRef, watch } from "vue"
 import MarkdownIt from "markdown-it"
 import markdownItKatex from "@vscode/markdown-it-katex"
-import hljs from "highlight.js"
+import hljs from "highlight.js/lib/core"
+import bash from "highlight.js/lib/languages/bash"
+import css from "highlight.js/lib/languages/css"
+import javascript from "highlight.js/lib/languages/javascript"
+import json from "highlight.js/lib/languages/json"
+import markdown from "highlight.js/lib/languages/markdown"
+import python from "highlight.js/lib/languages/python"
+import typescript from "highlight.js/lib/languages/typescript"
+import xml from "highlight.js/lib/languages/xml"
+
+hljs.registerLanguage("bash", bash)
+hljs.registerLanguage("css", css)
+hljs.registerLanguage("javascript", javascript)
+hljs.registerLanguage("json", json)
+hljs.registerLanguage("markdown", markdown)
+hljs.registerLanguage("python", python)
+hljs.registerLanguage("typescript", typescript)
+hljs.registerLanguage("xml", xml)
+
+const HIGHLIGHT_ALIASES = {
+  html: "xml",
+  js: "javascript",
+  jsx: "javascript",
+  md: "markdown",
+  sh: "bash",
+  shell: "bash",
+  ts: "typescript",
+  tsx: "typescript",
+  vue: "xml",
+  zsh: "bash",
+}
 
 const props = defineProps({
   content: { type: String, default: "" },
@@ -27,11 +57,12 @@ const md = new MarkdownIt({
   breaks: props.breaks,
   highlight(str, lang) {
     const displayLang = lang || "text"
-    const langClass = lang && hljs.getLanguage(lang) ? lang : ""
+    const language = HIGHLIGHT_ALIASES[lang] || lang
+    const langClass = language && hljs.getLanguage(language) ? language : ""
     let highlighted
     if (langClass) {
       try {
-        highlighted = hljs.highlight(str, { language: lang }).value
+        highlighted = hljs.highlight(str, { language: langClass }).value
       } catch {
         highlighted = md.utils.escapeHtml(str)
       }

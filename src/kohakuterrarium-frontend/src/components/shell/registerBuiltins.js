@@ -8,6 +8,8 @@
  *             "catalog", "settings", "code-editor"
  */
 
+import { defineAsyncComponent } from "vue"
+
 import { registerTabKind, registerInspectorInnerTab } from "@/stores/tabKindRegistry"
 
 import AgentInspectorTab from "@/components/shell/tabs/AgentInspectorTab.vue"
@@ -16,16 +18,29 @@ import InspectorActivity from "@/components/shell/tabs/inspector/InspectorActivi
 import InspectorTrace from "@/components/shell/tabs/inspector/InspectorTrace.vue"
 import InspectorLog from "@/components/shell/tabs/inspector/InspectorLog.vue"
 import Dashboard from "@/components/shell/tabs/Dashboard.vue"
-import AttachTab from "@/components/shell/tabs/AttachTab.vue"
-import SessionViewerTab from "@/components/shell/tabs/SessionViewerTab.vue"
-import SavedSessionsTab from "@/components/shell/tabs/SavedSessionsTab.vue"
 import StatsTab from "@/components/shell/tabs/StatsTab.vue"
-import StudioEditorTab from "@/components/shell/tabs/StudioEditorTab.vue"
-import CatalogTab from "@/components/shell/tabs/CatalogTab.vue"
-import SettingsTab from "@/components/shell/tabs/SettingsTab.vue"
-import CodeEditorTab from "@/components/shell/tabs/CodeEditorTab.vue"
+
+const AttachTab = defineAsyncComponent(() => import("@/components/shell/tabs/AttachTab.vue"))
+const SessionViewerTab = defineAsyncComponent(
+  () => import("@/components/shell/tabs/SessionViewerTab.vue"),
+)
+const SavedSessionsTab = defineAsyncComponent(
+  () => import("@/components/shell/tabs/SavedSessionsTab.vue"),
+)
+const StudioEditorTab = defineAsyncComponent(
+  () => import("@/components/shell/tabs/StudioEditorTab.vue"),
+)
+const CatalogTab = defineAsyncComponent(() => import("@/components/shell/tabs/CatalogTab.vue"))
+const SettingsTab = defineAsyncComponent(() => import("@/components/shell/tabs/SettingsTab.vue"))
+const CodeEditorTab = defineAsyncComponent(
+  () => import("@/components/shell/tabs/CodeEditorTab.vue"),
+)
 
 let _registered = false
+
+export function _resetBuiltinTabKindsForTests() {
+  _registered = false
+}
 
 export function registerBuiltinTabKinds() {
   if (_registered) return

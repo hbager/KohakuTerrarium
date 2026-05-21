@@ -80,6 +80,7 @@ const error = ref("")
 const viewerMeta = ref(null)
 const historyTargets = ref([])
 const refreshingTarget = ref(false)
+const targetHistorySignatures = new Map()
 
 const viewerInstance = computed(() => {
   const meta = viewerMeta.value || {}
@@ -115,6 +116,25 @@ function resetViewer() {
     compactThreshold: 0,
     maxContext: 0,
   }
+  targetHistorySignatures.clear()
+}
+
+function normalizeHistoryPayload(value) {
+  if (Array.isArray(value)) return value.map(normalizeHistoryPayload)
+  if (!value || typeof value !== "object") return value
+  return Object.keys(value)
+    .sort()
+    .reduce((acc, key) => {
+      acc[key] = normalizeHistoryPayload(value[key])
+      return acc
+    }, {})
+}
+
+function historyPayloadSignature(data) {
+  return JSON.stringify({
+    events: normalizeHistoryPayload(data.events || []),
+    messages: normalizeHistoryPayload(data.messages || []),
+  })
 }
 
 function ensureTabs(tabs) {
@@ -126,6 +146,10 @@ function ensureTabs(tabs) {
 async function loadTarget(tab) {
   if (!tab) return
   const data = await sessionAPI.getHistory(sessionName.value, tab)
+  const signatureKey = `${sessionName.value}:${tab}`
+  const signature = historyPayloadSignature(data)
+  if (targetHistorySignatures.get(signatureKey) === signature) return
+  targetHistorySignatures.set(signatureKey, signature)
   if (data.events?.length) {
     const { messages, pendingJobs } = _replayEvents(data.messages || [], data.events)
     chat.messagesByTab[tab] = messages

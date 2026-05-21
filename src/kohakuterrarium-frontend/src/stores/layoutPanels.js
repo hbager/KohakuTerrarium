@@ -7,23 +7,31 @@
  *   LeafNode  = { type: "leaf", panelId: string }
  */
 
-import ChatPanel from "@/components/chat/ChatPanel.vue"
-import EditorMain from "@/components/editor/EditorMain.vue"
-import EditorStatus from "@/components/editor/EditorStatus.vue"
-import FileTree from "@/components/editor/FileTree.vue"
-import CanvasPanel from "@/components/panels/CanvasPanel.vue"
-import CreaturesPanel from "@/components/panels/CreaturesPanel.vue"
-import DebugPanel from "@/components/panels/DebugPanel.vue"
-import FilesPanel from "@/components/panels/FilesPanel.vue"
-import ActivityPanel from "@/components/panels/ActivityPanel.vue"
-import SettingsPanel from "@/components/panels/SettingsPanel.vue"
-import StatePanel from "@/components/panels/StatePanel.vue"
-import TerminalPanel from "@/components/panels/TerminalPanel.vue"
-import ModulesPanel from "@/components/panels/modules/ModulesPanel.vue"
-import StatusDashboard from "@/components/status/StatusDashboard.vue"
-import StatusDashboardTab from "@/components/status/StatusDashboardTab.vue"
+import { defineAsyncComponent } from "vue"
 
 import { useLayoutStore } from "@/stores/layout"
+
+const ChatPanel = defineAsyncComponent(() => import("@/components/chat/ChatPanel.vue"))
+const EditorMain = defineAsyncComponent(() => import("@/components/editor/EditorMain.vue"))
+const EditorStatus = defineAsyncComponent(() => import("@/components/editor/EditorStatus.vue"))
+const FileTree = defineAsyncComponent(() => import("@/components/editor/FileTree.vue"))
+const CanvasPanel = defineAsyncComponent(() => import("@/components/panels/CanvasPanel.vue"))
+const CreaturesPanel = defineAsyncComponent(() => import("@/components/panels/CreaturesPanel.vue"))
+const DebugPanel = defineAsyncComponent(() => import("@/components/panels/DebugPanel.vue"))
+const FilesPanel = defineAsyncComponent(() => import("@/components/panels/FilesPanel.vue"))
+const ActivityPanel = defineAsyncComponent(() => import("@/components/panels/ActivityPanel.vue"))
+const SettingsPanel = defineAsyncComponent(() => import("@/components/panels/SettingsPanel.vue"))
+const StatePanel = defineAsyncComponent(() => import("@/components/panels/StatePanel.vue"))
+const TerminalPanel = defineAsyncComponent(() => import("@/components/panels/TerminalPanel.vue"))
+const ModulesPanel = defineAsyncComponent(
+  () => import("@/components/panels/modules/ModulesPanel.vue"),
+)
+const StatusDashboard = defineAsyncComponent(
+  () => import("@/components/status/StatusDashboard.vue"),
+)
+const StatusDashboardTab = defineAsyncComponent(
+  () => import("@/components/status/StatusDashboardTab.vue"),
+)
 
 // ─── Helper to build tree nodes concisely ────────────────────────
 

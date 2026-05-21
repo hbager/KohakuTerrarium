@@ -8,6 +8,7 @@ share one implementation.
 """
 
 import os
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +39,7 @@ _SESSION_DIR = Path.home() / ".kohakuterrarium" / "sessions"
 _session_index: list[dict] = []
 _index_built_at: float = 0
 _index_signature: tuple[tuple[str, float], ...] = ()
+_index_rebuild_lock = threading.RLock()
 
 
 def _session_dir() -> Path:
@@ -212,7 +214,9 @@ def _entry_time_ts(entry: dict, fallback: float = 0.0) -> float:
     return fallback
 
 
-def _session_file_signature(session_dir: Path | None = None) -> tuple[list[Path], tuple[tuple[str, float], ...]]:
+def _session_file_signature(
+    session_dir: Path | None = None,
+) -> tuple[list[Path], tuple[tuple[str, float], ...]]:
     """Return canonical files plus a cheap change signature."""
     session_dir = session_dir or _session_dir()
     if not session_dir.exists():
@@ -229,7 +233,13 @@ _MAX_INDEX_WORKERS = min(32, (os.cpu_count() or 4) * 4)
 
 
 def build_session_index() -> list[dict]:
-    """Build index of all sessions. Cached in memory.
+    """Build index of all sessions. Cached in memory."""
+    with _index_rebuild_lock:
+        return _build_session_index_unlocked()
+
+
+def _build_session_index_unlocked() -> list[dict]:
+    """Build index of all sessions. Caller must hold ``_index_rebuild_lock``.
 
     Two-phase:
 
@@ -305,9 +315,14 @@ def build_session_index() -> list[dict]:
 def get_session_index(max_age: float = 30.0) -> list[dict]:
     """Get cached session index, rebuild if stale or files changed."""
     _files, signature = _session_file_signature()
-    if signature != _index_signature or time.time() - _index_built_at > max_age:
-        return build_session_index()
-    return _session_index
+    if signature == _index_signature and time.time() - _index_built_at <= max_age:
+        return _session_index
+
+    with _index_rebuild_lock:
+        _files, signature = _session_file_signature()
+        if signature == _index_signature and time.time() - _index_built_at <= max_age:
+            return _session_index
+        return _build_session_index_unlocked()
 
 
 def all_session_files_default() -> list[Path]:

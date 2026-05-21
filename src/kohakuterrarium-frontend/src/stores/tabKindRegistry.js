@@ -14,7 +14,7 @@
  * Discriminating by kind elsewhere is a coupling smell.
  */
 
-import { reactive } from "vue"
+import { markRaw, reactive } from "vue"
 
 export const tabKinds = reactive(new Map())
 export const inspectorInnerTabs = reactive(new Map())
@@ -48,15 +48,23 @@ export function registerTabKind({ kind, component, capabilities = {}, minDensity
   if (tabKinds.has(kind)) {
     console.warn(`tab kind ${kind} already registered; overwriting`)
   }
-  tabKinds.set(kind, { component, capabilities, minDensity })
+  tabKinds.set(kind, {
+    component: component ? markRaw(component) : component,
+    capabilities,
+    minDensity,
+  })
 }
 
 export function registerInspectorInnerTab({ id, component, label, order = 100 }) {
-  inspectorInnerTabs.set(id, { component, label, order })
+  inspectorInnerTabs.set(id, {
+    component: component ? markRaw(component) : component,
+    label,
+    order,
+  })
 }
 
 export function registerRailGroup({ id, component, order = 100 }) {
-  railGroups.set(id, { component, order })
+  railGroups.set(id, { component: component ? markRaw(component) : component, order })
 }
 
 /** Lookup helper used by TabContent.vue. */

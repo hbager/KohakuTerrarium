@@ -75,14 +75,87 @@ describe("SessionHistoryViewer — workspace refresh", () => {
 
     await flushPromises()
     expect(sessionAPI.getHistory).toHaveBeenCalledTimes(1)
-    expect(chat.messagesByTab.root.map((m) => m.content || m.parts?.[0]?.content).join(" ")).toContain(
-      "first",
-    )
+    expect(
+      chat.messagesByTab.root.map((m) => m.content || m.parts?.[0]?.content).join(" "),
+    ).toContain("first")
 
     await vi.advanceTimersByTimeAsync(2000)
     await flushPromises()
 
     expect(sessionAPI.getHistory).toHaveBeenCalledTimes(2)
     expect(JSON.stringify(chat.messagesByTab.root)).toContain("second")
+  })
+
+  it("keeps the existing messages array when a refresh returns unchanged history", async () => {
+    const detail = useSessionDetailStore()
+    detail.name = "session-a"
+    const chat = useChatStore()
+    const unchangedPayload = {
+      messages: [],
+      events: [{ type: "user_input", content: "first", event_id: 1 }],
+    }
+    sessionAPI.getHistoryIndex.mockResolvedValue({
+      meta: { session_id: "session-a", agents: ["root"] },
+      targets: ["root"],
+    })
+    sessionAPI.getHistory.mockResolvedValue(unchangedPayload)
+
+    mount(SessionHistoryViewer, {
+      props: { embedded: true },
+      global: {
+        stubs: {
+          ChatPanel: { template: "<div />" },
+        },
+      },
+    })
+
+    await flushPromises()
+    expect(sessionAPI.getHistory).toHaveBeenCalledTimes(1)
+    const firstMessages = chat.messagesByTab.root
+
+    await vi.advanceTimersByTimeAsync(2000)
+    await flushPromises()
+
+    expect(sessionAPI.getHistory).toHaveBeenCalledTimes(2)
+    expect(chat.messagesByTab.root).toBe(firstMessages)
+  })
+
+  it("updates the messages array when same-sized history content changes", async () => {
+    const detail = useSessionDetailStore()
+    detail.name = "session-a"
+    const chat = useChatStore()
+    sessionAPI.getHistoryIndex.mockResolvedValue({
+      meta: { session_id: "session-a", agents: ["root"] },
+      targets: ["root"],
+    })
+    sessionAPI.getHistory
+      .mockResolvedValueOnce({
+        messages: [],
+        events: [{ type: "user_input", content: "first", event_id: 1 }],
+      })
+      .mockResolvedValueOnce({
+        messages: [],
+        events: [{ type: "user_input", content: "other", event_id: 1 }],
+      })
+
+    mount(SessionHistoryViewer, {
+      props: { embedded: true },
+      global: {
+        stubs: {
+          ChatPanel: { template: "<div />" },
+        },
+      },
+    })
+
+    await flushPromises()
+    expect(sessionAPI.getHistory).toHaveBeenCalledTimes(1)
+    const firstMessages = chat.messagesByTab.root
+
+    await vi.advanceTimersByTimeAsync(2000)
+    await flushPromises()
+
+    expect(sessionAPI.getHistory).toHaveBeenCalledTimes(2)
+    expect(chat.messagesByTab.root).not.toBe(firstMessages)
+    expect(JSON.stringify(chat.messagesByTab.root)).toContain("other")
   })
 })

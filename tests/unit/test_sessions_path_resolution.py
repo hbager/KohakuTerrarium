@@ -218,7 +218,10 @@ def test_listing_sorts_by_last_active_not_file_mtime(session_dir):
 def test_cached_listing_rebuilds_when_session_files_change(session_dir):
     """Workspace polling should see changed sessions before the TTL expires."""
     from kohakuterrarium.session.store import SessionStore
-    from kohakuterrarium.studio.persistence.store import build_session_index, get_session_index
+    from kohakuterrarium.studio.persistence.store import (
+        build_session_index,
+        get_session_index,
+    )
 
     older_path = session_dir / "older.kohakutr"
     newer_path = session_dir / "newer.kohakutr"
@@ -244,6 +247,78 @@ def test_cached_listing_rebuilds_when_session_files_change(session_dir):
     index = get_session_index(max_age=3600)
 
     assert [entry["name"] for entry in index[:2]] == ["older", "newer"]
+
+
+def test_concurrent_cached_listing_uses_one_cold_rebuild(session_dir, monkeypatch):
+    """Concurrent dashboard/session-stat loads must share one index rebuild.
+
+    The frontend can ask for saved-session rows and saved-session stats at
+    the same time. A cold cache should create one inner worker pool, not
+    one pool per HTTP request.
+    """
+    import concurrent.futures
+    import threading
+    import time
+
+    from kohakuterrarium.studio.persistence import store as persistence_store
+
+    for idx in range(4):
+        _touch_session_file(session_dir / f"session-{idx}.kohakutr")
+
+    monkeypatch.setattr(persistence_store, "_session_index", [])
+    monkeypatch.setattr(persistence_store, "_index_signature", ())
+    monkeypatch.setattr(persistence_store, "_index_built_at", 0)
+
+    real_executor = persistence_store.ThreadPoolExecutor
+    state_lock = threading.Lock()
+    start_barrier = threading.Barrier(2)
+    active_pools = 0
+    max_active_pools = 0
+    pool_count = 0
+
+    class TrackingExecutor:
+        def __init__(self, *args, **kwargs):
+            self._inner = real_executor(*args, **kwargs)
+
+        def __enter__(self):
+            nonlocal active_pools, max_active_pools, pool_count
+            with state_lock:
+                active_pools += 1
+                pool_count += 1
+                max_active_pools = max(max_active_pools, active_pools)
+            return self._inner.__enter__()
+
+        def __exit__(self, exc_type, exc, tb):
+            nonlocal active_pools
+            try:
+                return self._inner.__exit__(exc_type, exc, tb)
+            finally:
+                with state_lock:
+                    active_pools -= 1
+
+    def slow_read(path):
+        time.sleep(0.05)
+        return {
+            "name": persistence_store.normalize_session_stem(path),
+            "filename": path.name,
+            "created_at": "2024-01-01T00:00:00",
+            "last_active": "2024-01-01T00:00:00",
+        }
+
+    monkeypatch.setattr(persistence_store, "ThreadPoolExecutor", TrackingExecutor)
+    monkeypatch.setattr(persistence_store, "_read_session_entry", slow_read)
+
+    def list_sessions():
+        start_barrier.wait()
+        return persistence_store.get_session_index(max_age=3600)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(list_sessions) for _ in range(2)]
+        results = [future.result(timeout=5) for future in futures]
+
+    assert [len(result) for result in results] == [4, 4]
+    assert pool_count == 1
+    assert max_active_pools == 1
 
 
 @pytest.mark.asyncio
