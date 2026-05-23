@@ -129,6 +129,24 @@ class TestBuildEmbeddings:
         assert out["indexed_per_agent"]["alice"]["events"] == 3
         assert out["provider"] == "model2vec"
 
+    def test_closes_memory_index(self, tmp_path, monkeypatch):
+        kt_path = tmp_path / "sess.kohakutr"
+        store = _make_populated_store(kt_path)
+        store.close()
+
+        closed: list[_FakeMemory] = []
+
+        class _TrackingMemory(_FakeMemory):
+            def close(self):
+                closed.append(self)
+
+        monkeypatch.setattr(ms, "create_embedder", lambda cfg: _StubEmbedder())
+        monkeypatch.setattr(ms, "SessionMemory", _TrackingMemory)
+
+        ms.build_embeddings(kt_path)
+
+        assert len(closed) == 1
+
     def test_handles_agent_with_no_events(self, tmp_path, monkeypatch):
         kt_path = tmp_path / "sess.kohakutr"
         store = SessionStore(kt_path)
@@ -288,6 +306,31 @@ class TestSearchSessionMemory:
             assert out["count"] == 2
             assert out["session_name"] == "sess"
             assert out["results"][0]["content"] == "hello world"
+        finally:
+            await engine.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_search_closes_memory_index(self, tmp_path, monkeypatch):
+        engine = Terrarium()
+        try:
+            kt_path = tmp_path / "sess.kohakutr"
+            store = _make_populated_store(kt_path)
+            store.close()
+
+            closed: list[_FakeMemory] = []
+
+            class _TrackingMemory(_FakeMemory):
+                def close(self):
+                    closed.append(self)
+
+            monkeypatch.setattr(ms, "create_embedder", lambda cfg: _StubEmbedder())
+            monkeypatch.setattr(ms, "SessionMemory", _TrackingMemory)
+
+            await ms.search_session_memory(
+                kt_path, q="kenobi", mode="auto", k=5, agent=None, engine=engine
+            )
+
+            assert len(closed) == 1
         finally:
             await engine.shutdown()
 

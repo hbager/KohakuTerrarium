@@ -43,6 +43,7 @@ from kohakuterrarium.session.token_views import (
     token_usage_all_loops as _token_usage_all_loops_impl,
 )
 from kohakuterrarium.session.version import FORMAT_VERSION
+from kohakuterrarium.session.vault_handles import close_and_release_vault
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -853,17 +854,18 @@ class SessionStore:
                     error=str(e),
                     exc_info=True,
                 )
-        self.events.close()
-        self.meta.close()
-        self.state.close()
-        self.channels.close()
-        self.subagents.close()
-        self.jobs.close()
-        self.conversation.close()
-        self.turn_rollup.close()
-        fts_close = getattr(self.fts, "close", None)
-        if callable(fts_close):
-            fts_close()
+        for table in (
+            self.events,
+            self.meta,
+            self.state,
+            self.channels,
+            self.subagents,
+            self.jobs,
+            self.conversation,
+            self.turn_rollup,
+            self.fts,
+        ):
+            close_and_release_vault(table)
         logger.debug("SessionStore closed", path=self._path)
 
     # ─── Fork / Branch (Wave E) ─────────────────────────────────────

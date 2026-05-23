@@ -24,6 +24,7 @@ from kohakuterrarium.session.history import (
     dedupe_adjacent_duplicate_events,
     select_live_event_ids,
 )
+from kohakuterrarium.session.vault_handles import close_and_release_vault
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -361,6 +362,11 @@ class SessionMemory:
             "has_vectors": self._has_vectors,
             "dimensions": self._embedder.dimensions,
         }
+
+    def close(self) -> None:
+        """Close indexes opened by this memory facade."""
+        for handle in (self._fts, self._state, self._vec):
+            close_and_release_vault(handle)
 
 
 # ── Block extraction ───────────────────────────────────────────

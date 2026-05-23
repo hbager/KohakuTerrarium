@@ -71,6 +71,7 @@ def search_cli(
         return 1
 
     store = SessionStore(path)
+    memory = None
     try:
         # Try to create embedder for query encoding (semantic/hybrid)
         embedder = None
@@ -123,4 +124,6 @@ def search_cli(
         print(f"Error: {e}")
         return 1
     finally:
+        if memory is not None:
+            memory.close()
         store.close()

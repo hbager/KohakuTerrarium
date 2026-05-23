@@ -486,6 +486,21 @@ class TestLifecycle:
         assert meta["status"] == "paused"
         s2.close()
 
+    def test_close_releases_file_handle(self, tmp_path):
+        path = tmp_path / "delete_after_close.kohakutr"
+        s = SessionStore(path)
+        s.init_meta(
+            session_id="s1",
+            config_type="agent",
+            config_path="/p",
+            pwd="/w",
+            agents=["a"],
+        )
+        s.append_event("a", "user_input", {"content": "hello"})
+        s.close(update_status=False)
+
+        path.unlink()
+
     def test_repr(self, store):
         assert "SessionStore" in repr(store)
         assert "test_session.kohakutr" in repr(store)

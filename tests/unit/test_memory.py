@@ -341,6 +341,25 @@ class TestSessionMemory:
         memory = SessionMemory(tmp_db, embedder=fake_embedder)
         assert memory.has_vectors
 
+    def test_close_closes_owned_indexes(self, tmp_db, fake_embedder):
+        memory = SessionMemory(tmp_db, embedder=fake_embedder)
+        closed: list[str] = []
+
+        class _Closable:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def close(self) -> None:
+                closed.append(self.name)
+
+        memory._fts = _Closable("fts")
+        memory._state = _Closable("state")
+        memory._vec = _Closable("vec")
+
+        memory.close()
+
+        assert closed == ["fts", "state", "vec"]
+
     def test_index_events(self, tmp_db, fake_embedder, sample_events):
         memory = SessionMemory(tmp_db, embedder=fake_embedder)
         count = memory.index_events("test", sample_events)
@@ -589,3 +608,27 @@ class TestSearchMemoryTool:
         schema = _BUILTIN_SCHEMAS["search_memory"]
         assert "query" in schema["properties"]
         assert "query" in schema["required"]
+
+
+class TestAgentSessionMemoryCleanup:
+    def test_closes_cached_session_memory(self):
+        from kohakuterrarium.core.agent_lifecycle import AgentLifecycleMixin
+        from kohakuterrarium.core.session import Session
+
+        closed: list[bool] = []
+
+        class _Memory:
+            def close(self):
+                closed.append(True)
+
+        class _Agent(AgentLifecycleMixin):
+            config = type("C", (), {"name": "agent"})()
+            session = Session(key="agent")
+
+        agent = _Agent()
+        agent.session._memory = _Memory()
+
+        agent._close_session_memory()
+
+        assert closed == [True]
+        assert not hasattr(agent.session, "_memory")

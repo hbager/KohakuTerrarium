@@ -60,17 +60,21 @@ def build_embeddings(
 
         embedder = create_embedder(embed_config)
         memory = SessionMemory(str(path), embedder=embedder, store=store)
+        try:
+            indexed: dict[str, dict[str, int]] = {}
+            for agent_name in agents:
+                events = store.get_events(agent_name)
+                if not events:
+                    indexed[agent_name] = {"events": 0, "blocks": 0}
+                    continue
+                count = memory.index_events(agent_name, events)
+                indexed[agent_name] = {"events": len(events), "blocks": count}
 
-        indexed: dict[str, dict[str, int]] = {}
-        for agent_name in agents:
-            events = store.get_events(agent_name)
-            if not events:
-                indexed[agent_name] = {"events": 0, "blocks": 0}
-                continue
-            count = memory.index_events(agent_name, events)
-            indexed[agent_name] = {"events": len(events), "blocks": count}
-
-        stats = memory.get_stats()
+            stats = memory.get_stats()
+        finally:
+            close = getattr(memory, "close", None)
+            if callable(close):
+                close()
         return {
             "path": str(path),
             "agents": agents,
@@ -116,6 +120,8 @@ async def search_session_memory(
     behavior. Modes: ``auto`` (default), ``fts``, ``semantic``,
     ``hybrid``.
     """
+    store: SessionStore | None = None
+    live_store: SessionStore | None = None
     try:
         # Find the live creature (if running) to reuse its store
         # and embedder — same pattern as the search_memory builtin tool.
@@ -136,19 +142,25 @@ async def search_session_memory(
             embedder = None
 
         memory = SessionMemory(str(path), embedder=embedder, store=store)
+        try:
+            # Index unindexed events (idempotent — skips already indexed)
+            meta = store.load_meta()
+            for agent_name in meta.get("agents", []):
+                events = store.get_events(agent_name)
+                if events:
+                    memory.index_events(agent_name, events)
 
-        # Index unindexed events (idempotent — skips already indexed)
-        meta = store.load_meta()
-        for agent_name in meta.get("agents", []):
-            events = store.get_events(agent_name)
-            if events:
-                memory.index_events(agent_name, events)
-
-        results = memory.search(query=q, mode=mode, k=k, agent=agent)
+            results = memory.search(query=q, mode=mode, k=k, agent=agent)
+        finally:
+            close = getattr(memory, "close", None)
+            if callable(close):
+                close()
 
         if not live_store:
             store.close(update_status=False)
     except Exception as e:
+        if store is not None and not live_store:
+            store.close(update_status=False)
         raise HTTPException(500, f"Memory search failed: {e}")
 
     return {

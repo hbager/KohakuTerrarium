@@ -46,6 +46,7 @@ class AgentLifecycleMixin:
         await self.input.stop()
         if self.compact_manager:
             await self.compact_manager.cancel()
+        self._close_session_memory()
         await self.output_router.stop()
         compact_llm = (
             getattr(self.compact_manager, "_llm", None)
@@ -59,6 +60,27 @@ class AgentLifecycleMixin:
         ):
             await compact_llm.close()
         await self.llm.close()
+
+    def _close_session_memory(self) -> None:
+        session = getattr(self, "session", None)
+        memory = getattr(session, "_memory", None)
+        if memory is None:
+            return
+        close = getattr(memory, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as e:
+                logger.debug(
+                    "Failed to close session memory",
+                    agent_name=self.config.name,
+                    error=str(e),
+                    exc_info=True,
+                )
+        try:
+            delattr(session, "_memory")
+        except AttributeError:
+            pass
 
     async def _cancel_executor_tasks(self) -> None:
         executor = getattr(self, "executor", None)
