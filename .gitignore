@@ -1,6 +1,7 @@
 /temp*/
 env
 .env
+/rule.md
 ideas/
 example_output/
 novel_log.txt
