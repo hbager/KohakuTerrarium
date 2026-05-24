@@ -5,10 +5,8 @@
  *   Phase 3 — kind: "inspector"
  *   Phase 4 — kind: "dashboard"
  *   Phase 5 — kinds: "attach", "session-viewer", "studio-editor",
- *             "catalog", "settings", "code-editor"
+ *             "catalog", "settings", "code-editor", "graph-editor"
  */
-
-import { defineAsyncComponent } from "vue"
 
 import { registerTabKind, registerInspectorInnerTab } from "@/stores/tabKindRegistry"
 
@@ -18,23 +16,16 @@ import InspectorActivity from "@/components/shell/tabs/inspector/InspectorActivi
 import InspectorTrace from "@/components/shell/tabs/inspector/InspectorTrace.vue"
 import InspectorLog from "@/components/shell/tabs/inspector/InspectorLog.vue"
 import Dashboard from "@/components/shell/tabs/Dashboard.vue"
+import AttachTab from "@/components/shell/tabs/AttachTab.vue"
+import SessionViewerTab from "@/components/shell/tabs/SessionViewerTab.vue"
+import SavedSessionsTab from "@/components/shell/tabs/SavedSessionsTab.vue"
 import StatsTab from "@/components/shell/tabs/StatsTab.vue"
-const AttachTab = defineAsyncComponent(() => import("@/components/shell/tabs/AttachTab.vue"))
-const SessionViewerTab = defineAsyncComponent(
-  () => import("@/components/shell/tabs/SessionViewerTab.vue"),
-)
-const SavedSessionsTab = defineAsyncComponent(
-  () => import("@/components/shell/tabs/SavedSessionsTab.vue"),
-)
-const StudioEditorTab = defineAsyncComponent(
-  () => import("@/components/shell/tabs/StudioEditorTab.vue"),
-)
-const CatalogTab = defineAsyncComponent(() => import("@/components/shell/tabs/CatalogTab.vue"))
-const ExtensionsTab = defineAsyncComponent(() => import("@/components/shell/tabs/ExtensionsTab.vue"))
-const SettingsTab = defineAsyncComponent(() => import("@/components/shell/tabs/SettingsTab.vue"))
-const CodeEditorTab = defineAsyncComponent(
-  () => import("@/components/shell/tabs/CodeEditorTab.vue"),
-)
+import StudioEditorTab from "@/components/shell/tabs/StudioEditorTab.vue"
+import CatalogTab from "@/components/shell/tabs/CatalogTab.vue"
+import ExtensionsTab from "@/components/shell/tabs/ExtensionsTab.vue"
+import SettingsTab from "@/components/shell/tabs/SettingsTab.vue"
+import CodeEditorTab from "@/components/shell/tabs/CodeEditorTab.vue"
+import GraphEditorTab from "@/components/graph-editor/GraphEditorTab.vue"
 
 let _registered = false
 
@@ -92,4 +83,5 @@ export function registerBuiltinTabKinds() {
   registerTabKind({ kind: "extensions", component: ExtensionsTab })
   registerTabKind({ kind: "settings", component: SettingsTab })
   registerTabKind({ kind: "code-editor", component: CodeEditorTab })
+  registerTabKind({ kind: "graph-editor", component: GraphEditorTab })
 }

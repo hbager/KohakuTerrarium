@@ -19,24 +19,16 @@
 </template>
 
 <script setup>
-import { computed, defineAsyncComponent, ref } from "vue"
+import { computed, ref } from "vue"
 
 import NewCreatureModal from "@/components/shell/modals/NewCreatureModal.vue"
 import NewTerrariumModal from "@/components/shell/modals/NewTerrariumModal.vue"
 import ResumeSessionModal from "@/components/shell/modals/ResumeSessionModal.vue"
 import AdvancedStartModal from "@/components/shell/modals/AdvancedStartModal.vue"
-import { registerTabKind, tabKindRegistry } from "@/stores/tabKindRegistry"
 import { useTabsStore } from "@/stores/tabs"
 import { useStudioWorkspaceStore } from "@/stores/studio/workspace"
 import { buildStudioTabId } from "@/utils/tabsUrl"
 import { useI18n } from "@/utils/i18n"
-
-// Register the graph-editor tab kind once at module load. Idempotent
-// guard against repeated registrations (HMR / multiple rail mounts).
-const GraphEditorTab = defineAsyncComponent(() => import("@/components/graph-editor/GraphEditorTab.vue"))
-if (!tabKindRegistry.has("graph-editor")) {
-  registerTabKind({ kind: "graph-editor", component: GraphEditorTab })
-}
 
 const tabs = useTabsStore()
 const ws = useStudioWorkspaceStore()

@@ -6,7 +6,10 @@ no server involved.  Tests redirect both via ``KT_CONFIG_DIR`` /
 """
 
 import argparse
+import builtins
 from pathlib import Path
+import sys
+import types
 
 import pytest
 
@@ -38,6 +41,18 @@ def cli_env(tmp_path, monkeypatch):
 
 def _ns(**kwargs) -> argparse.Namespace:
     return argparse.Namespace(**kwargs)
+
+
+def _install_segno_stub(monkeypatch):
+    class _Qr:
+        def terminal(self, out, compact=True, border=1):
+            out.write("QR-STUB\n")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "segno",
+        types.SimpleNamespace(make=lambda *args, **kwargs: _Qr()),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -106,7 +121,26 @@ class TestShowHostQr:
         assert rc == 1
         assert "host_token is not set" in captured.err
 
-    def test_prints_qr_and_uri(self, cli_env, capsys):
+    def test_returns_1_when_qr_dependency_missing(self, cli_env, capsys, monkeypatch):
+        real_import = builtins.__import__
+
+        def guarded_import(name, *args, **kwargs):
+            if name == "segno":
+                raise ModuleNotFoundError("No module named 'segno'")
+            return real_import(name, *args, **kwargs)
+
+        admin_cli(_ns(admin_command="set-host-token"))
+        capsys.readouterr()
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+        rc = admin_cli(_ns(admin_command="show-host-qr", url="", yes=True))
+        captured = capsys.readouterr()
+
+        assert rc == 1
+        assert "segno" in captured.err
+
+    def test_prints_qr_and_uri(self, cli_env, capsys, monkeypatch):
+        _install_segno_stub(monkeypatch)
         admin_cli(_ns(admin_command="set-host-token"))
         rc = admin_cli(
             _ns(
@@ -121,7 +155,8 @@ class TestShowHostQr:
         assert "ktconnect://kt.home.lan:8001/?token=" in captured.out
         assert "https://kt.home.lan:8001" in captured.out
 
-    def test_uri_scheme_param_captures_https(self, cli_env, capsys):
+    def test_uri_scheme_param_captures_https(self, cli_env, capsys, monkeypatch):
+        _install_segno_stub(monkeypatch)
         # The ktconnect URI carries the original scheme as a query
         # param so the mobile client knows TLS vs plain.  Pin so the
         # contract doesn't drift if a future refactor drops it.
@@ -136,7 +171,8 @@ class TestShowHostQr:
         out = capsys.readouterr().out
         assert "scheme=https" in out
 
-    def test_token_in_uri_is_url_encoded(self, cli_env, capsys):
+    def test_token_in_uri_is_url_encoded(self, cli_env, capsys, monkeypatch):
+        _install_segno_stub(monkeypatch)
         # Manually seed a token with special chars to verify quoting.
         from kohakuterrarium.api.auth.config_write import write_auth_section
 

@@ -40,6 +40,7 @@
 
 <script setup>
 import { computed, ref } from "vue"
+import { useRoute } from "vue-router"
 
 import { useInstanceContext } from "@/components/chrome/instanceContext"
 import ModelSwitcher from "@/components/chrome/ModelSwitcher.vue"

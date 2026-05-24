@@ -12,8 +12,6 @@ import socket
 import sys
 from urllib.parse import quote, urlparse
 
-import segno
-
 from kohakuterrarium.api.auth.config import load_auth_config
 
 
@@ -44,6 +42,16 @@ def show_host_qr(url: str, yes: bool) -> int:
     if not cfg.host_token:
         print(
             "(host_token is not set; run ``kt admin set-host-token`` first)",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        import segno
+    except ImportError:
+        print(
+            "segno is required for `kt admin show-host-qr`; "
+            "install it with `pip install segno`.",
             file=sys.stderr,
         )
         return 1

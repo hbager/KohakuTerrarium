@@ -74,22 +74,30 @@ function sessionPayload(id, name, creatures = [{ name, running: true }]) {
 
 function mockActiveSessions(sessions) {
   sessionAPI.listActive.mockResolvedValue(sessions)
+  sessionAPI.getActive.mockImplementation(async (id) => sessions.find((s) => s.session_id === id) ?? null)
 }
 
 describe("MacroShell — tab registration", () => {
-  it("registers heavy tab kinds as async components so initial workspace load stays light", () => {
+  it("registers all built-in tab kinds centrally", () => {
     registerBuiltinTabKinds()
 
     for (const kind of [
+      "dashboard",
+      "attach",
+      "inspector",
       "session-viewer",
       "saved-sessions",
+      "stats",
       "studio-editor",
       "catalog",
+      "extensions",
       "settings",
+      "code-editor",
+      "graph-editor",
     ]) {
       const entry = tabKinds.get(kind)
-      expect(entry).toBeTruthy()
-      expect(entry.component?.__asyncLoader).toBeTypeOf("function")
+      expect(entry, `${kind} should be registered`).toBeTruthy()
+      expect(entry.component, `${kind} should have a component`).toBeTruthy()
     }
   })
   it("keeps registered tab components raw so Vue does not proxy component definitions", () => {

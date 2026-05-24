@@ -53,6 +53,7 @@
 
 <script setup>
 import { computed, ref } from "vue"
+import { useRoute } from "vue-router"
 
 import InstanceSettingsModal from "@/components/chrome/InstanceSettingsModal.vue"
 import { useInstanceContext } from "@/components/chrome/instanceContext"
