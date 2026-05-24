@@ -63,6 +63,163 @@ describe("chat store — interrupted task handling", () => {
     expect(pendingJobs).toEqual({})
   })
 
+  it("background subagent without subagent_result rebuilds as running, not interrupted", () => {
+    // Background sub-agents finish AFTER the controller turn that spawned
+    // them — the event stream is allowed to end with subagent_call but no
+    // subagent_result yet.  A rebuild during that window must keep the
+    // accordion at "running" (the live ``runningJobs`` map is the source
+    // of truth for "actually interrupted") rather than fall through to
+    // the "done with no result" interrupted sweep.
+    const chat = useChatStore()
+    chat.messagesByTab = { main: [] }
+
+    const messages = []
+    const events = [
+      { type: "processing_start" },
+      { type: "subagent_call", name: "explore", job_id: "agent_explore_1", task: "find auth" },
+      { type: "processing_end" },
+    ]
+
+    const { messages: replayed, pendingJobs } = _replayEvents(messages, events)
+
+    const tool = replayed[0].parts[0]
+    expect(tool.kind).toBe("subagent")
+    expect(tool.status).toBe("running")
+    expect(pendingJobs.agent_explore_1).toBeTruthy()
+  })
+
+  it("background subagent without job_id still rebuilds as running, not interrupted", () => {
+    // The same scenario but with a legacy / buggy backend that emitted
+    // ``subagent_call`` without a ``job_id`` field. Pre-fix this fell
+    // through to the "interrupted" sweep because addTool defaulted to
+    // status="done"; now it stays "running" because addTool defaults
+    // sub-agents to "running" regardless of jobId.
+    const chat = useChatStore()
+    chat.messagesByTab = { main: [] }
+
+    const messages = []
+    const events = [
+      { type: "processing_start" },
+      { type: "subagent_call", name: "explore", task: "find auth" },
+      { type: "processing_end" },
+    ]
+
+    const { messages: replayed } = _replayEvents(messages, events)
+
+    const tool = replayed[0].parts[0]
+    expect(tool.kind).toBe("subagent")
+    expect(tool.status).toBe("running")
+  })
+
+  it("replay marks completed sub-agent as 'done' (not stuck at 'running')", () => {
+    // Bug 2 regression: ``addTool`` defaults sub-agents to "running"
+    // (chat.js:359). The replay-path ``updateTool`` previously only
+    // had branches for interrupted / error and no explicit "set to
+    // done" path, so a successful ``subagent_result`` left the part
+    // stuck at "running" after any history reload / tab switch.
+    const events = [
+      { type: "processing_start" },
+      { type: "subagent_call", name: "explore", job_id: "agent_explore_2", task: "scan" },
+      {
+        type: "subagent_result",
+        name: "explore",
+        job_id: "agent_explore_2",
+        output: "Found 3 matches.",
+        turns: 3,
+        duration: 4.2,
+      },
+      { type: "processing_end" },
+    ]
+    const { messages: replayed, pendingJobs } = _replayEvents([], events)
+    const tool = replayed[0].parts[0]
+    expect(tool.kind).toBe("subagent")
+    expect(tool.status).toBe("done")
+    expect(tool.result).toBe("Found 3 matches.")
+    expect(pendingJobs).toEqual({})
+  })
+
+  it("live + replay convergence: subagent_done replay does not clobber 'done' to 'running'", () => {
+    // Bug 2 regression — second symptom: take the live store all the
+    // way through start + done (so the part is "done"), then drive
+    // the same events through _replayEvents and assert the result
+    // matches. The previous bug made the replay rebuild the part as
+    // "running" because updateTool had no done branch.
+    const events = [
+      { type: "processing_start" },
+      { type: "subagent_call", name: "explore", job_id: "agent_explore_3", task: "scan" },
+      {
+        type: "subagent_result",
+        name: "explore",
+        job_id: "agent_explore_3",
+        output: "ok",
+      },
+      { type: "processing_end" },
+    ]
+    const { messages: replayed } = _replayEvents([], events)
+    const tool = replayed[0].parts[0]
+    expect(tool.status).toBe("done")
+  })
+
+  it("replay does NOT mark a still-live sub-agent as 'interrupted' (stale terminal guard)", () => {
+    // Bug 1 regression: a background sub-agent is actively running
+    // (its job_id is in the live ``runningJobs`` map). A history
+    // reload finds a stale ``subagent_result{interrupted:true}``
+    // event in the persisted log (e.g. from a previous run with the
+    // same name, or a race during a reconnect). Without the guard,
+    // ``updateTool`` would flip the live-running part's status to
+    // "interrupted" even though the live truth says it's still
+    // running and its accordion is still streaming.
+    const events = [
+      { type: "processing_start" },
+      {
+        type: "subagent_call",
+        name: "researcher",
+        job_id: "agent_researcher_5",
+        task: "deep dive",
+      },
+      {
+        type: "subagent_result",
+        name: "researcher",
+        job_id: "agent_researcher_5",
+        output: "User manually interrupted this job.",
+        error: "User manually interrupted this job.",
+        interrupted: true,
+        final_state: "interrupted",
+      },
+    ]
+    // Live truth: the job is still active.
+    const liveRunning = new Set(["agent_researcher_5"])
+    const { messages: replayed, pendingJobs } = _replayEvents([], events, null, liveRunning)
+    const tool = replayed[0].parts[0]
+    // Guard MUST preserve "running" — replay's interrupted flip is
+    // suppressed because the live WS still tracks this job.
+    expect(tool.status).toBe("running")
+    // Pending-job tracking must NOT mark the job as completed, so
+    // _restoreRunningState keeps it on the radar.
+    expect(pendingJobs).toHaveProperty("agent_researcher_5")
+  })
+
+  it("replay still applies 'done' to a sub-agent the live truth no longer tracks", () => {
+    // Counterpart to the stale-interrupt guard: when the job is NOT
+    // in ``liveRunning`` (i.e. the live WS already saw subagent_done
+    // and deleted runningJobs[J]), the replay must STILL set the
+    // status to "done" — otherwise Bug 2 would resurface.
+    const events = [
+      { type: "processing_start" },
+      { type: "subagent_call", name: "explore", job_id: "agent_explore_6", task: "scan" },
+      {
+        type: "subagent_result",
+        name: "explore",
+        job_id: "agent_explore_6",
+        output: "found it",
+      },
+      { type: "processing_end" },
+    ]
+    const liveRunning = new Set() // empty — live truth says nothing is running
+    const { messages: replayed } = _replayEvents([], events, null, liveRunning)
+    expect(replayed[0].parts[0].status).toBe("done")
+  })
+
   it("live tool_error with interrupted metadata clears running job as interrupted", () => {
     const chat = useChatStore()
     chat.messagesByTab = { main: [{ id: "m1", role: "assistant", parts: [] }] }

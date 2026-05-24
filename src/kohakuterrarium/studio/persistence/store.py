@@ -24,6 +24,7 @@ from kohakuterrarium.studio.persistence.viewer.paths import (
     pick_canonical_per_session,
     resolve_session_path,
 )
+from kohakuterrarium.utils.config_dir import config_dir
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -43,9 +44,33 @@ _index_rebuild_lock = threading.RLock()
 
 
 def _session_dir() -> Path:
-    """Return the live ``_SESSION_DIR`` (read fresh each call so tests
-    that monkey-patch the module-level value continue to work)."""
-    return _SESSION_DIR
+    """Return the live session directory.
+
+    Honours the ``KT_SESSION_DIR`` environment variable — the same
+    documented override that ``studio.sessions.lifecycle._session_dir``
+    and ``api.deps._session_dir`` already use to decide *where sessions
+    are written*. Without this, the persistence namespace (resume /
+    saved-list / history / viewer) looked in a different directory than
+    the sessions namespace saved to, so a non-default ``KT_SESSION_DIR``
+    made every saved session invisible to resume.
+
+    Falls back to the module-global ``_SESSION_DIR`` (which the route
+    layer still monkey-patches directly in some tests) when the env var
+    is unset. Read fresh each call so both override mechanisms work.
+    """
+    env = os.environ.get("KT_SESSION_DIR")
+    if env:
+        return Path(env)
+    # Legacy seam: tests still monkey-patch ``_SESSION_DIR`` directly.
+    # If the live value differs from the documented hard-coded default,
+    # respect the override.  Otherwise fall through to
+    # ``config_dir() / "sessions"`` so a test setting only
+    # ``KT_CONFIG_DIR`` (the conftest autouse fixture) doesn't leak
+    # into the operator's real ``~/.kohakuterrarium/sessions``.
+    _docs_default = Path.home() / ".kohakuterrarium" / "sessions"
+    if _SESSION_DIR != _docs_default:
+        return _SESSION_DIR
+    return config_dir() / "sessions"
 
 
 def _max_mtime(path: Path) -> float:
@@ -147,6 +172,28 @@ def _read_session_entry(path: Path) -> dict:
 
             lineage = meta.get("lineage") or {}
             forked_children = meta.get("forked_children") or []
+            # Cheap probe for "does this session have a vector index?".
+            # Reading the ``vec_dimensions`` state key the index builder
+            # writes is enough to answer the boolean. We DELIBERATELY
+            # avoid opening a fresh ``SessionMemory`` here even though
+            # it'd be more authoritative — the listing scans every
+            # saved session with up to 32 worker threads, and each
+            # SessionMemory open holds 3 native SQLite handles whose
+            # release timing is touchy on Windows (see the
+            # ``SessionMemory.close()`` docstring). A bare state read
+            # uses the already-open SessionStore's handle and never
+            # opens a new one.
+            has_vector_index = False
+            try:
+                saved_dims = store.state.get("vec_dimensions")
+                if isinstance(saved_dims, int) and saved_dims > 0:
+                    has_vector_index = True
+            except (KeyError, Exception) as e:
+                logger.debug(
+                    "Failed to probe vector index",
+                    error=str(e),
+                    path=str(path),
+                )
             return {
                 # Canonical name strips the version suffix so v1+v2 of
                 # the same session show as one entry — and the name
@@ -163,6 +210,14 @@ def _read_session_entry(path: Path) -> dict:
                 "preview": preview,
                 "pwd": meta.get("pwd", ""),
                 "format_version": meta.get("format_version", 1),
+                "has_vector_index": has_vector_index,
+                # Per-saved ``node_id`` (added 2026-05-13): the
+                # ``SessionMirrorWriter`` stamps this on the first
+                # mirrored event arrival so the saved-session listing
+                # can colour / badge entries by originating worker.
+                # Absent (``""``) entries are host-local; the frontend
+                # treats absent and ``"_host"`` identically.
+                "node_id": meta.get("on_node", ""),
                 # Wave E lineage for the fork tree in the lister.
                 "parent_session_id": (
                     (lineage.get("fork") or {}).get("parent_session_id")

@@ -1,13 +1,15 @@
 <template>
   <div class="relative h-full shrink-0" :style="{ width: width + 'px' }">
     <nav class="h-full flex flex-col border-r border-warm-200 dark:border-warm-700 bg-warm-200/50 dark:bg-warm-800/40 overflow-hidden">
-      <!-- Brand + command palette trigger -->
-      <div class="flex items-center gap-2 px-3 py-3">
+      <!-- Brand + cluster pill + command palette trigger -->
+      <div class="relative flex items-center gap-2 px-3 py-3">
         <BrandMark class="w-7 h-7 rounded-full shrink-0" />
         <span class="text-sm flex-1 truncate">
           <span class="font-bold text-amber">Kohaku</span>
           <span class="font-light text-iolite-light dark:text-iolite-light">Terrarium</span>
         </span>
+        <SitePill data-test="cluster-pill" @click.stop="togglePopover" />
+        <SitePopover :open="popoverOpen" @close="popoverOpen = false" />
         <button class="i-carbon-search w-4 h-4 text-warm-400 hover:text-warm-700" :title="t('shell.rail.commandPalette')" @click="openPalette" />
       </div>
       <div class="mx-2 border-t border-warm-200 dark:border-warm-700" />
@@ -34,6 +36,11 @@
 
       <!-- Footer -->
       <div class="mx-2 border-t border-warm-200 dark:border-warm-700" />
+      <div class="flex items-center justify-between gap-2 px-3 py-1.5">
+        <!-- Host-picker chip — clickable indicator of which backend
+             we're talking to, opens the modal to add / switch hosts. -->
+        <HostStatusChip :show-label="true" @open="openHostPicker" />
+      </div>
       <div class="flex items-center justify-between gap-2 px-3 py-2">
         <button class="w-5 h-5 flex items-center justify-center text-warm-400 hover:text-warm-700" :class="theme.dark ? 'i-carbon-sun' : 'i-carbon-moon'" :title="theme.dark ? t('shell.rail.themeToLight') : t('shell.rail.themeToDark')" @click="theme.toggle()" />
         <button class="text-[10px] uppercase tracking-wider text-warm-400 hover:text-warm-700" :title="t('shell.rail.cycleLocale')" @click="cycleLocale">
@@ -48,11 +55,16 @@
 </template>
 
 <script setup>
+import { ref } from "vue"
+
+import HostStatusChip from "@/components/host-picker/HostStatusChip.vue"
 import BrandMark from "@/components/shell/BrandMark.vue"
 import RailGroupTop from "@/components/shell/RailGroupTop.vue"
 import RailGroupAttached from "@/components/shell/RailGroupAttached.vue"
 import RailGroupQuick from "@/components/shell/RailGroupQuick.vue"
 import RailGroupPinned from "@/components/shell/RailGroupPinned.vue"
+import SitePill from "@/components/cluster/SitePill.vue"
+import SitePopover from "@/components/cluster/SitePopover.vue"
 import { useRailWidth } from "@/composables/useRailWidth"
 import { useThemeStore } from "@/stores/theme"
 import { useLocaleStore } from "@/stores/locale"
@@ -64,11 +76,22 @@ const locale = useLocaleStore()
 const palette = usePaletteStore()
 const { t } = useI18n()
 const { width, dragging, startDrag, resetWidth } = useRailWidth()
+const popoverOpen = ref(false)
+
+function togglePopover() {
+  popoverOpen.value = !popoverOpen.value
+}
 
 function openPalette() {
   // Palette store exposes openPalette / closePalette / toggle.
   if (typeof palette.openPalette === "function") palette.openPalette()
   else if (typeof palette.toggle === "function") palette.toggle()
+}
+
+function openHostPicker() {
+  if (typeof window !== "undefined") {
+    window.dispatchEvent(new Event("kt-open-host-picker"))
+  }
 }
 
 function cycleLocale() {

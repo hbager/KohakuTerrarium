@@ -3,12 +3,22 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Channel to publish (override)"
+        required: false
+        default: "stable"
+        type: choice
+        options: [stable, beta, nightly]
 
 permissions:
   contents: write
   id-token: write
+  packages: write
 
 jobs:
+  # ── Wheel + sdist (PyPI source-of-truth, unchanged) ────────────────
   build-wheel:
     runs-on: ubuntu-latest
     steps:
@@ -22,7 +32,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Build frontend
         working-directory: src/kohakuterrarium-frontend
@@ -48,22 +58,42 @@ jobs:
           pip install --upgrade pip
           pip install dist/*.whl
           kt --help
-          kt app --help
 
       - uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
 
-  build-desktop:
+  # ── Per-(platform, py_abi) release-tree tarballs ───────────────────
+  # 06b/Phase H: each cell runs scripts/build_release_tree.py, producing
+  # one ``kohakuterrarium-<v>-<plat>-py<X.Y>.tar.zst`` + sidecar manifest.
+  # The launcher's downloader consumes these directly.
+  #
+  # cp313 only: briefcase bundles cp313 on Win/macOS, so the launcher
+  # only ever fetches cp313 trees. Earlier cp311/cp312 cells were built
+  # for hypothetical "user runs the launcher on their own Python"
+  # consumers; pip-installed users update via PyPI and docker users
+  # update via ``docker pull`` — neither uses launcher tarballs.
+  # The Linux cell is kept for advanced users running the launcher on
+  # their own Linux Python.
+  build-release-tree:
+    needs: [build-wheel]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            platform: windows
+          - os: ubuntu-latest
+            py: "3.13"
+            abi: cp313
+            plat: linux-x64
           - os: macos-latest
-            platform: macOS
+            py: "3.13"
+            abi: cp313
+            plat: macos-arm64
+          - os: windows-latest
+            py: "3.13"
+            abi: cp313
+            plat: win-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -72,11 +102,11 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          python-version: ${{ matrix.py }}
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Build frontend
         working-directory: src/kohakuterrarium-frontend
@@ -84,10 +114,191 @@ jobs:
           npm ci
           npm run build
 
-      - name: Verify frontend build output
+      - name: Install build deps
         shell: bash
         run: |
-          test -f src/kohakuterrarium/web_dist/index.html
+          python -m pip install --upgrade pip
+          pip install zstandard
+
+      - name: Resolve version from tag (or workflow_dispatch)
+        id: ver
+        shell: bash
+        run: |
+          if [ -n "${GITHUB_REF_NAME#v}" ] && [[ "${GITHUB_REF_NAME}" == v* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            # Workflow_dispatch path: derive a dev/nightly version.
+            ts=$(date -u +%Y%m%d%H%M%S)
+            echo "version=0.0.0-dev${ts}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve channel
+        id: ch
+        shell: bash
+        run: |
+          channel="${{ inputs.channel }}"
+          if [ -z "${channel}" ]; then
+            case "${GITHUB_REF_NAME}" in
+              *b*|*rc*) channel="beta" ;;
+              *) channel="stable" ;;
+            esac
+          fi
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release tree
+        shell: bash
+        run: |
+          python scripts/build_release_tree.py \
+            --version "${{ steps.ver.outputs.version }}" \
+            --platform "${{ matrix.plat }}" \
+            --py-abi "${{ matrix.abi }}" \
+            --channel "${{ steps.ch.outputs.channel }}" \
+            --out dist/release-trees/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-tree-${{ matrix.plat }}-${{ matrix.abi }}
+          path: dist/release-trees/
+
+  # ── Aggregate sidecars into channel manifests ─────────────────────
+  publish-channel-manifests:
+    needs: [build-release-tree]
+    runs-on: ubuntu-latest
+    outputs:
+      channel: ${{ steps.ch.outputs.channel }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # Filter to ONLY the release-tree artifacts — the dist wheel job
+      # and docker job upload their own artifacts to the same run, and
+      # downloading 16MB of wheels + 100KB of dockerbuild metadata is
+      # both wasted bandwidth and a reliability hit when the run holds
+      # many artifacts in flight.
+      - uses: actions/download-artifact@v4
+        with:
+          path: tarballs
+          pattern: release-tree-*
+          merge-multiple: true
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          mkdir -p release-trees
+          find tarballs -type f \( -name "*.tar.zst" -o -name "*.manifest.json" \) -exec cp {} release-trees/ \;
+          ls -la release-trees/
+
+      - name: Resolve channel
+        id: ch
+        shell: bash
+        run: |
+          channel="${{ inputs.channel }}"
+          if [ -z "${channel}" ]; then
+            case "${GITHUB_REF_NAME}" in
+              *b*|*rc*) channel="beta" ;;
+              *) channel="stable" ;;
+            esac
+          fi
+          echo "channel=${channel}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch previous channel manifest (if any)
+        shell: bash
+        run: |
+          channel="${{ steps.ch.outputs.channel }}"
+          url="https://github.com/${GITHUB_REPOSITORY}/releases/download/manifests-${channel}/${channel}.json"
+          curl -fsSL "${url}" -o "previous-${channel}.json" || echo "no previous manifest"
+
+      - name: Build channel manifest
+        shell: bash
+        run: |
+          channel="${{ steps.ch.outputs.channel }}"
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "${GITHUB_REF_NAME}" != v* ]]; then
+            version="0.0.0-dev"
+          fi
+          python scripts/publish_manifest.py \
+            --channel "${channel}" \
+            --release-url-prefix "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${version}" \
+            --artifacts-dir release-trees/ \
+            --previous-manifest "previous-${channel}.json" \
+            --release-notes-url "https://github.com/${GITHUB_REPOSITORY}/releases/tag/v${version}" \
+            --out "${channel}.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: channel-manifest
+          path: ${{ steps.ch.outputs.channel }}.json
+
+      - name: Publish manifest to manifests-<channel> release
+        # Overwrites the asset on the fixed-tag release so the launcher's
+        # canonical URL stays stable.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          channel="${{ steps.ch.outputs.channel }}"
+          tag="manifests-${channel}"
+          if ! gh release view "${tag}" -R "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release create "${tag}" \
+              --title "Channel manifest: ${channel}" \
+              --notes "Auto-updated channel manifest for ${channel}. Do not delete." \
+              --prerelease \
+              -R "${GITHUB_REPOSITORY}"
+          fi
+          gh release upload "${tag}" "${channel}.json" \
+            --clobber \
+            -R "${GITHUB_REPOSITORY}"
+
+  # ── Briefcase desktop shell (slim — bundles ONE release-tree as fallback) ─
+  build-desktop:
+    needs: [build-release-tree]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            plat_tag: win-x64
+            abi: cp313
+            py: "3.13"
+          - os: macos-latest
+            platform: macOS
+            plat_tag: macos-arm64
+            abi: cp313
+            py: "3.13"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.py }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Build frontend
+        working-directory: src/kohakuterrarium-frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-tree-${{ matrix.plat_tag }}-${{ matrix.abi }}
+          path: bundled-release/
+
+      - name: Verify bundled-release has the right tarball
+        shell: bash
+        run: |
+          ls -la bundled-release/
+          test -n "$(find bundled-release -maxdepth 1 -name 'kohakuterrarium-*.tar.*' | head -n 1)"
 
       - name: Install briefcase
         run: pip install briefcase
@@ -117,12 +328,9 @@ jobs:
         shell: bash
         run: |
           mkdir -p artifacts
-          # Windows: .msi in dist/
-          # macOS: .dmg in dist/
           cp dist/*.msi artifacts/ 2>/dev/null || true
           cp dist/*.dmg artifacts/ 2>/dev/null || true
           cp dist/*.zip artifacts/ 2>/dev/null || true
-          # Fallback: grab anything briefcase produced
           find dist/ -maxdepth 1 -type f \( -name "*.msi" -o -name "*.dmg" -o -name "*.zip" -o -name "*.exe" -o -name "*.app" \) -exec cp {} artifacts/ \; 2>/dev/null || true
           ls -la artifacts/
           test -n "$(find artifacts -maxdepth 1 -type f | head -n 1)"
@@ -132,6 +340,84 @@ jobs:
           name: desktop-${{ matrix.platform }}
           path: artifacts/
 
+  # ── Docker images (unchanged) ──────────────────────────────────────
+  build-docker:
+    needs: [build-wheel]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - target: all
+            dockerfile: docker/Dockerfile.all
+            suffix: ""
+          - target: host
+            dockerfile: docker/Dockerfile.host
+            suffix: "-host"
+          - target: client
+            dockerfile: docker/Dockerfile.client
+            suffix: "-client"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Compute image tags
+        id: tags
+        shell: bash
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/kohakuterrarium${{ matrix.image.suffix }}"
+          version="${GITHUB_REF_NAME#v}"
+          {
+            echo "repo=${repo}"
+            echo "version=${version}"
+            echo "tag_version=${repo}:${version}"
+            echo "tag_latest=${repo}:latest"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (multi-arch)
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.image.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.tags.outputs.tag_version }}
+            ${{ steps.tags.outputs.tag_latest }}
+          build-args: |
+            WHEEL_GLOB=dist/kohakuterrarium-*.whl
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless via OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          cosign sign --yes "${{ steps.tags.outputs.repo }}@${DIGEST}"
+
+  # ── PyPI publish (unchanged) ───────────────────────────────────────
   publish-pypi:
     needs: [build-wheel]
     runs-on: ubuntu-latest
@@ -143,18 +429,36 @@ jobs:
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
 
+  # ── GitHub Release (release-tree tarballs + briefcase artifacts) ──
   github-release:
-    needs: [build-wheel, build-desktop]
+    needs: [build-wheel, build-release-tree, build-desktop, publish-channel-manifests]
     runs-on: ubuntu-latest
     steps:
+      # Pull only artifacts we actually publish to the release.  The
+      # ``Kohaku-Lab~*~*.dockerbuild`` blobs from the docker job are
+      # heavy provenance metadata we don't need here.
       - uses: actions/download-artifact@v4
         with:
           path: all-artifacts
+          pattern: dist
+      - uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+          pattern: release-tree-*
+      - uses: actions/download-artifact@v4
+        with:
+          path: all-artifacts
+          pattern: desktop-*
 
-      - name: Collect all files
+      - name: Collect release assets
         run: |
           mkdir release
-          find all-artifacts -type f -exec cp {} release/ \;
+          # Wheels + sdists
+          find all-artifacts/dist -type f -exec cp {} release/ \;
+          # Release-tree tarballs + sidecars
+          find all-artifacts/release-tree-* -type f -exec cp {} release/ \;
+          # Briefcase desktop bundles
+          find all-artifacts/desktop-* -type f -exec cp {} release/ \;
           ls -la release/
 
       - uses: softprops/action-gh-release@v2
@@ -162,4 +466,12 @@ jobs:
           files: release/*
           generate_release_notes: true
           draft: false
-          prerelease: ${{ contains(github.ref, 'b') || contains(github.ref, 'rc') }}
+          # PEP 440 pre-release identifiers: alpha (``a``), beta (``b``),
+          # release-candidate (``rc``), and dev (``dev``).  The old check
+          # only looked at ``b`` / ``rc``, so ``v2.0.0.dev6`` was published
+          # as a *stable* release and showed up as "Latest" on the repo's
+          # release page.  Reading ``github.ref_name`` (the bare tag,
+          # e.g. ``v2.0.0.dev6``) keeps the ``contains`` matches scoped
+          # to user-supplied tag text instead of the literal
+          # ``refs/tags/`` prefix.
+          prerelease: ${{ contains(github.ref_name, 'dev') || contains(github.ref_name, 'rc') || contains(github.ref_name, 'a') || contains(github.ref_name, 'b') }}

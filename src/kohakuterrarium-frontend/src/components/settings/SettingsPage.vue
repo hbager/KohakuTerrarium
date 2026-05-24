@@ -10,6 +10,11 @@
         <div class="settings-pane flex flex-col gap-3 max-w-2xl">
           <p class="text-xs text-warm-400 mb-1">{{ t("settings.providers.description") }}</p>
           <p class="text-xs text-warm-400 mb-2">{{ t("settings.keys.storageHint") }}</p>
+          <!-- Multi-node target picker. Hidden in standalone mode by SitePicker itself. -->
+          <div class="flex items-center gap-2">
+            <SitePicker v-model="providerNode" :label="t('settings.providers.targetNode')" />
+            <span v-if="providerNode && providerNode !== '_host'" class="text-[11px] text-amber-shadow dark:text-amber-light">{{ t("settings.providers.targetNodeHint") }}</span>
+          </div>
 
           <!-- Built-in provider list (auth managed inline) -->
           <div class="card p-4">
@@ -47,6 +52,13 @@
                     <el-button v-else size="small" @click="startEditKey(backend.name)">
                       {{ backend.has_key ? t("settings.keys.change") : t("settings.keys.setKey") }}
                     </el-button>
+                    <el-popconfirm v-if="editingKey !== backend.name && backend.has_key" :title="t('settings.keys.deleteConfirm', { provider: backend.name })" :confirm-button-text="t('common.delete')" :cancel-button-text="t('common.cancel')" @confirm="deleteKey(backend.name)">
+                      <template #reference>
+                        <el-button size="small" type="danger" plain :title="t('settings.keys.delete')">
+                          <span class="i-carbon-trash-can" />
+                        </el-button>
+                      </template>
+                    </el-popconfirm>
                   </template>
                   <template v-else>
                     <el-button size="small" type="primary" :loading="codexLoggingIn" @click="runCodexLogin">
@@ -106,6 +118,13 @@
                     <el-button v-else size="small" @click="startEditKey(backend.name)">
                       {{ backend.has_key ? t("settings.keys.change") : t("settings.keys.setKey") }}
                     </el-button>
+                    <el-popconfirm v-if="editingKey !== backend.name && backend.has_key" :title="t('settings.keys.deleteConfirm', { provider: backend.name })" :confirm-button-text="t('common.delete')" :cancel-button-text="t('common.cancel')" @confirm="deleteKey(backend.name)">
+                      <template #reference>
+                        <el-button size="small" type="danger" plain :title="t('settings.keys.delete')">
+                          <span class="i-carbon-trash-can" />
+                        </el-button>
+                      </template>
+                    </el-popconfirm>
                   </template>
                   <template v-else>
                     <el-button size="small" type="primary" :loading="codexLoggingIn" @click="runCodexLogin">
@@ -177,7 +196,7 @@
               <span class="i-carbon-arrow-left" />
               <span>{{ t("settings.models.backToList") }}</span>
             </button>
-            <PresetEditor v-if="showEditor" :preset="editorPreset" :backends="backends" :mode="editorMode" @save="handleSavePreset" @cancel="cancelEdit" @clone="clonePreset" @delete="confirmDeletePreset" />
+            <PresetEditor v-if="showEditor" :preset="editorPreset" :backends="backends" :mode="editorMode" @save="handleSavePreset" @cancel="cancelEdit" @clone="clonePreset" @delete="confirmDeletePreset" @set-default="handleSetDefault" />
             <div v-else class="model-editor-empty">
               <p class="text-sm">Select a preset on the left, or click "+ New" to create one.</p>
               <p class="text-[11px] mt-2">
@@ -199,6 +218,10 @@
               <span class="font-medium text-warm-700 dark:text-warm-300">{{ server.name }}</span>
               <span class="text-[10px] px-1.5 py-0.5 rounded bg-sapphire/15 text-sapphire dark:text-sapphire-light font-mono">{{ server.transport }}</span>
               <div class="flex-1" />
+              <el-button size="small" plain @click="openMCPEdit(server)">
+                <span class="i-carbon-edit mr-1" />
+                {{ t("common.edit") }}
+              </el-button>
               <el-popconfirm :title="t('settings.mcp.deleteConfirm')" @confirm="removeMCPServer(server.name)">
                 <template #reference>
                   <el-button size="small" type="danger" plain>{{ t("common.remove") }}</el-button>
@@ -323,6 +346,28 @@
         </div>
       </el-tab-pane>
 
+      <!-- ════════════════════════ Sites (lab cluster) ════════════════════════ -->
+      <el-tab-pane v-if="cluster.isCluster" :label="t('cluster.settings.title')" name="sites">
+        <SitesPane />
+      </el-tab-pane>
+
+      <!-- ════════════════════════ Updates ════════════════════════ -->
+      <el-tab-pane label="Updates" name="updates">
+        <div class="settings-pane max-w-2xl">
+          <UpdatesPanel />
+        </div>
+      </el-tab-pane>
+
+      <!-- ════════════════════════ Advanced ════════════════════════ -->
+      <el-tab-pane :label="t('settings.tabs.advanced')" name="advanced">
+        <AdvancedPanel />
+      </el-tab-pane>
+
+      <!-- ════════════════════════ About ════════════════════════ -->
+      <el-tab-pane :label="t('settings.tabs.about')" name="about">
+        <AboutPanel />
+      </el-tab-pane>
+
       <!-- ════════════════════════ Preferences ════════════════════════ -->
       <el-tab-pane :label="t('settings.tabs.prefs')" name="prefs">
         <div class="settings-pane flex flex-col gap-4 max-w-xl">
@@ -369,6 +414,8 @@
         </div>
       </el-tab-pane>
     </el-tabs>
+    <MCPServerEditModal v-model="mcpEditOpen" :server="mcpEditTarget" @saved="onMCPEditSaved" />
+    <CodexLoginModal :open="codexModalOpen" :node="codexModalNode" @close="codexModalOpen = false" @done="onCodexLoginDone" />
   </div>
 </template>
 
@@ -376,14 +423,24 @@
 import { computed, reactive, ref, onMounted, watch } from "vue"
 import { ElMessage, ElMessageBox } from "element-plus"
 
+import AboutPanel from "@/components/settings/AboutPanel.vue"
+import AdvancedPanel from "@/components/settings/AdvancedPanel.vue"
 import BackendForm from "@/components/settings/BackendForm.vue"
+import CodexLoginModal from "@/components/settings/CodexLoginModal.vue"
+import MCPServerEditModal from "@/components/settings/modals/MCPServerEditModal.vue"
 import PresetEditor from "@/components/settings/PresetEditor.vue"
+import SitesPane from "@/components/settings/SitesPane.vue"
+import UpdatesPanel from "@/components/settings/UpdatesPanel.vue"
+import SitePicker from "@/components/cluster/SitePicker.vue"
 import { useDensity } from "@/composables/useDensity"
+import { useClusterStore } from "@/stores/cluster"
 import { LOCALE_DISPLAY_NAMES, SUPPORTED_LOCALES, useLocaleStore } from "@/stores/locale"
 import { DEFAULT_DESKTOP_ZOOM, DEFAULT_MOBILE_ZOOM, MAX_UI_ZOOM, MIN_UI_ZOOM, useThemeStore } from "@/stores/theme"
 import { useI18n } from "@/utils/i18n"
 import { fireModelCatalogChanged } from "@/utils/layoutEvents"
 import { configAPI, settingsAPI } from "@/utils/api"
+
+const cluster = useClusterStore()
 
 const theme = useThemeStore()
 const localeStore = useLocaleStore()
@@ -404,9 +461,16 @@ const providerKeys = ref([])
 const editingKey = ref("")
 const keyInput = ref("")
 
+// Multi-node: which node's identity store are we managing? "_host" by
+// default (today's behaviour). When the user picks a worker, every
+// key + Codex-OAuth op routes to THAT worker's local config so OAuth
+// tokens stay process-local and api_keys.yaml lives in the worker's
+// own ``--home-dir`` instead of the host's.
+const providerNode = ref("_host")
+
 async function loadKeys() {
   try {
-    const data = await settingsAPI.getKeys()
+    const data = await settingsAPI.getKeys(providerNode.value)
     providerKeys.value = data.providers || []
   } catch {
     providerKeys.value = []
@@ -421,7 +485,7 @@ function startEditKey(provider) {
 async function saveKey(provider) {
   if (!keyInput.value) return
   try {
-    await settingsAPI.saveKey(provider, keyInput.value)
+    await settingsAPI.saveKey(provider, keyInput.value, providerNode.value)
     ElMessage.success(t("settings.keys.saved", { provider }))
     editingKey.value = ""
     keyInput.value = ""
@@ -434,13 +498,44 @@ async function saveKey(provider) {
   }
 }
 
-const codexLoggingIn = ref(false)
-async function runCodexLogin() {
-  codexLoggingIn.value = true
-  ElMessage.info("Codex OAuth started — complete the flow in your browser (or visit the console URL).")
+async function deleteKey(provider) {
   try {
-    await settingsAPI.codexLogin()
-    ElMessage.success("Codex login successful")
+    await settingsAPI.removeKey(provider, providerNode.value)
+    ElMessage.success(t("settings.keys.deleted", { provider }))
+    await loadKeys()
+    await loadBackends()
+    await loadPresets()
+  } catch (err) {
+    ElMessage.error(err.response?.data?.detail || t("settings.keys.deleteFailed"))
+  }
+}
+
+const codexLoggingIn = ref(false)
+const codexModalOpen = ref(false)
+const codexModalNode = ref("_host")
+
+function runCodexLogin() {
+  // Worker-side login still uses the one-shot REST endpoint (the
+  // streaming variant only supports the host node in 1.5.0).  For
+  // host-side login we open the streaming modal so the user sees
+  // the manual URL + device code immediately — required for
+  // environments where ``webbrowser.open()`` silently fails
+  // (Android WebView, headless CI, SSH).
+  const target = providerNode.value
+  if (target && target !== "_host") {
+    void runCodexLoginRemote(target)
+    return
+  }
+  codexModalNode.value = "_host"
+  codexModalOpen.value = true
+}
+
+async function runCodexLoginRemote(node) {
+  codexLoggingIn.value = true
+  ElMessage.info(`Codex OAuth started on ${node} — complete the flow in the browser that opens on that worker.`)
+  try {
+    await settingsAPI.codexLogin(node)
+    ElMessage.success(`Codex login successful on ${node}`)
     await loadKeys()
     await loadBackends()
     await loadPresets()
@@ -451,6 +546,19 @@ async function runCodexLogin() {
     codexLoggingIn.value = false
   }
 }
+
+async function onCodexLoginDone() {
+  ElMessage.success("Codex login successful")
+  await loadKeys()
+  await loadBackends()
+}
+
+// Re-fetch keys whenever the user switches target node. Backends and
+// presets remain host-managed metadata; only the key + Codex-OAuth
+// state is per-node.
+watch(providerNode, () => {
+  loadKeys()
+})
 
 // ───────── Backends / providers ─────────
 
@@ -694,6 +802,20 @@ async function handleSavePreset(payload) {
   }
 }
 
+async function handleSetDefault(preset) {
+  if (!preset || !preset.name) return
+  try {
+    await settingsAPI.setDefaultModel(preset.name)
+    ElMessage.success(t("settings.models.defaultSet", { name: preset.name }))
+    await loadPresets()
+    // Refresh the editor's bound preset so the badge flips.
+    const refreshed = (presets.value || []).find((p) => p.name === preset.name && p.provider === preset.provider)
+    if (refreshed) editorPreset.value = refreshed
+  } catch (err) {
+    ElMessage.error(err.response?.data?.detail || t("settings.models.defaultSetFailed"))
+  }
+}
+
 async function confirmDeletePreset(name) {
   try {
     await ElMessageBox.confirm(t("settings.models.deleteConfirm"), {
@@ -732,6 +854,18 @@ const mcpForm = reactive({
   argsStr: "",
   url: "",
 })
+
+const mcpEditOpen = ref(false)
+const mcpEditTarget = ref(null)
+
+function openMCPEdit(server) {
+  mcpEditTarget.value = server
+  mcpEditOpen.value = true
+}
+
+function onMCPEditSaved() {
+  loadMCP()
+}
 
 async function loadMCP() {
   try {

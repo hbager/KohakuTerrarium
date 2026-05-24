@@ -19,7 +19,6 @@ import InspectorTrace from "@/components/shell/tabs/inspector/InspectorTrace.vue
 import InspectorLog from "@/components/shell/tabs/inspector/InspectorLog.vue"
 import Dashboard from "@/components/shell/tabs/Dashboard.vue"
 import StatsTab from "@/components/shell/tabs/StatsTab.vue"
-
 const AttachTab = defineAsyncComponent(() => import("@/components/shell/tabs/AttachTab.vue"))
 const SessionViewerTab = defineAsyncComponent(
   () => import("@/components/shell/tabs/SessionViewerTab.vue"),
@@ -31,6 +30,7 @@ const StudioEditorTab = defineAsyncComponent(
   () => import("@/components/shell/tabs/StudioEditorTab.vue"),
 )
 const CatalogTab = defineAsyncComponent(() => import("@/components/shell/tabs/CatalogTab.vue"))
+const ExtensionsTab = defineAsyncComponent(() => import("@/components/shell/tabs/ExtensionsTab.vue"))
 const SettingsTab = defineAsyncComponent(() => import("@/components/shell/tabs/SettingsTab.vue"))
 const CodeEditorTab = defineAsyncComponent(
   () => import("@/components/shell/tabs/CodeEditorTab.vue"),
@@ -89,6 +89,7 @@ export function registerBuiltinTabKinds() {
   // (1 → 2 → 3 columns) so no gating needed.
   registerTabKind({ kind: "studio-editor", component: StudioEditorTab, minDensity: "regular" })
   registerTabKind({ kind: "catalog", component: CatalogTab })
+  registerTabKind({ kind: "extensions", component: ExtensionsTab })
   registerTabKind({ kind: "settings", component: SettingsTab })
   registerTabKind({ kind: "code-editor", component: CodeEditorTab })
 }

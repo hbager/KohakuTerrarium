@@ -1,5 +1,17 @@
 [
   {
+    "file": "src/kohakuterrarium/launcher/android.py",
+    "line": 78,
+    "function": "_serve_and_report",
+    "reason": "Lazy import of api.app.create_app — the Android launcher loads via JNI before the framework's heavy api/serving graph needs to be in memory.  Lazy import means an import-time failure surfaces in the foreground-service log (visible via adb logcat) instead of silently killing the Python interpreter at module load."
+  },
+  {
+    "file": "src/kohakuterrarium/launcher/android.py",
+    "line": 79,
+    "function": "_serve_and_report",
+    "reason": "Lazy import of serving.web.start_uvicorn_with_port_fallback — paired with the create_app lazy import above; both share the same JNI-cold-start rationale."
+  },
+  {
     "file": "src/kohakuterrarium/__main__.py",
     "line": 33,
     "function": "main",
@@ -13,51 +25,57 @@
   },
   {
     "file": "src/kohakuterrarium/__briefcase__.py",
-    "line": 10,
+    "line": 81,
     "function": "main",
-    "reason": "briefcase bundle entry point — defers serving stack until app launch"
+    "reason": "briefcase bundle entry — MUST import cli post-sys.path-swap. The launcher first runs prepare() (briefcase-bundled), then evicts kohakuterrarium.* from sys.modules and prepends the active version tree to sys.path. Importing cli at module top would pin it to the briefcase-bundled framework (defeating the in-process version swap that makes self-update work on briefcase shells where _pth disables PYTHONPATH)."
   },
   {
     "file": "src/kohakuterrarium/cli/serve.py",
-    "line": 29,
+    "line": 34,
     "function": "_is_pid_alive",
     "reason": "Win32-only ctypes import inside `if sys.platform == 'win32'` branch"
   },
   {
     "file": "src/kohakuterrarium/cli/serve.py",
-    "line": 30,
+    "line": 35,
     "function": "_is_pid_alive",
     "reason": "Win32-only ctypes.wintypes import inside `if sys.platform == 'win32'` branch"
   },
   {
     "file": "src/kohakuterrarium/serving/web.py",
-    "line": 32,
+    "line": 34,
     "function": "_resolve_config_dirs",
     "reason": "package-discovery cold-path; avoids loading packages module on bare uvicorn boot"
   },
   {
     "file": "src/kohakuterrarium/serving/web.py",
-    "line": 33,
+    "line": 35,
     "function": "_resolve_config_dirs",
-    "reason": "package-discovery cold-path; sibling of line 32 — same justification"
+    "reason": "package-discovery cold-path; sibling of line 34 — same justification"
   },
   {
     "file": "src/kohakuterrarium/serving/web.py",
-    "line": 134,
+    "line": 126,
+    "function": "start_uvicorn_with_port_fallback",
+    "reason": "uvicorn deferred — heavy import (pulls fastapi-deps transitively); function is only called from desktop/web boot, not from the bare module load path"
+  },
+  {
+    "file": "src/kohakuterrarium/serving/web.py",
+    "line": 232,
+    "function": "run_web_server",
+    "reason": "uvicorn deferred — heavy import, function is on the boot path only"
+  },
+  {
+    "file": "src/kohakuterrarium/serving/web.py",
+    "line": 234,
     "function": "run_web_server",
     "reason": "FastAPI app factory: serving->api lazy boot avoids pulling all routes when only the helper is touched"
   },
   {
     "file": "src/kohakuterrarium/serving/web.py",
-    "line": 188,
-    "function": "run_desktop_app",
-    "reason": "subprocess used only when relaunching as desktop process"
-  },
-  {
-    "file": "src/kohakuterrarium/serving/web.py",
-    "line": 252,
+    "line": 393,
     "function": "_run_desktop_app_blocking",
-    "reason": "FastAPI app factory: same as line 134, desktop variant"
+    "reason": "FastAPI app factory: same as run_web_server, desktop variant"
   },
   {
     "file": "src/kohakuterrarium/api/studio/introspect.py",
@@ -187,13 +205,13 @@
   },
   {
     "file": "src/kohakuterrarium/serving/web.py",
-    "line": 132,
+    "line": 143,
     "function": "run_web_server",
     "reason": "uvicorn is heavy; imported only when serving HTTP for real"
   },
   {
     "file": "src/kohakuterrarium/serving/web.py",
-    "line": 250,
+    "line": 279,
     "function": "_run_desktop_app_blocking",
     "reason": "uvicorn import deferred to desktop-app launch path"
   },
@@ -228,6 +246,18 @@
     "reason": "prompt.aggregator imports from builtin_skills and prompt.__init__ loads aggregator eagerly; lazy import here breaks the cycle"
   },
   {
+    "file": "src/kohakuterrarium/terrarium/engine_rich_cli.py",
+    "line": 78,
+    "function": "_input_conflicts_with_terminal",
+    "reason": "TUIInput pulls in Textual (third-party heavy); imported lazily so minimal installs don't have to take the Textual dependency"
+  },
+  {
+    "file": "src/kohakuterrarium/launcher/downloader.py",
+    "line": 112,
+    "function": "_open_tarball",
+    "reason": "zstandard is an optional launcher-only dep (briefcase bundles it; framework wheel doesn't require it). Lazy import so .tar.gz fallback path still works without zstandard installed."
+  },
+  {
     "file": "src/kohakuterrarium/studio/attach/pty_router.py",
     "line": 56,
     "function": "pty_session",
@@ -238,5 +268,77 @@
     "line": 64,
     "function": "pty_session",
     "reason": "POSIX-only PTY backend imported on non-Windows platforms (uses fcntl/pty/termios)"
+  },
+  {
+    "file": "src/kohakuterrarium/bootstrap/llm.py",
+    "line": 126,
+    "function": "_create_from_profile",
+    "reason": "test-only fake_test backend; FakeLLMProvider imported lazily so production runtime never loads the testing package"
+  },
+  {
+    "file": "src/kohakuterrarium/bootstrap/llm.py",
+    "line": 179,
+    "function": "_create_from_profile",
+    "reason": "LiteLLM is an optional extra (`kohakuterrarium[litellm]`); LiteLLMProvider imported lazily on the litellm backend branch so a minimal install without that extra keeps `kt --help` and core imports working"
+  },
+  {
+    "file": "src/kohakuterrarium/cli/lab_client.py",
+    "line": 186,
+    "function": "_run_worker",
+    "reason": "test-only seam guarded by KT_TEST_LLM_SCRIPT env var; production runs never import the testing package"
+  },
+  {
+    "file": "src/kohakuterrarium/mcp/client.py",
+    "line": 200,
+    "function": "_connect_impl",
+    "reason": "mcp SDK is heavy/optional; loaded only when a server is actually connecting"
+  },
+  {
+    "file": "src/kohakuterrarium/mcp/client.py",
+    "line": 201,
+    "function": "_connect_impl",
+    "reason": "mcp.client.stdio is loaded on the stdio-transport path"
+  },
+  {
+    "file": "src/kohakuterrarium/testing/subprocess_seam.py",
+    "line": 78,
+    "function": "maybe_install_test_llm_seam",
+    "reason": "test-only monkeypatch installer — imports deferred so production callers don't pay the cost when KT_TEST_LLM_SCRIPT is unset"
+  },
+  {
+    "file": "src/kohakuterrarium/testing/subprocess_seam.py",
+    "line": 84,
+    "function": "maybe_install_test_llm_seam",
+    "reason": "test-only monkeypatch installer — imports deferred so production callers don't pay the cost when KT_TEST_LLM_SCRIPT is unset"
+  },
+  {
+    "file": "src/kohakuterrarium/testing/subprocess_seam.py",
+    "line": 90,
+    "function": "maybe_install_test_llm_seam",
+    "reason": "test-only monkeypatch installer — imports deferred so production callers don't pay the cost when KT_TEST_LLM_SCRIPT is unset"
+  },
+  {
+    "file": "src/kohakuterrarium/launcher/_lock.py",
+    "line": 68,
+    "function": "_acquire",
+    "reason": "Win32-only msvcrt import inside the `if sys.platform == 'win32'` branch of the cross-platform flock wrapper"
+  },
+  {
+    "file": "src/kohakuterrarium/launcher/_lock.py",
+    "line": 85,
+    "function": "_release",
+    "reason": "Win32-only msvcrt import inside the `if sys.platform == 'win32'` branch of the cross-platform flock wrapper"
+  },
+  {
+    "file": "src/kohakuterrarium/launcher/splash_window.py",
+    "line": 86,
+    "function": "_try_tk",
+    "reason": "tkinter is the optional fallback splash backend used only when pywebview is unavailable; deferred so headless / non-Tk environments aren't required to have it"
+  },
+  {
+    "file": "src/kohakuterrarium/launcher/splash_window.py",
+    "line": 87,
+    "function": "_try_tk",
+    "reason": "tkinter.ttk sibling — same fallback rationale"
   }
 ]

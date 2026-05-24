@@ -1,16 +1,76 @@
 /**
  * API client for KohakuTerrarium backend.
+ *
+ * The ``baseURL`` is resolved dynamically per request:
+ *
+ *   - **same-origin mode** (default, ``kt serve`` / web build): the
+ *     hosts store has no active host; we send relative ``/api/...``
+ *     so the request hits whatever served the page.
+ *   - **remote mode** (bundled-app build / user-added host): the
+ *     hosts store has an active host; we send absolute
+ *     ``http(s)://host:port/api/...`` plus ``Authorization: Bearer
+ *     <token>`` from the active host's stored token.
+ *
+ * Resolution happens in an axios request interceptor so the SAME
+ * ``api`` instance works for every consumer — no plumbing through
+ * route components.  Components that need to react to host changes
+ * subscribe to ``useHostsStore()`` directly.
+ *
+ * The hosts store is imported LAZILY inside the interceptor.  This
+ * avoids a circular import during module load (utils/api.js is
+ * imported very early; the store needs Pinia which needs the Vue
+ * app), and also keeps SSR / test bootstraps happy.
  */
 
 import axios from "axios"
+
+import { useHostsStore } from "@/stores/hosts"
+import { wsUrl } from "@/utils/wsUrl"
 
 function encodeTarget(target) {
   return encodeURIComponent(target)
 }
 
+// ``baseURL`` stays empty so the interceptor controls every URL.
 const api = axios.create({
-  baseURL: "/api",
+  baseURL: "",
   timeout: 30000,
+})
+
+api.interceptors.request.use((config) => {
+  // useHostsStore() is safe at request time because requests only
+  // fire after Vue + Pinia are mounted.  If pinia hasn't been
+  // initialised yet (some test harnesses) the call throws — we
+  // catch and fall through to same-origin mode.
+  let active = null
+  try {
+    active = useHostsStore().activeHost
+  } catch (_err) {
+    active = null
+  }
+  // For same-origin we want ``/api/<path>``; for remote we want
+  // ``<host>/api/<path>``.  Absolute URLs (rare — only the few
+  // helpers that build their own) pass through unchanged.
+  const path = config.url || ""
+  const isAbsolute = /^https?:\/\//.test(path)
+  if (isAbsolute) {
+    return config
+  }
+  const apiPath = path.startsWith("/") ? `/api${path}` : `/api/${path}`
+  if (active) {
+    config.url = `${active.url}${apiPath}`
+    if (active.token) {
+      config.headers = config.headers || {}
+      // Don't clobber an explicit Authorization header on a per-
+      // request basis (e.g. login flows passing their own creds).
+      if (!config.headers.Authorization) {
+        config.headers.Authorization = `Bearer ${active.token}`
+      }
+    }
+  } else {
+    config.url = apiPath
+  }
+  return config
 })
 
 /**
@@ -33,9 +93,25 @@ export const configAPI = {
     return data
   },
 
-  /** @returns {Promise<{cwd: string, platform: string}>} */
-  async getServerInfo() {
-    const { data } = await api.get("/configs/server-info")
+  /**
+   * Fetch server runtime info. When ``opts.onNode`` is a connected worker
+   * (i.e. not ``"_host"``), the request includes ``?on_node=<node>`` so the
+   * backend returns that worker's default working directory instead of the
+   * host's cwd (B5). Standalone mode keeps the original behavior.
+   *
+   * @param {{ onNode?: string }} [opts]
+   * @returns {Promise<{cwd: string, platform: string}>}
+   */
+  async getServerInfo(opts = {}) {
+    const params = {}
+    if (opts.onNode && opts.onNode !== "_host") params.on_node = opts.onNode
+    const { data } = await api.get("/configs/server-info", { params })
+    return data
+  },
+
+  /** Full diagnostic snapshot for the About panel. */
+  async getDiagnostics() {
+    const { data } = await api.get("/configs/server-info/diagnostics")
     return data
   },
 
@@ -63,10 +139,13 @@ export const runtimeGraphAPI = {
 /** Terrarium lifecycle */
 export const terrariumAPI = {
   /** @returns {Promise<{terrarium_id: string}>} */
-  async create(configPath, pwd, name = null) {
+  async create(configPath, pwd, name = null, opts = {}) {
     const body = { config_path: configPath }
     if (pwd) body.pwd = pwd
     if (name) body.name = name
+    // Lab cluster site — backend defaults to "_host" if absent, so
+    // standalone mode is unaffected.
+    if (opts.onNode && opts.onNode !== "_host") body.on_node = opts.onNode
     const { data } = await api.post("/sessions/active/terrariums", body)
     return data
   },
@@ -111,13 +190,19 @@ export const terrariumAPI = {
 
   /** Merge graph ``b`` into graph ``a`` so both creature sets share
    * one engine graph. Returns ``{session_id, merged}`` where
-   * ``session_id`` is the surviving graph id. No bridge channel is
-   * created — used when wiring a channel that lives in a different
-   * molecule from the creature being wired to it. */
-  async mergeGraphs(aSessionId, bSessionId) {
-    const { data } = await api.post(
-      `/sessions/topology/${encodeTarget(aSessionId)}/merge/${encodeTarget(bSessionId)}`,
-    )
+   * ``session_id`` is the surviving graph id.
+   *
+   * ``channel`` (optional): when set, the backend's underlying
+   * ``service.connect`` reuses that channel name instead of creating
+   * a fresh auto-named ``{a}_to_{b}`` bridge.  Pass this when the
+   * user dragged FROM an existing channel — otherwise the merge would
+   * spawn a parallel channel alongside the user's, which is the
+   * wrong UX. */
+  async mergeGraphs(aSessionId, bSessionId, channel = null) {
+    const url =
+      `/sessions/topology/${encodeTarget(aSessionId)}/merge/${encodeTarget(bSessionId)}` +
+      (channel ? `?channel=${encodeURIComponent(channel)}` : "")
+    const { data } = await api.post(url)
     return data
   },
 
@@ -280,10 +365,11 @@ export const terrariumAPI = {
 /** Standalone agent lifecycle */
 export const agentAPI = {
   /** @returns {Promise<{agent_id: string}>} */
-  async create(configPath, pwd, name = null) {
+  async create(configPath, pwd, name = null, opts = {}) {
     const body = { config_path: configPath }
     if (pwd) body.pwd = pwd
     if (name) body.name = name
+    if (opts.onNode && opts.onNode !== "_host") body.on_node = opts.onNode
     const { data } = await api.post("/sessions/active/agents", body)
     return data
   },
@@ -447,7 +533,7 @@ export const filesAPI = {
     return data
   },
 
-  async getTree(root, depth = 3) {
+  async getTree(root, depth = 1) {
     const { data } = await api.get("/files/tree", { params: { root, depth } })
     return data
   },
@@ -502,8 +588,10 @@ export const sessionAPI = {
   },
 
   /** @returns {Promise<{instance_id: string, type: string, session_name: string}>} */
-  async resume(sessionName) {
-    const { data } = await api.post(`/sessions/${sessionName}/resume`)
+  async resume(sessionName, opts = {}) {
+    const body = {}
+    if (opts.onNode && opts.onNode !== "_host") body.on_node = opts.onNode
+    const { data } = await api.post(`/sessions/${sessionName}/resume`, body)
     return data
   },
 
@@ -519,6 +607,70 @@ export const sessionAPI = {
       params,
     })
     return data
+  },
+
+  /**
+   * Get the vector-index status for a saved session.
+   * @param {string} sessionName
+   * @returns {Promise<{indexed: boolean, embedder: string|null, model: string|null,
+   *                    dimensions: number|null, fts_blocks: number, vec_blocks: number,
+   *                    agents: string[]}>}
+   */
+  async getMemoryStatus(sessionName) {
+    const { data } = await api.get(`/sessions/${sessionName}/memory/status`)
+    return data
+  },
+
+  /**
+   * Acknowledge a build request and return the WS URL for progress.
+   * The actual work runs on the WS stream returned by ``openMemoryBuildStream``.
+   * @param {string} sessionName
+   * @param {{embedder?: string, model?: string|null, dimensions?: number|null, force?: boolean}} body
+   */
+  async buildMemory(sessionName, body = {}) {
+    const payload = {
+      embedder: body.embedder || "auto",
+      model: body.model || null,
+      dimensions: body.dimensions || null,
+      force: !!body.force,
+    }
+    const { data } = await api.post(`/sessions/${sessionName}/memory/build`, payload)
+    return data
+  },
+
+  /**
+   * Open the WS that streams memory-build progress. Caller is
+   * responsible for closing the socket; the server closes after the
+   * terminal ``{status: ok|failed|cancelled}`` frame.
+   * @param {string} sessionName
+   * @param {{embedder?: string, model?: string|null, dimensions?: number|null,
+   *          force?: boolean, onFrame: (frame: object) => void,
+   *          onClose?: () => void, onError?: (e: Event) => void}} opts
+   * @returns {WebSocket}
+   */
+  openMemoryBuildStream(sessionName, opts) {
+    const params = new URLSearchParams()
+    if (opts.embedder) params.set("embedder", opts.embedder)
+    if (opts.model) params.set("model", opts.model)
+    if (opts.dimensions) params.set("dimensions", String(opts.dimensions))
+    if (opts.force) params.set("force", "true")
+    // Route via wsUrl so the active host's authority + token gets
+    // applied (was hardcoded to window.location.host before the
+    // host-picker work).
+    const url = wsUrl(
+      `/ws/sessions/${encodeURIComponent(sessionName)}/memory/build?${params.toString()}`,
+    )
+    const ws = new WebSocket(url)
+    ws.onmessage = (e) => {
+      try {
+        opts.onFrame(JSON.parse(e.data))
+      } catch (err) {
+        opts.onError?.(err)
+      }
+    }
+    ws.onerror = (e) => opts.onError?.(e)
+    ws.onclose = () => opts.onClose?.()
+    return ws
   },
 
   async getHistoryIndex(sessionName) {
@@ -637,18 +789,26 @@ export const sessionAPI = {
   },
 }
 
-/** Settings - API keys, custom models */
+/** Settings - API keys, custom models.
+ *
+ * Identity ops (keys, codex) accept an optional ``node`` argument that
+ * routes the call to a specific worker's local credential store (see
+ * src/kohakuterrarium/api/routes/identity/node_routing.py). Omit or
+ * pass "_host" to hit the host's own store (the default standalone
+ * behaviour). */
+const _nodeQuery = (node) => (node && node !== "_host" ? { params: { node } } : undefined)
 export const settingsAPI = {
-  async getKeys() {
-    const { data } = await api.get("/settings/keys")
+  async getKeys(node = "_host") {
+    const { data } = await api.get("/settings/keys", _nodeQuery(node))
     return data
   },
-  async saveKey(provider, key) {
-    const { data } = await api.post("/settings/keys", { provider, key })
+  async saveKey(provider, key, node = "_host") {
+    const cfg = _nodeQuery(node) || {}
+    const { data } = await api.post("/settings/keys", { provider, key }, cfg)
     return data
   },
-  async removeKey(provider) {
-    const { data } = await api.delete(`/settings/keys/${provider}`)
+  async removeKey(provider, node = "_host") {
+    const { data } = await api.delete(`/settings/keys/${provider}`, _nodeQuery(node))
     return data
   },
   async getBackends() {
@@ -691,6 +851,24 @@ export const settingsAPI = {
     const { data } = await api.post("/settings/default-model", { name })
     return data
   },
+  // Raw config files (Settings → Advanced)
+  async listConfigFiles() {
+    const { data } = await api.get("/settings/config-files")
+    return data
+  },
+  async readConfigFile(name) {
+    const { data } = await api.get(`/settings/config-files/${encodeURIComponent(name)}/content`)
+    return data
+  },
+  async writeConfigFile(name, content, sha256Expected = null) {
+    const body = { content }
+    if (sha256Expected) body.sha256_expected = sha256Expected
+    const { data } = await api.put(
+      `/settings/config-files/${encodeURIComponent(name)}/content`,
+      body,
+    )
+    return data
+  },
   // MCP server management
   async listMCP() {
     const { data } = await api.get("/settings/mcp")
@@ -704,16 +882,43 @@ export const settingsAPI = {
     const { data } = await api.delete(`/settings/mcp/${name}`)
     return data
   },
+  /**
+   * Partial in-place edit of an existing MCP server.
+   * Send only the fields you want to change.
+   * @param {string} name
+   * @param {object} patch
+   */
+  async patchMCP(name, patch) {
+    const { data } = await api.patch(`/settings/mcp/${name}`, patch)
+    return data
+  },
+  /**
+   * Probe an MCP server: connect, list_tools, disconnect.
+   * @returns {Promise<{ok: boolean, error: string|null, tool_count: number|null, elapsed_ms: number|null}>}
+   */
+  async testMCP(name) {
+    const { data } = await api.post(`/settings/mcp/${name}/test`)
+    return data
+  },
+  /**
+   * List installed creatures / terrariums that reference this server.
+   * @returns {Promise<{name: string, kind: 'creature'|'terrarium', path: string}[]>}
+   */
+  async mcpUsage(name) {
+    const { data } = await api.get(`/settings/mcp/${name}/usage`)
+    return data
+  },
   async getCodexUsage() {
     const { data } = await api.get("/settings/codex-usage")
     return data
   },
-  async getCodexStatus() {
-    const { data } = await api.get("/settings/codex-status")
+  async getCodexStatus(node = "_host") {
+    const { data } = await api.get("/settings/codex-status", _nodeQuery(node))
     return data
   },
-  async codexLogin() {
-    const { data } = await api.post("/settings/codex-login", {}, { timeout: 300000 })
+  async codexLogin(node = "_host") {
+    const cfg = { timeout: 300000, ..._nodeQuery(node) }
+    const { data } = await api.post("/settings/codex-login", {}, cfg)
     return data
   },
   async getUIPrefs() {
@@ -742,6 +947,99 @@ export const registryAPI = {
   },
   async uninstall(name) {
     const { data } = await api.post("/registry/uninstall", { name })
+    return data
+  },
+  /** Update a single git-backed installed package. */
+  async update(name) {
+    const { data } = await api.post(`/registry/${encodeURIComponent(name)}/update`)
+    return data
+  },
+  /** Aggregated list of plugin / tool / trigger / etc. extensions
+   *  contributed by installed packages.
+   *  @returns {Promise<{name, kind, package, package_version, description, module, editable}[]>}
+   */
+  // (also exposed as extensionsAPI.list — kept here for the
+  // packages-tab cross-reference; UI components use extensionsAPI.)
+  async listExtensions() {
+    const { data } = await api.get("/registry/extensions")
+    return data
+  },
+  /** Update every git-backed installed package. */
+  async updateAll() {
+    const { data } = await api.post("/registry/update-all")
+    return data
+  },
+  /** List files inside an installed package. */
+  async listFiles(name) {
+    const { data } = await api.get(`/registry/${encodeURIComponent(name)}/files`)
+    return data
+  },
+  /** Read one file from an installed package as UTF-8 text. */
+  async readFile(name, path) {
+    const { data } = await api.get(
+      `/registry/${encodeURIComponent(name)}/files/${path
+        .split("/")
+        .map(encodeURIComponent)
+        .join("/")}`,
+    )
+    return data
+  },
+  /** Write one file inside an installed package. */
+  async writeFile(name, path, content, sha256Expected = null) {
+    const body = { content }
+    if (sha256Expected) body.sha256_expected = sha256Expected
+    const { data } = await api.put(
+      `/registry/${encodeURIComponent(name)}/files/${path
+        .split("/")
+        .map(encodeURIComponent)
+        .join("/")}`,
+      body,
+    )
+    return data
+  },
+}
+
+/** Lab cluster control — Sites tab verbs (lab-host mode only). */
+export const labAPI = {
+  async status() {
+    const { data } = await api.get("/lab/status")
+    return data
+  },
+  async disconnectClient(nodeId) {
+    const { data } = await api.post(`/lab/clients/${encodeURIComponent(nodeId)}/disconnect`)
+    return data
+  },
+  async blockClient(nodeId, reason = "") {
+    const { data } = await api.post(`/lab/clients/${encodeURIComponent(nodeId)}/block`, { reason })
+    return data
+  },
+  async unblockClient(nodeId) {
+    const { data } = await api.delete(`/lab/clients/blocklist/${encodeURIComponent(nodeId)}`)
+    return data
+  },
+  async listBlocked() {
+    const { data } = await api.get("/lab/clients/blocklist")
+    return data
+  },
+  async rotatePairingToken() {
+    const { data } = await api.post("/lab/pairing-tokens/rotate")
+    return data
+  },
+}
+
+/** Extensions catalog — flattened view of plugins / tools / triggers /
+ *  io / llm-presets / skills / commands / prompts contributed by
+ *  installed packages.
+ */
+export const extensionsAPI = {
+  async list() {
+    const { data } = await api.get("/registry/extensions")
+    return data
+  },
+  async get(kind, name) {
+    const { data } = await api.get(
+      `/registry/extensions/${encodeURIComponent(kind)}/${encodeURIComponent(name)}`,
+    )
     return data
   },
 }
@@ -782,6 +1080,51 @@ export const attachAPI = {
   /** @returns {Promise<{policies: string[]}>} */
   async getSessionPolicies(sessionId) {
     const { data } = await api.get(`/attach/session_policies/${encodeURIComponent(sessionId)}`)
+    return data
+  },
+}
+
+/**
+ * Cluster (lab-host) nodes API.
+ *
+ * The lab-host mode exposes a list of connected sites (host + workers).
+ * In standalone mode every endpoint returns 404 — callers must catch.
+ * See ``api/routes/nodes.py`` for the backend.
+ *
+ * Wire field is ``node_id`` (immutable contract).  Frontend code uses
+ * ``siteId`` to avoid confusion with graph-node terminology — see
+ * planned-frontend-modification.md §0.
+ */
+export const nodesAPI = {
+  /**
+   * GET /api/nodes
+   * @returns {Promise<{nodes: Array<{node_id: string, is_host: boolean, status: string, creatures: number|null}>}>}
+   */
+  async list() {
+    const { data } = await api.get("/nodes")
+    return data
+  },
+
+  /**
+   * GET /api/nodes/:node_id/status
+   * @param {string} nodeId
+   * @returns {Promise<{node_id: string, is_host: boolean, ok: boolean, creatures: number, status_snapshot: object}>}
+   */
+  async status(nodeId) {
+    const { data } = await api.get(`/nodes/${encodeURIComponent(nodeId)}/status`)
+    return data
+  },
+
+  /**
+   * POST /api/nodes/:node_id/deploy/creature
+   * @param {string} nodeId
+   * @param {string} workspacePath  Local absolute path to a creature directory.
+   * @returns {Promise<{target_path: string, node_id: string}>}
+   */
+  async deployCreature(nodeId, workspacePath) {
+    const { data } = await api.post(`/nodes/${encodeURIComponent(nodeId)}/deploy/creature`, {
+      workspace_path: workspacePath,
+    })
     return data
   },
 }

@@ -48,8 +48,23 @@ ALLOWLIST_600 = {
     "llm/profiles.py",
     # Rich CLI orchestrator — same shape as core/agent.py + manager.py
     # (top-level class owning lifecycle + layout + many small delegation
-    # methods). Output-event handlers already extracted to AppOutputMixin.
+    # methods). Output-event handlers already extracted to AppOutputMixin;
+    # multi-creature wiring extracted to AppMultiCreatureMixin.
     "builtins/cli_rich/app.py",
+    # Composer — prompt_toolkit TextArea + ~25 key bindings (paste
+    # detection, picker indirection, completion, multi-line edit, focus
+    # cycling). Splitting would scatter keymap setup from the TextArea.
+    "builtins/cli_rich/composer.py",
+    # Multi-creature mixin — cohesive surface for RichCLIApp's
+    # multi-creature mode (setup/teardown, focus controller, @name
+    # routing, multiplex demux, runtime CREATURE_STARTED/STOPPED
+    # subscriber + dynamic mount/unmount, B2 per-creature scrollback
+    # capture + on-focus redraw, user-message routing helpers). Every
+    # method here references the same RichCLIApp instance state
+    # (live_regions, draft_by_creature, committer, focus_controller);
+    # splitting along category lines would scatter handlers that all
+    # mutate the same dicts across files for no readability win.
+    "builtins/cli_rich/app_multi.py",
     # Settings overlay state machine — list/form/confirm modes + 4 tabs of
     # data loaders and action handlers. Rendering already split into
     # settings_render.py; splitting further would fragment a cohesive
@@ -90,6 +105,105 @@ ALLOWLIST_600 = {
     # an existing function; splitting the namespaces across files would
     # fragment a single discoverable surface for the programmatic API.
     "studio/studio.py",
+    # Laboratory host engine — top-level orchestrator class owning
+    # accept loop, Hello/Welcome handshake, per-client read/write
+    # tasks, envelope routing (match-case over EnvelopeKind), pluggable
+    # CONTROL + APP extension dispatch, and heartbeat reaper. Same
+    # shape as core/agent.py / serving/manager.py / cli_rich/app.py:
+    # one cohesive lifecycle with many short delegation methods.
+    "laboratory/_internal/host.py",
+    # Laboratory client connector — counterpart to host.py with the
+    # same shape: handshake, read/write tasks, reconnect+backoff loop,
+    # APP request/response dispatch with pending-future bookkeeping,
+    # heartbeat producer. The added structured logging at every state
+    # transition (boot/connect/reconnect/dispatch/abort) pushes it over
+    # the soft cap. Splitting transport-side bookkeeping from handler
+    # dispatch would fragment a single cohesive lifecycle.
+    "laboratory/_internal/client.py",
+    # TerrariumService Protocol + LocalTerrariumService — full
+    # per-creature API surface (chat / state / mutation / wiring /
+    # cluster snapshot). One cohesive Protocol definition with a
+    # uniform LocalImpl method per Protocol method; splitting along
+    # category lines would scatter related implementations across
+    # files that all consume the same engine handle.
+    "terrarium/service.py",
+    # RemoteTerrariumService — wire-call counterpart to service.py,
+    # one method per Protocol entry. Same shape rationale.
+    "terrarium/remote_service.py",
+    # Worker-side ``terrarium.files`` adapter — cohesive Lab APP handler
+    # covering the full file-IO surface (list/stat/read/read_stream/
+    # write/write_stream/write_commit/write_abort/delete/watch/push_bundle)
+    # over five scopes. Each op is short; splitting the dispatch would
+    # fragment the namespace surface external Lab callers consume.
+    "laboratory/adapters/terrarium_files.py",
+    # MultiNodeTerrariumService — composite service. ~30 route-by-home
+    # delegations + fan-out subscribe/snapshot in one cohesive
+    # registry / dispatch class.
+    "terrarium/multi_node_service.py",
+    # Session lifecycle — start_creature/start_terrarium with
+    # local-vs-remote branches, rename, list, stop, attach, find. Many
+    # short helpers around the engine; splitting would fragment the
+    # session creation surface frontends depend on.
+    "studio/sessions/lifecycle.py",
+    # Pure agent-touching helpers shared by service.py + studio.sessions.
+    # One function per Protocol method (scratchpad, triggers, env,
+    # plugins, modules, native tools, attach policies, runtime graph
+    # snapshot, slash-command dispatch).  Grouped by topic; splitting
+    # would scatter related agent reads across many small files.
+    "terrarium/creature_ops.py",
+    # Lab APP adapter for ``terrarium.runtime``.  One match-case per
+    # RPC type (40+ types: lifecycle, channels, per-creature state,
+    # module catalog, runtime graph snapshot).  Splitting along category
+    # lines would fragment the single authoritative dispatch table.
+    "laboratory/adapters/terrarium_runtime.py",
+    # Channel topology + persistence + event emission for the engine.
+    # Adding the ``CHANNEL_MESSAGE`` emit (2026-05-13) pushed it over
+    # the soft cap; splitting persistence from topology would scatter
+    # the on_send install + store wiring + event emit across files
+    # that all reference the same ``Channel`` lifecycle.
+    "terrarium/channels.py",
+    # FastAPI application factory + lifespan + route mounting.  The
+    # multi-node lifespan (HostEngine + adapters + membership watcher +
+    # mirror writer + broadcast + output-wire forwarder) and the long
+    # route-include block sit in one cohesive boot path; splitting
+    # would scatter the dependency order callers rely on.
+    "api/app.py",
+    # AgentInitMixin: cohesive ``_init_*`` / ``_create_*`` lifecycle
+    # mixin for the Agent class (LLM, registry, executor, subagents,
+    # controller, skills, I/O, user-commands, triggers). Same shape as
+    # the already-allowlisted ``core/agent_handlers.py``; heavy lifting
+    # is already delegated to ``bootstrap/*`` factory modules — what
+    # remains is the wiring sequence the Agent depends on in order.
+    "bootstrap/agent_init.py",
+    # AgentToolsMixin: tool dispatch + handle waiting + promotion +
+    # interruption + completion-activity emission + native/text result
+    # formatting. One cohesive lifecycle around in-flight tool jobs;
+    # runtime tool registration already extracted to
+    # ``agent_runtime_tools.py`` and metrics to ``agent_tools_metrics.py``.
+    "core/agent_tools.py",
+    # OpenAI-compat provider: streaming + non-streaming + tool calling +
+    # retry + emergency drop + reasoning capture + Anthropic-cache marker
+    # interop + live credential reload. One cohesive AsyncOpenAI wrapper
+    # — splitting along category lines would scatter retry / stream-state
+    # / extra_body handling across files that all touch the same
+    # ``create_kwargs`` dict.
+    "llm/openai.py",
+    # Resumable-events normalization pipeline — cohesive replay/branch
+    # logic: nested-branch parent-path resolution, branch-view selection,
+    # OpenAI-shape conversation replay, interrupted-job synthesis, plus
+    # the B8 synthetic ``assistant_tool_calls`` injector that pairs
+    # orphan tool_call/tool_result events ahead of replay. Splitting
+    # would scatter the pairing + synthesis + rollup logic across files
+    # that all reference the same event stream and selected_branches
+    # state.
+    "session/history.py",
+    # Auth routes — capabilities + register / login / logout / me /
+    # tokens / users / invitations / admin token-rotation.  Each
+    # handler is short; what dominates the line count is the route
+    # catalogue itself (one ``@router.<verb>(...)`` per surface).
+    # Splitting along surface lines (auth vs admin) would scatter
+    # request/response Pydantic models that are shared across them.
+    "api/auth/routes.py",
 }
 
 
