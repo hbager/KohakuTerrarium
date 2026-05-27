@@ -269,6 +269,35 @@ describe("chat store — edit/regen live branch resync", () => {
     expect(chat._branchResyncPendingByTab.main).toBeUndefined()
   })
 
+  it("switches the edited turn to the branch_id returned by the API before resync", async () => {
+    const chat = useChatStore()
+    chat._instanceId = "agent_1"
+    chat._instanceGraphId = "graph_1"
+    chat.activeTab = "main"
+    chat.branchViewByTab.main = { 1: 1 }
+    chat.messagesByTab = {
+      main: [
+        { id: "u1", role: "user", content: "old", turnIndex: 1, userPosition: 0, latestBranch: 1 },
+        { id: "a1", role: "assistant", parts: [{ type: "text", content: "old reply" }], turnIndex: 1 },
+      ],
+    }
+
+    const importActual = await vi.importActual("@/utils/api")
+    const editApi = vi.spyOn(importActual.agentAPI, "editMessage").mockResolvedValue({
+      status: "edited",
+      branch_id: 2,
+    })
+    const resync = vi.spyOn(chat, "_resyncHistory").mockImplementation(async () => {
+      expect(chat.branchViewByTab.main).toEqual({ 1: 2 })
+      return true
+    })
+
+    await expect(chat.editMessage(0, "new", { turnIndex: 1, userPosition: 0, latestBranch: 1 })).resolves.toBe(true)
+
+    editApi.mockRestore()
+    resync.mockRestore()
+  })
+
   it("schedules a canonical replay after streaming branch mutations finish", async () => {
     vi.useFakeTimers()
     try {

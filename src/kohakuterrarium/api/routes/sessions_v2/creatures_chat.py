@@ -19,6 +19,19 @@ from kohakuterrarium.terrarium.service import TerrariumService
 router = APIRouter()
 
 
+def _latest_branch_for_turn(history: dict, turn_index: int | None) -> int | None:
+    if turn_index is None:
+        return None
+    latest: int | None = None
+    for evt in history.get("events") or []:
+        if evt.get("turn_index") != turn_index:
+            continue
+        branch_id = evt.get("branch_id")
+        if isinstance(branch_id, int) and (latest is None or branch_id > latest):
+            latest = branch_id
+    return latest
+
+
 @router.post("/{session_id}/creatures/{creature_id}/chat")
 async def chat_creature(
     session_id: str,
@@ -72,7 +85,7 @@ async def edit_creature_message(
         content = req.content
     cid = await resolve_creature_id(service, creature_id)
     try:
-        edited = await service.edit_message(
+        edit_result = await service.edit_message(
             cid,
             msg_idx,
             content,
@@ -82,13 +95,23 @@ async def edit_creature_message(
         )
     except KeyError:
         raise HTTPException(404, f"creature {creature_id!r} not found")
+    edited = bool(edit_result.get("edited")) if isinstance(edit_result, dict) else bool(edit_result)
     if not edited:
         raise HTTPException(400, "Invalid edit target; expected a user message")
-    return {
+    response = {
         "status": "edited",
         "turn_index": req.turn_index,
         "user_position": req.user_position,
     }
+    branch_id = edit_result.get("branch_id") if isinstance(edit_result, dict) else None
+    if branch_id is None:
+        try:
+            branch_id = _latest_branch_for_turn(await service.chat_history(cid), req.turn_index)
+        except Exception:
+            branch_id = None
+    if branch_id is not None:
+        response["branch_id"] = branch_id
+    return response
 
 
 @router.post("/{session_id}/creatures/{creature_id}/messages/{msg_idx}/rewind")

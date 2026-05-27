@@ -174,6 +174,35 @@ class TestEditMessage:
         assert resp.status_code == 200
         assert resp.json()["status"] == "edited"
 
+    def test_success_includes_new_branch_id_when_service_returns_it(self):
+        client = _client(_FakeService(edit_returns={"edited": True, "branch_id": 3}))
+        resp = client.post(
+            "/sessions/g/creatures/alice/messages/0/edit",
+            json={"content": "new text", "turn_index": 1},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "edited"
+        assert resp.json()["branch_id"] == 3
+
+    def test_success_infers_branch_id_from_history_when_service_returns_bool(self):
+        client = _client(
+            _FakeService(
+                edit_returns=True,
+                history_returns={
+                    "events": [
+                        {"type": "user_message", "turn_index": 1, "branch_id": 1},
+                        {"type": "user_message", "turn_index": 1, "branch_id": 2},
+                    ]
+                },
+            )
+        )
+        resp = client.post(
+            "/sessions/g/creatures/alice/messages/0/edit",
+            json={"content": "new text", "turn_index": 1},
+        )
+        assert resp.status_code == 200
+        assert resp.json()["branch_id"] == 2
+
     def test_with_content_list(self):
         client = _client(_FakeService(edit_returns=True))
         resp = client.post(

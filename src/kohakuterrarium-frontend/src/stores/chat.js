@@ -308,6 +308,17 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
   events = _dedupeAdjacentDuplicateEvents(events)
   const { byTurn, liveIds, branchSelection } = _collectBranchMetadata(events, branchView)
 
+  const userMessageEventIds = new Map()
+  for (const evt of events) {
+    if (evt?.type !== "user_message") continue
+    const ti = evt.turn_index
+    const bi = evt.branch_id
+    const eid = evt.event_id
+    if (typeof ti === "number" && typeof bi === "number" && typeof eid === "number") {
+      userMessageEventIds.set(`${ti}/${bi}`, eid)
+    }
+  }
+
   // Pre-pass: compact_replace ranges hide every event whose event_id
   // falls inside the replaced range. Mirrors Python replay_conversation
   // so resume + live show the same compact-summary bubble.
@@ -332,10 +343,23 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
   const startedJobs = {} // jobId -> tool part reference
   const completedJobs = new Set() // jobIds that received done/error
 
-  function ensureCur() {
+  function messageId(prefix, evt, fallbackIndex = result.length) {
+    const ti = evt?.turn_index
+    const bi = evt?.branch_id
+    let eid = evt?.event_id
+    if (prefix === "u" && typeof ti === "number" && typeof bi === "number") {
+      eid = userMessageEventIds.get(`${ti}/${bi}`) ?? eid
+    }
+    if (typeof ti === "number" && typeof bi === "number" && typeof eid === "number") {
+      return `${prefix}_${ti}_${bi}_${eid}`
+    }
+    return `h_${fallbackIndex}`
+  }
+
+  function ensureCur(anchorEvt = null) {
     if (!cur) {
       cur = {
-        id: "h_" + result.length,
+        id: messageId("a", anchorEvt),
         role: "assistant",
         parts: [],
         timestamp: "",
@@ -345,8 +369,8 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
     return cur
   }
 
-  function appendText(content) {
-    const c = ensureCur()
+  function appendText(content, anchorEvt = null) {
+    const c = ensureCur(anchorEvt)
     const tail = c.parts.length ? c.parts[c.parts.length - 1] : null
     if (tail && tail.type === "text") {
       tail.content += content
@@ -355,8 +379,8 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
     }
   }
 
-  function addTool(name, kind, args, jobId) {
-    const c = ensureCur()
+  function addTool(name, kind, args, jobId, anchorEvt = null) {
+    const c = ensureCur(anchorEvt)
     const tail = c.parts.length ? c.parts[c.parts.length - 1] : null
     if (tail && tail.type === "text") tail._streaming = false
     // Sub-agents run asynchronously in the background — the assistant
@@ -615,7 +639,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
       cur = null
       const normalized = normalizeMessageContent(evt.content)
       result.push({
-        id: "h_" + result.length,
+        id: messageId("u", evt),
         role: "user",
         content: normalized.content,
         contentParts: normalized.contentParts,
@@ -623,7 +647,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
       })
     } else if (t === "processing_start") {
       cur = {
-        id: "h_" + result.length,
+        id: messageId("a", evt),
         role: "assistant",
         parts: [],
         timestamp: "",
@@ -632,7 +656,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
     } else if (t === "text" || t === "text_chunk") {
       // text_chunk is the Wave C per-chunk streaming format; replay
       // collapses consecutive chunks into one assistant text part.
-      appendText(evt.content || "")
+      appendText(evt.content || "", evt)
     } else if (t === "processing_end" || t === "idle") {
       // Do NOT clear cur if sub-agents might still be adding tools to this message
       // But mark text as done
@@ -679,7 +703,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
           timestamp: "",
         })
       } else if (at === "subagent_start") {
-        addTool(evt.name, "subagent", evt.args || { info: evt.detail }, evt.job_id)
+        addTool(evt.name, "subagent", evt.args || { info: evt.detail }, evt.job_id, evt)
       } else if (at === "subagent_done") {
         updateTool(
           evt.name,
@@ -712,7 +736,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
           evt.job_id,
         )
       } else if (at === "tool_start") {
-        addTool(evt.name, "tool", evt.args || { info: evt.detail }, evt.job_id)
+        addTool(evt.name, "tool", evt.args || { info: evt.detail }, evt.job_id, evt)
       } else if (at === "tool_done") {
         updateTool(
           evt.name,
@@ -780,7 +804,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
         timestamp: "",
       })
     } else if (t === "tool_call") {
-      addTool(evt.name, "tool", evt.args || {}, evt.call_id || evt.job_id)
+      addTool(evt.name, "tool", evt.args || {}, evt.call_id || evt.job_id, evt)
     } else if (t === "tool_result") {
       updateTool(
         evt.name,
@@ -796,7 +820,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
         evt.call_id || evt.job_id,
       )
     } else if (t === "subagent_call") {
-      addTool(evt.name, "subagent", { task: evt.task || "" }, evt.job_id)
+      addTool(evt.name, "subagent", { task: evt.task || "" }, evt.job_id, evt)
     } else if (t === "subagent_result") {
       updateTool(
         evt.name,
@@ -2397,6 +2421,8 @@ const _chatStoreOptions = {
           branchView,
         })
         if (turnIndex != null && editResponse?.branch_id != null) {
+          if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
+          this.branchViewByTab[tab][turnIndex] = editResponse.branch_id
           this._markBranchResyncPending(tab, {
             expectedBranchByTurn: { [turnIndex]: editResponse.branch_id },
           })

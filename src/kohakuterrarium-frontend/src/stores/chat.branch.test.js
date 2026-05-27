@@ -171,7 +171,36 @@ describe("chat store — duplicate backend-event compatibility", () => {
   })
 })
 
+describe("chat store — stable replay keys", () => {
+  it("uses turn/branch/event identity instead of replay position for message ids", () => {
+    const branchOne = [
+      { type: "user_input", content: "old", event_id: 1, turn_index: 1, branch_id: 1 },
+      { type: "user_message", content: "old", event_id: 2, turn_index: 1, branch_id: 1 },
+      { type: "processing_start", event_id: 3, turn_index: 1, branch_id: 1 },
+      { type: "text_chunk", content: "old reply", event_id: 4, turn_index: 1, branch_id: 1 },
+      { type: "processing_end", event_id: 5, turn_index: 1, branch_id: 1 },
+    ]
+    const branchTwo = [
+      ...branchOne,
+      { type: "user_input", content: "new", event_id: 6, turn_index: 1, branch_id: 2 },
+      { type: "user_message", content: "new", event_id: 7, turn_index: 1, branch_id: 2 },
+      { type: "processing_start", event_id: 8, turn_index: 1, branch_id: 2 },
+      { type: "text_chunk", content: "new reply", event_id: 9, turn_index: 1, branch_id: 2 },
+      { type: "processing_end", event_id: 10, turn_index: 1, branch_id: 2 },
+    ]
+
+    const oldView = _replayEvents([], branchOne).messages
+    const newView = _replayEvents([], branchTwo).messages
+
+    expect(oldView[0].id).toBe("u_1_1_2")
+    expect(oldView[1].id).toBe("a_1_1_3")
+    expect(newView[0].id).toBe("u_1_2_7")
+    expect(newView[1].id).toBe("a_1_2_8")
+  })
+})
+
 describe("chat store — branch-switch keeps consistent follow-ups", () => {
+
   it("default view shows turn 1 branch 2 + follow-up turn 2", () => {
     const { messages } = _replayEvents([], makeEvents())
     const userMsgs = messages.filter((m) => m.role === "user")
