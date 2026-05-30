@@ -298,6 +298,92 @@ describe("chat store — edit/regen live branch resync", () => {
     resync.mockRestore()
   })
 
+  it("optimistically splices by turn/user target when the rendered index is stale", async () => {
+    const chat = useChatStore()
+    chat._instanceId = "agent_1"
+    chat._instanceGraphId = "graph_1"
+    chat.activeTab = "main"
+    chat.messagesByTab = {
+      main: [
+        { id: "u1", role: "user", content: "old", turnIndex: 1, userPosition: 0, latestBranch: 1 },
+        { id: "a1", role: "assistant", parts: [{ type: "text", content: "old reply" }], turnIndex: 1 },
+      ],
+    }
+
+    let resolveEdit
+    const pending = new Promise((resolve) => {
+      resolveEdit = resolve
+    })
+    const importActual = await vi.importActual("@/utils/api")
+    const editApi = vi.spyOn(importActual.agentAPI, "editMessage").mockReturnValue(pending)
+    const resync = vi.spyOn(chat, "_resyncHistory").mockResolvedValue(true)
+
+    const editPromise = chat.editMessage(99, "new", { turnIndex: 1, userPosition: 0, latestBranch: 1 })
+
+    expect(chat.messagesByTab.main).toHaveLength(1)
+    expect(chat.messagesByTab.main[0]).toMatchObject({ role: "user", content: "new" })
+
+    resolveEdit({ status: "edited", branch_id: 2 })
+    await editPromise
+    editApi.mockRestore()
+    resync.mockRestore()
+  })
+
+  it("changes the optimistic edited user id so Vue does not reuse the old editing component", async () => {
+    const chat = useChatStore()
+    chat._instanceId = "agent_1"
+    chat._instanceGraphId = "graph_1"
+    chat.activeTab = "main"
+    chat.messagesByTab = {
+      main: [
+        { id: "u_1_1_2", role: "user", content: "old", turnIndex: 1, userPosition: 0, latestBranch: 1 },
+        { id: "a_1_1_3", role: "assistant", parts: [{ type: "text", content: "old reply" }], turnIndex: 1 },
+      ],
+    }
+
+    let resolveEdit
+    const pending = new Promise((resolve) => {
+      resolveEdit = resolve
+    })
+    const importActual = await vi.importActual("@/utils/api")
+    const editApi = vi.spyOn(importActual.agentAPI, "editMessage").mockReturnValue(pending)
+    const resync = vi.spyOn(chat, "_resyncHistory").mockResolvedValue(true)
+
+    const editPromise = chat.editMessage(0, "new", { turnIndex: 1, userPosition: 0, latestBranch: 1 })
+
+    expect(chat.messagesByTab.main[0].id).toBe("u_1_2_pending")
+
+    resolveEdit({ status: "edited", branch_id: 2 })
+    await editPromise
+    editApi.mockRestore()
+    resync.mockRestore()
+  })
+
+  it("returns success when edit API accepts but canonical branch resync is still pending", async () => {
+    const chat = useChatStore()
+    chat._instanceId = "agent_1"
+    chat._instanceGraphId = "graph_1"
+    chat.activeTab = "main"
+    chat.messagesByTab = {
+      main: [
+        { id: "u1", role: "user", content: "old", turnIndex: 1, userPosition: 0, latestBranch: 1 },
+        { id: "a1", role: "assistant", parts: [{ type: "text", content: "old reply" }], turnIndex: 1 },
+      ],
+    }
+
+    const importActual = await vi.importActual("@/utils/api")
+    const editApi = vi.spyOn(importActual.agentAPI, "editMessage").mockResolvedValue({
+      status: "edited",
+      branch_id: 2,
+    })
+    const resync = vi.spyOn(chat, "_resyncHistory").mockResolvedValue(false)
+
+    await expect(chat.editMessage(0, "new", { turnIndex: 1, userPosition: 0, latestBranch: 1 })).resolves.toBe(true)
+
+    editApi.mockRestore()
+    resync.mockRestore()
+  })
+
   it("schedules a canonical replay after streaming branch mutations finish", async () => {
     vi.useFakeTimers()
     try {

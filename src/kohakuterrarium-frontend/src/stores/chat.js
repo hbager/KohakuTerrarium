@@ -2363,48 +2363,68 @@ const _chatStoreOptions = {
             ? { [turnIndex]: expectedLatestBranch + 1 }
             : {},
       })
-      let validTarget = false
+      let targetMessageIdx = null
       if (tab) {
         const msgs = this.messagesByTab[tab] || []
-        if (messageIdx >= 0 && messageIdx < msgs.length && msgs[messageIdx]?.role === "user") {
-          validTarget = true
-          userPosition = userPosition ?? this._conversationUserPosition(tab, messageIdx)
+        const isUserAt = (idx) => idx >= 0 && idx < msgs.length && msgs[idx]?.role === "user"
+        if (isUserAt(messageIdx)) {
+          targetMessageIdx = messageIdx
+        } else if (turnIndex != null || userPosition != null) {
+          if (turnIndex != null) {
+            const idx = msgs.findIndex((msg) => msg?.role === "user" && msg?.turnIndex === turnIndex)
+            if (idx !== -1) targetMessageIdx = idx
+          }
+          if (targetMessageIdx == null && userPosition != null) {
+            let seen = -1
+            for (let i = 0; i < msgs.length; i++) {
+              if (msgs[i]?.role !== "user") continue
+              seen += 1
+              if (seen === userPosition) {
+                targetMessageIdx = i
+                break
+              }
+            }
+          }
+        }
+        if (targetMessageIdx != null) {
+          userPosition = userPosition ?? this._conversationUserPosition(tab, targetMessageIdx)
           // Back-compat fallback for servers that only understand the
           // URL index: count rendered conversation rows, excluding
           // decorations. New servers prefer turnIndex/userPosition.
           backendIdx = 0
-          for (let i = 0; i < messageIdx; i++) {
+          for (let i = 0; i < targetMessageIdx; i++) {
             const r = msgs[i]?.role
             if (r === "user" || r === "assistant") backendIdx += 1
           }
         }
       }
-      if (!validTarget && turnIndex == null && userPosition == null) {
+      if (targetMessageIdx == null && turnIndex == null && userPosition == null) {
         delete this._branchResyncPendingByTab[tab]
         this._regenInFlight = false
         return false
       }
       const previousMessages = tab ? [...(this.messagesByTab[tab] || [])] : null
-      if (validTarget && tab) {
-        // Keep the user row at ``messageIdx`` visible (with the new
-        // content) and drop everything after it — the old assistant
-        // response, tool calls, etc. Previously we spliced from
-        // ``messageIdx`` itself, which made the edited message vanish
-        // until ``_resyncHistory`` ran AFTER the LLM finished. That
-        // gave a several-second gap where the chat showed only the
-        // streaming reply with the question that prompted it gone.
-        // ``_handleUserInput`` dedupes against the visible last-user
-        // message, so the WS replay from the new branch won't double
-        // it up.
+      if (targetMessageIdx != null && tab) {
+        // Keep the edited user row visible (with the new content) and
+        // drop everything after it — the old assistant response, tool
+        // calls, etc. The target index can be stale after Vue reuses a
+        // keyed row, so resolve by turn/user metadata before splicing.
         const msgs = this.messagesByTab[tab]
-        const original = msgs[messageIdx]
+        const original = msgs[targetMessageIdx]
         const normalized = normalizeMessageContent(newContent)
+        const rowTurnIndex = turnIndex ?? original.turnIndex
+        const rowLatestBranch = expectedLatestBranch ?? original.latestBranch
+        const optimisticId =
+          rowTurnIndex != null && rowLatestBranch != null
+            ? `u_${rowTurnIndex}_${rowLatestBranch + 1}_pending`
+            : `edit_${original.id || "user"}_${Date.now()}`
         const editedRow = {
           ...original,
+          id: optimisticId,
           content: normalized.content,
           contentParts: normalized.contentParts,
         }
-        msgs.splice(messageIdx, msgs.length - messageIdx, editedRow)
+        msgs.splice(targetMessageIdx, msgs.length - targetMessageIdx, editedRow)
       }
       try {
         const { agentAPI } = await import("@/utils/api")
@@ -2427,8 +2447,8 @@ const _chatStoreOptions = {
             expectedBranchByTurn: { [turnIndex]: editResponse.branch_id },
           })
         }
-        const resynced = await this._resyncHistory(tab)
-        return resynced !== false
+        await this._resyncHistory(tab)
+        return true
       } catch (e) {
         delete this._branchResyncPendingByTab[tab]
         if (previousMessages && tab) this.messagesByTab[tab] = previousMessages

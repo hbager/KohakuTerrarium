@@ -1,7 +1,13 @@
 from dataclasses import dataclass, field
 from typing import Any
 
-_LEGACY_BACKEND_TYPES = {"openai", "codex", "codex-oauth", "anthropic"}
+_LEGACY_BACKEND_TYPES = {
+    "openai",
+    "openai_responses",
+    "codex",
+    "codex-oauth",
+    "anthropic",
+}
 
 
 @dataclass

@@ -412,18 +412,29 @@ function removeEditAttachment(index) {
 async function confirmEdit() {
   if (editSaving.value || (!editText.value.trim() && editAttachments.value.length === 0)) return
   editSaving.value = true
+  const previousText = editText.value
+  const previousAttachments = [...editAttachments.value]
   try {
     const newContent = await buildMessageParts(editText.value, editAttachments.value)
+    editing.value = false
+    editText.value = ""
+    editAttachments.value = []
     const ok = await chat.editMessage(props.messageIdx, newContent, {
       turnIndex: props.message.turnIndex,
       userPosition: props.message.userPosition,
       latestBranch: props.message.latestBranch,
     })
-    if (!ok) return
-    editing.value = false
-    editText.value = ""
-    editAttachments.value = []
+    if (!ok) {
+      editText.value = previousText
+      editAttachments.value = previousAttachments
+      editing.value = true
+      nextTick(() => editTextareaEl.value?.focus())
+    }
   } catch (err) {
+    editText.value = previousText
+    editAttachments.value = previousAttachments
+    editing.value = true
+    nextTick(() => editTextareaEl.value?.focus())
     console.error("Failed to prepare edited message:", err)
   } finally {
     editSaving.value = false

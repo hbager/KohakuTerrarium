@@ -14,6 +14,7 @@ from kohakuterrarium.llm.anthropic_provider import AnthropicProvider
 from kohakuterrarium.llm.base import LLMConfig, LLMProvider
 from kohakuterrarium.llm.codex_provider import CodexOAuthProvider
 from kohakuterrarium.llm.openai import OpenAIProvider
+from kohakuterrarium.llm.openai_responses import OpenAIResponsesProvider
 from kohakuterrarium.llm import api_keys as _api_keys
 from kohakuterrarium.llm.profiles import LLMProfile, get_api_key, resolve_controller_llm
 from kohakuterrarium.utils.logging import get_logger
@@ -202,6 +203,18 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
             service_tier=profile.service_tier or None,
             retry_policy=retry_policy,
         )
+    elif profile.backend_type == "openai_responses":
+        provider = OpenAIResponsesProvider(
+            api_key=api_key,
+            base_url=profile.base_url or None,
+            model=profile.model,
+            temperature=profile.temperature,
+            max_tokens=profile.max_output or None,
+            reasoning_effort=profile.reasoning_effort or "",
+            service_tier=profile.service_tier or None,
+            extra_body=profile.extra_body or None,
+            retry_policy=retry_policy,
+        )
     else:
         provider = OpenAIProvider(
             api_key=api_key,
@@ -303,6 +316,19 @@ def _create_from_inline(config: AgentConfig) -> LLMProvider:
             max_tokens=config.max_tokens,
             extra_body=config.extra_body or None,
             service_tier=config.service_tier,
+            retry_policy=config.retry_policy,
+        )
+
+    if config.auth_mode == "openai-responses" or config.auth_mode == "openai_responses":
+        return OpenAIResponsesProvider(
+            api_key=api_key,
+            base_url=config.base_url or None,
+            model=config.model,
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+            reasoning_effort=config.reasoning_effort,
+            service_tier=config.service_tier or None,
+            extra_body=config.extra_body or None,
             retry_policy=config.retry_policy,
         )
 

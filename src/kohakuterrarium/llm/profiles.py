@@ -9,6 +9,10 @@ The backend types in use:
     openai    : OpenAI-compatible HTTP client. Used for OpenAI, OpenRouter,
                 Gemini, MiMo, and any user-defined provider that exposes a
                 ``/chat/completions`` interface.
+    openai_responses
+              : OpenAI Responses API-compatible HTTP client. Used for OpenAI
+                Platform or third-party proxies exposing ``/responses`` with
+                ordinary Bearer API keys.
     anthropic : Anthropic-compatible Messages API via the official
                 ``anthropic`` package (Claude, MiniMax, and compatible
                 proxies).
@@ -76,9 +80,11 @@ def save_backend(backend: LLMBackend) -> None:
     """Persist a user-defined provider.
 
     ``backend_type`` values are ``openai`` (OpenAI-compatible
-    ``/chat/completions``), ``anthropic`` (Anthropic-compatible Messages API),
-    and ``codex`` (ChatGPT-subscription OAuth). Legacy ``codex-oauth`` values
-    are normalized here so older API clients keep working.
+    ``/chat/completions``), ``openai_responses`` (OpenAI Responses
+    API-compatible ``/responses``), ``anthropic`` (Anthropic-compatible
+    Messages API), and ``codex`` (ChatGPT-subscription OAuth). Legacy
+    ``codex-oauth`` values are normalized here so older API clients keep
+    working.
     """
     backend.backend_type = validate_backend_type(backend.backend_type)
     data = _load_yaml()

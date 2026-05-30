@@ -37,6 +37,7 @@ from kohakuterrarium.llm.openai import (
     OPENROUTER_BASE_URL,
     OpenAIProvider,
 )
+from kohakuterrarium.llm.openai_responses import OpenAIResponsesProvider
 
 # Note: build_tool_schemas is NOT imported here to avoid circular imports
 # (llm.tools -> core.registry -> core.__init__ -> core.controller -> llm.tools).
@@ -54,6 +55,7 @@ __all__ = [
     "NativeToolCall",
     # OpenAI provider
     "OpenAIProvider",
+    "OpenAIResponsesProvider",
     "OPENAI_BASE_URL",
     "OPENROUTER_BASE_URL",
     # Anthropic provider

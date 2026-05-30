@@ -25,7 +25,7 @@ _BUILT_IN_BACKEND_NAMES = {
     "gemini",
     "mimo",
 }
-_SUPPORTED_BACKEND_TYPES = {"openai", "codex", "anthropic"}
+_SUPPORTED_BACKEND_TYPES = {"openai", "openai_responses", "codex", "anthropic"}
 
 
 def list_backends() -> list[dict[str, Any]]:

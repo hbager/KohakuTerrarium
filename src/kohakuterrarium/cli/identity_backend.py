@@ -19,7 +19,7 @@ def list_cli() -> int:
         print("No providers.")
         return 0
     print(
-        f"{'Name':<24} {'Backend':<10} {'Provider name':<16} "
+        f"{'Name':<24} {'Backend':<17} {'Provider name':<16} "
         f"{'Native tools':<22} {'Base URL'}"
     )
     print("-" * 110)
@@ -27,7 +27,7 @@ def list_cli() -> int:
         native = ",".join(sorted(entry.get("provider_native_tools") or [])) or "-"
         provider_name = entry.get("provider_name") or "-"
         print(
-            f"{entry['name']:<24} {entry['backend_type']:<10} "
+            f"{entry['name']:<24} {entry['backend_type']:<17} "
             f"{provider_name:<16} {native:<22} {entry['base_url']}"
         )
     return 0
@@ -41,7 +41,7 @@ def add_or_update_cli(name: str | None = None) -> int:
         return 1
     backend_type = _prompt_choice(
         "Backend type",
-        ["openai", "codex", "anthropic"],
+        ["openai", "openai_responses", "codex", "anthropic"],
         existing.backend_type if existing else "openai",
     )
     provider_name = _prompt(

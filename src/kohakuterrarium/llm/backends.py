@@ -9,6 +9,10 @@ A ``backend_type`` is a tiny enum of transport implementations:
     openai    : any OpenAI-compatible ``/chat/completions`` endpoint
                 (OpenAI, OpenRouter, Gemini's compat path, MiMo, and
                 user-defined proxies).
+    openai_responses
+              : any OpenAI Responses API-compatible ``/responses`` endpoint
+                using ordinary Bearer API keys (OpenAI Platform or
+                third-party compatible proxies).
     anthropic : Anthropic-compatible Messages API via the official
                 ``anthropic`` package (Claude, MiniMax's Anthropic path,
                 and compatible proxies).
@@ -60,7 +64,13 @@ _BUILTIN_PROVIDER_NAMES: set[str] = {
 # Historical values that appeared under a preset's ``provider`` field to
 # describe the backend type. They are now only valid as ``backend_type`` and
 # get rewritten on load (see ``_normalize_backend_type``).
-_LEGACY_BACKEND_TYPE_VALUES: set[str] = {"openai", "codex", "codex-oauth", "anthropic"}
+_LEGACY_BACKEND_TYPE_VALUES: set[str] = {
+    "openai",
+    "openai_responses",
+    "codex",
+    "codex-oauth",
+    "anthropic",
+}
 
 
 def _normalize_backend_type(value: str) -> str:
@@ -69,6 +79,8 @@ def _normalize_backend_type(value: str) -> str:
     - ``"codex-oauth"`` → ``"codex"`` (old name for the ChatGPT-OAuth backend)
     - ``"anthropic"`` stays ``"anthropic"`` and selects the native
       Anthropic-compatible Messages API provider.
+    - ``"openai_responses"`` selects an OpenAI Responses API-compatible
+      endpoint using ordinary API-key auth.
     - empty / unknown → ``"openai"`` (safe default for unconfigured data).
     """
     if value == "codex-oauth":
@@ -269,11 +281,11 @@ def load_backends() -> dict[str, LLMBackend]:
 def validate_backend_type(backend_type: str) -> str:
     """Return the canonical backend_type for a new/updated provider.
 
-    Raises ``ValueError`` on anything other than ``openai`` / ``anthropic`` /
-    ``codex`` (post-normalization — ``codex-oauth`` is accepted and silently
-    rewritten).
+    Raises ``ValueError`` on anything other than ``openai`` /
+    ``openai_responses`` / ``anthropic`` / ``codex`` (post-normalization —
+    ``codex-oauth`` is accepted and silently rewritten).
     """
     normalized = _normalize_backend_type(backend_type)
-    if normalized not in {"openai", "anthropic", "codex"}:
+    if normalized not in {"openai", "openai_responses", "anthropic", "codex"}:
         raise ValueError(f"Unsupported backend_type: {backend_type}")
     return normalized
