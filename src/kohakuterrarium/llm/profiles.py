@@ -178,6 +178,30 @@ def _resolve_preset(
     )
 
 
+def _dotted_get(data: dict[str, Any], path: str) -> Any:
+    node: Any = data
+    for part in path.split("."):
+        if not isinstance(node, dict) or part not in node:
+            return None
+        node = node[part]
+    return node
+
+
+def _infer_matching_variations(preset: LLMPreset | None) -> dict[str, str]:
+    if preset is None or not preset.variation_groups:
+        return {}
+    base = preset.to_dict()
+    selections: dict[str, str] = {}
+    for group_name, options in preset.variation_groups.items():
+        for option_name, patch in (options or {}).items():
+            if not patch:
+                continue
+            if all(_dotted_get(base, path) == value for path, value in patch.items()):
+                selections[group_name] = option_name
+                break
+    return selections
+
+
 def load_profiles() -> dict[tuple[str, str], LLMProfile]:
     backends = load_backends()
     profiles: dict[tuple[str, str], LLMProfile] = {}
@@ -426,6 +450,24 @@ def _get_preset_definition(name: str, provider: str = "") -> LLMPreset | None:
     return matches[0]
 
 
+def _default_variation_selections_for_base(
+    base_name: str, provider: str = ""
+) -> dict[str, str]:
+    default_name = get_default_model()
+    if not default_name:
+        return {}
+    default_base, explicit_selections = parse_variation_selector(default_name)
+    qualified_base = (
+        f"{provider}/{base_name}" if provider and "/" not in base_name else base_name
+    )
+    if qualified_base != default_base:
+        return {}
+    preset = _get_preset_definition(default_base)
+    selections = _infer_matching_variations(preset)
+    selections.update(explicit_selections)
+    return selections
+
+
 def _get_profile_from_selector(
     name: str,
     extra_selections: dict[str, str] | None = None,
@@ -526,8 +568,15 @@ def resolve_controller_llm(
 
     profile: LLMProfile | None = None
     if name:
+        base_name, selector_selections = parse_variation_selector(name)
+        merged_selections = dict(
+            _default_variation_selections_for_base(base_name, provider)
+        )
+        for group in selector_selections:
+            merged_selections.pop(group, None)
+        merged_selections.update(selection_overrides)
         profile = _get_profile_from_selector(
-            name, selection_overrides, provider=provider
+            name, merged_selections, provider=provider
         )
     elif raw_model:
         model_name, model_selector_selections = parse_variation_selector(raw_model)
@@ -544,7 +593,10 @@ def resolve_controller_llm(
     if profile is None and not name and not raw_model:
         default_name = get_default_model()
         if default_name:
-            profile = _get_profile_from_selector(default_name, selection_overrides)
+            base_default, _ = parse_variation_selector(default_name)
+            merged_defaults = _default_variation_selections_for_base(base_default)
+            merged_defaults.update(selection_overrides)
+            profile = _get_profile_from_selector(default_name, merged_defaults)
 
     if not profile:
         if name or raw_model:
@@ -662,16 +714,22 @@ def list_all() -> list[dict[str, Any]]:
         result.append(_entry(profile, definitions.get((provider, name)), "preset"))
 
     default = get_default_model()
-    default_provider, default_bare = _split_provider_prefix(default)
+    default_base, default_selections = parse_variation_selector(default) if default else ("", {})
+    default_provider, default_bare = _split_provider_prefix(default_base)
     for entry in result:
         is_default = False
-        if default:
+        if default_base:
             if default_provider:
                 is_default = (
                     entry["provider"] == default_provider
                     and entry["name"] == default_bare
                 )
             else:
-                is_default = entry["name"] == default or entry["model"] == default
+                is_default = entry["name"] == default_base or entry["model"] == default_base
         entry["is_default"] = is_default
+        if is_default:
+            preset = definitions.get((entry["provider"], entry["name"]))
+            entry["selected_variations"] = dict(
+                default_selections or _infer_matching_variations(preset)
+            )
     return result

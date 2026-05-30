@@ -17,7 +17,7 @@ vi.mock("@/utils/api", () => {
   }
 })
 
-import { sessionAPI } from "@/utils/api"
+import { agentAPI, sessionAPI, terrariumAPI } from "@/utils/api"
 import { useInstancesStore } from "./instances"
 
 beforeEach(() => {
@@ -149,5 +149,39 @@ describe("instances store", () => {
     expect(result.type).toBe("creature")
     expect(result.creatures.length).toBe(1)
     expect(result.creatures[0].name).toBe("alice")
+  })
+
+  it("passes the requested LLM selector when creating a creature session", async () => {
+    const store = useInstancesStore()
+    agentAPI.create.mockResolvedValue({ agent_id: "agent_1", session_id: "graph_1" })
+    sessionAPI.listActive.mockResolvedValue([])
+
+    const id = await store.create("creature", "creatures/general", "/repo", "alice", {
+      onNode: "worker-1",
+      llm: "openrouter/mimo-v2-pro",
+    })
+
+    expect(id).toBe("graph_1")
+    expect(agentAPI.create).toHaveBeenCalledWith("creatures/general", "/repo", "alice", {
+      onNode: "worker-1",
+      llm: "openrouter/mimo-v2-pro",
+    })
+  })
+
+  it("passes the requested LLM selector when creating a terrarium session", async () => {
+    const store = useInstancesStore()
+    terrariumAPI.create.mockResolvedValue({ terrarium_id: "graph_team" })
+    sessionAPI.listActive.mockResolvedValue([])
+
+    const id = await store.create("terrarium", "terrariums/team", "/repo", "team", {
+      onNode: "_host",
+      llm: "anthropic/claude-opus-4.7",
+    })
+
+    expect(id).toBe("graph_team")
+    expect(terrariumAPI.create).toHaveBeenCalledWith("terrariums/team", "/repo", "team", {
+      onNode: "_host",
+      llm: "anthropic/claude-opus-4.7",
+    })
   })
 })

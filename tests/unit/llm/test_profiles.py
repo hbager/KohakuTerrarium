@@ -285,6 +285,68 @@ class TestResolveControllerLlm:
         assert profile.provider == "anthropic"
         assert profile.name == "claude-opus-4.7"
 
+    def test_base_default_infers_matching_variations_for_runtime_identifier(self):
+        save_backend(LLMBackend(name="aaaaa", backend_type="openai_responses"))
+        save_profile(
+            LLMPreset(
+                name="gpt-5.5-custom",
+                model="gpt-5.5",
+                provider="aaaaa",
+                reasoning_effort="xhigh",
+                service_tier="priority",
+                variation_groups={
+                    "reasoning": {
+                        "none": {"reasoning_effort": "none"},
+                        "xhigh": {"reasoning_effort": "xhigh"},
+                    },
+                    "speed": {
+                        "normal": {},
+                        "fast": {"service_tier": "priority"},
+                    },
+                },
+            )
+        )
+        set_default_model("aaaaa/gpt-5.5-custom")
+
+        profile = resolve_controller_llm({})
+
+        assert (
+            profile_to_identifier(profile)
+            == "aaaaa/gpt-5.5-custom@reasoning=xhigh,speed=fast"
+        )
+
+    def test_default_base_llm_override_infers_matching_variations(self):
+        save_backend(LLMBackend(name="aaaaa", backend_type="openai_responses"))
+        save_profile(
+            LLMPreset(
+                name="gpt-5.5-custom",
+                model="gpt-5.5",
+                provider="aaaaa",
+                reasoning_effort="xhigh",
+                service_tier="priority",
+                variation_groups={
+                    "reasoning": {
+                        "none": {"reasoning_effort": "none"},
+                        "xhigh": {"reasoning_effort": "xhigh"},
+                    },
+                    "speed": {
+                        "normal": {},
+                        "fast": {"service_tier": "priority"},
+                    },
+                },
+            )
+        )
+        set_default_model("aaaaa/gpt-5.5-custom")
+
+        profile = resolve_controller_llm(
+            {}, llm_override="aaaaa/gpt-5.5-custom"
+        )
+
+        assert (
+            profile_to_identifier(profile)
+            == "aaaaa/gpt-5.5-custom@reasoning=xhigh,speed=fast"
+        )
+
     def test_retry_policy_override_deep_copied(self):
         policy = {"max_attempts": 5, "backoff": [1, 2]}
         profile = resolve_controller_llm(
@@ -355,6 +417,52 @@ class TestDefaultModel:
     def test_explicit_qualified_default_returned_verbatim(self):
         set_default_model("openrouter/mimo-v2-pro")
         assert get_default_model() == "openrouter/mimo-v2-pro"
+
+    def test_explicit_qualified_default_with_variations_returned_verbatim(self):
+        set_default_model("openrouter/mimo-v2-pro@reasoning=xhigh,speed=fast")
+        assert get_default_model() == "openrouter/mimo-v2-pro@reasoning=xhigh,speed=fast"
+
+    def test_default_badge_ignores_variation_suffix(self):
+        set_default_model("openrouter/mimo-v2-pro@reasoning=xhigh,speed=fast")
+        entries = list_all()
+        target = next(
+            entry
+            for entry in entries
+            if entry["provider"] == "openrouter" and entry["name"] == "mimo-v2-pro"
+        )
+        assert target["is_default"] is True
+
+    def test_default_base_preset_infers_matching_variations(self):
+        save_backend(LLMBackend(name="aaaaa", backend_type="openai_responses"))
+        save_profile(
+            LLMPreset(
+                name="gpt-5.5-custom",
+                model="gpt-5.5",
+                provider="aaaaa",
+                reasoning_effort="xhigh",
+                service_tier="priority",
+                variation_groups={
+                    "reasoning": {
+                        "none": {"reasoning_effort": "none"},
+                        "xhigh": {"reasoning_effort": "xhigh"},
+                    },
+                    "speed": {
+                        "normal": {},
+                        "fast": {"service_tier": "priority"},
+                    },
+                },
+            )
+        )
+        set_default_model("aaaaa/gpt-5.5-custom")
+
+        entries = list_all()
+        target = next(
+            entry
+            for entry in entries
+            if entry["provider"] == "aaaaa" and entry["name"] == "gpt-5.5-custom"
+        )
+
+        assert target["selected_variations"] == {"reasoning": "xhigh", "speed": "fast"}
 
     def test_explicit_bare_default_upgraded_to_qualified(self):
         # legacy bare default written by old builds. 'claude-opus-4.7'

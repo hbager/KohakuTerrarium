@@ -143,6 +143,7 @@ export const terrariumAPI = {
     const body = { config_path: configPath }
     if (pwd) body.pwd = pwd
     if (name) body.name = name
+    if (opts.llm) body.llm = opts.llm
     // Lab cluster site — backend defaults to "_host" if absent, so
     // standalone mode is unaffected.
     if (opts.onNode && opts.onNode !== "_host") body.on_node = opts.onNode
@@ -369,6 +370,7 @@ export const agentAPI = {
     const body = { config_path: configPath }
     if (pwd) body.pwd = pwd
     if (name) body.name = name
+    if (opts.llm) body.llm = opts.llm
     if (opts.onNode && opts.onNode !== "_host") body.on_node = opts.onNode
     const { data } = await api.post("/sessions/active/agents", body)
     return data

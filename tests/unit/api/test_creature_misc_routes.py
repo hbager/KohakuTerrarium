@@ -75,6 +75,16 @@ class TestSwitchModelRoute:
         assert resp.status_code == 200
         assert resp.json() == {"status": "switched", "model": "claude-opus"}
 
+    def test_success_returns_resolved_identifier(self):
+        svc = _FakeService(switch_returns="claude-opus@reasoning=xhigh")
+        client = _client(model_mod.router, svc)
+        resp = client.post("/sess/creatures/alice/model", json={"model": "claude-opus"})
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "status": "switched",
+            "model": "claude-opus@reasoning=xhigh",
+        }
+
     def test_unknown_creature(self):
         svc = _FakeService(creatures=[])
         client = _client(model_mod.router, svc)

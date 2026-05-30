@@ -31,6 +31,7 @@ import { defineStore } from "pinia"
 
 import { acquireScope, releaseScope } from "@/composables/useScope"
 import { attachAPI } from "@/utils/api"
+import { useChatStore } from "@/stores/chat"
 import { parseTabId } from "@/utils/tabsUrl"
 
 const RECENTLY_CLOSED_MAX = 10
@@ -42,6 +43,12 @@ const DASHBOARD_ID = "dashboard"
 
 function isDashboard(id) {
   return id === DASHBOARD_ID
+}
+
+function _activeTargetModel(tab) {
+  if (!tab?.target || !["attach", "inspector"].includes(tab.kind)) return ""
+  const chat = useChatStore(tab.target)
+  return chat.sessionInfo?.llmName || chat.modelDisplay || chat.sessionInfo?.model || ""
 }
 
 /** Read pinned ids from localStorage on store init. */
@@ -288,6 +295,7 @@ export const useTabsStore = defineStore("tabs", {
       // Lab cluster site to spawn / resume on.  Defaults to "_host";
       // standalone mode ignores the field.
       onNode = "_host",
+      llm = "",
     }) {
       // Lazy-import the instances/session APIs to keep tabs.js light
       // and avoid a Pinia init race in tests.
@@ -302,7 +310,10 @@ export const useTabsStore = defineStore("tabs", {
       } else {
         if (!configPath) throw new Error("createSession: configPath required")
         if (!pwd) throw new Error("createSession: pwd required")
-        id = await instances.create(kind, configPath, pwd, name, { onNode })
+        const inheritedLlm = llm || _activeTargetModel(this.activeTab)
+        const createOpts = { onNode }
+        if (inheritedLlm) createOpts.llm = inheritedLlm
+        id = await instances.create(kind, configPath, pwd, name, createOpts)
       }
       // Hydrate the instance so the tab has a config_name / type to show.
       let inst = null

@@ -77,15 +77,20 @@ class TestMutationOps:
         try:
             creature = adapter._engine.get_creature("alice")
             switched = []
+
+            def switch_model(model):
+                switched.append(model)
+                return f"{model}@reasoning=xhigh"
+
             creature.agent = SimpleNamespace(
                 is_running=False,
-                switch_model=lambda m: switched.append(m),
+                switch_model=switch_model,
                 config=SimpleNamespace(model="old"),
             )
             out = await adapter._dispatch(
                 _msg("switch_model", {"creature_id": "alice", "model": "new"})
             )
-            assert out == {"model": "new"}
+            assert out == {"model": "new@reasoning=xhigh"}
             # Setter path is taken — config is NOT mutated directly.
             assert switched == ["new"]
             assert creature.agent.config.model == "old"

@@ -74,6 +74,7 @@ class _MockAgent:
 
     def switch_model(self, model):
         self.config.model = model
+        return model
 
 
 class _MockCreature:
@@ -338,6 +339,12 @@ class TestPerCreatureOps:
         out = await svc.switch_model("cid", "new-model")
         assert out == "new-model"
         assert c.agent.config.model == "new-model"
+
+    async def test_switch_model_returns_resolved_identifier_from_agent(self):
+        svc, c = _build_service()
+        c.agent.switch_model = MagicMock(return_value="new-model@reasoning=xhigh")
+        out = await svc.switch_model("cid", "new-model")
+        assert out == "new-model@reasoning=xhigh"
 
     async def test_switch_model_fallback(self):
         svc, c = _build_service()

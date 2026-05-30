@@ -15,11 +15,10 @@
       </div>
       <el-button v-if="isBuiltin" size="small" type="primary" @click="$emit('clone')">Clone</el-button>
       <el-button v-if="isEditing && !isBuiltin" size="small" @click="$emit('cancel')">Close</el-button>
-      <el-button v-if="isEditing && !preset?.is_default" size="small" type="success" plain :title="t('settings.models.setDefaultHint')" @click="$emit('set-default', preset)">
+      <el-button v-if="isEditing" size="small" type="success" plain :title="t('settings.models.setDefaultHint')" @click="emitSetDefault">
         <span class="i-carbon-checkmark-filled mr-1" />
-        {{ t("settings.models.setAsDefault") }}
+        {{ preset?.is_default ? t("settings.models.isDefault") : t("settings.models.setAsDefault") }}
       </el-button>
-      <el-tag v-if="isEditing && preset?.is_default" type="success" size="small">{{ t("settings.models.isDefault") }}</el-tag>
     </div>
 
     <!-- Core section -->
@@ -278,8 +277,10 @@ function loadPreset(preset) {
   form.service_tier = preset.service_tier || ""
   form.extra_body = JSON.stringify(preset.extra_body || {}, null, 2)
   form.variation_groups = deserializeGroups(preset.variation_groups || {})
-  // reset preview to "base"
   Object.keys(previewSelection).forEach((k) => delete previewSelection[k])
+  for (const [group, option] of Object.entries(preset.selected_variations || {})) {
+    if (option) previewSelection[group] = option
+  }
 }
 
 function deserializeGroups(value) {
@@ -419,6 +420,22 @@ const preview = computed(() => {
 
 const previewJSON = computed(() => preview.value.json)
 const previewError = computed(() => preview.value.error)
+
+const selectedPreviewVariations = computed(() => {
+  const selections = {}
+  for (const [group, option] of Object.entries(previewSelection)) {
+    if (option) selections[group] = option
+  }
+  return selections
+})
+
+function emitSetDefault() {
+  if (!props.preset) return
+  emit("set-default", {
+    ...props.preset,
+    selected_variations: selectedPreviewVariations.value,
+  })
+}
 
 async function save() {
   if (!canSave.value) return

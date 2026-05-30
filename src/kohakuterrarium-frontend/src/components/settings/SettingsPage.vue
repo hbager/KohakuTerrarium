@@ -802,14 +802,25 @@ async function handleSavePreset(payload) {
   }
 }
 
+function modelSelectorForPreset(preset) {
+  if (!preset || !preset.name) return ""
+  const base = preset.provider ? `${preset.provider}/${preset.name}` : preset.name
+  const entries = Object.entries(preset.selected_variations || {})
+    .filter(([, value]) => value)
+    .sort(([a], [b]) => a.localeCompare(b))
+  if (!entries.length) return base
+  return `${base}@${entries.map(([group, option]) => `${group}=${option}`).join(",")}`
+}
+
 async function handleSetDefault(preset) {
-  if (!preset || !preset.name) return
+  const identifier = modelSelectorForPreset(preset)
+  if (!identifier) return
   try {
-    await settingsAPI.setDefaultModel(preset.name)
-    ElMessage.success(t("settings.models.defaultSet", { name: preset.name }))
+    await settingsAPI.setDefaultModel(identifier)
+    ElMessage.success(t("settings.models.defaultSet", { name: identifier }))
     await loadPresets()
     // Refresh the editor's bound preset so the badge flips.
-    const refreshed = (presets.value || []).find((p) => p.name === preset.name && p.provider === preset.provider)
+    const refreshed = (allPresets.value || []).find((p) => p.name === preset.name && p.provider === preset.provider)
     if (refreshed) editorPreset.value = refreshed
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || t("settings.models.defaultSetFailed"))

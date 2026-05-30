@@ -269,7 +269,8 @@ function resetDraftFromCurrent() {
   draftProvider.value = matched.provider || matched.login_provider || ""
   draftPreset.value = matched.name
   Object.keys(draftSelections).forEach((k) => delete draftSelections[k])
-  Object.entries(selections).forEach(([g, o]) => (draftSelections[g] = o))
+  const effectiveSelections = Object.keys(selections).length ? selections : matched.is_default ? matched.selected_variations || {} : {}
+  Object.entries(effectiveSelections).forEach(([g, o]) => (draftSelections[g] = o))
 }
 
 function selectProvider(provider) {
@@ -334,13 +335,14 @@ async function applySelection() {
       ElMessage.error("Select a creature first")
       return
     }
-    await terrariumAPI.switchCreatureModel(sid, target, modelName)
+    const result = await terrariumAPI.switchCreatureModel(sid, target, modelName)
+    const resolvedModel = result?.model || modelName
     await instances.fetchOne(id)
     if (chat.terrariumTarget === target || (inst?.creatures?.length || 0) <= 1) {
-      chat.sessionInfo.llmName = modelName
-      chat.sessionInfo.model = modelName
+      chat.sessionInfo.llmName = resolvedModel
+      chat.sessionInfo.model = resolvedModel
     }
-    ElMessage.success(`Switched to ${modelName}`)
+    ElMessage.success(`Switched to ${resolvedModel}`)
     popoverVisible.value = false
   } catch (err) {
     ElMessage.error(`Model switch failed: ${err?.message || err}`)
@@ -363,10 +365,7 @@ watch(currentModel, () => {
 let _cleanup = null
 onMounted(() => {
   loadModels()
-  const cleanups = [
-    onLayoutEvent(LAYOUT_EVENTS.MODEL_CONFIG_OPEN, () => (popoverVisible.value = true)),
-    onLayoutEvent(LAYOUT_EVENTS.MODEL_CATALOG_CHANGED, loadModels),
-  ]
+  const cleanups = [onLayoutEvent(LAYOUT_EVENTS.MODEL_CONFIG_OPEN, () => (popoverVisible.value = true)), onLayoutEvent(LAYOUT_EVENTS.MODEL_CATALOG_CHANGED, loadModels)]
   _cleanup = () => cleanups.forEach((cleanup) => cleanup())
 })
 onUnmounted(() => {

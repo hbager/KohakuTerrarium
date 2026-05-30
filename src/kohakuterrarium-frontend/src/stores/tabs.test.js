@@ -1,6 +1,34 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { createPinia, setActivePinia } from "pinia"
 
+const mockCreateSessionDeps = vi.hoisted(() => ({
+  chatByScope: new Map(),
+  instancesCreate: vi.fn(),
+  instancesFetchOne: vi.fn(),
+}))
+
+vi.mock("@/stores/instances", () => ({
+  useInstancesStore: () => ({
+    create: mockCreateSessionDeps.instancesCreate,
+    fetchOne: mockCreateSessionDeps.instancesFetchOne,
+    current: null,
+    list: [],
+  }),
+}))
+
+vi.mock("@/stores/chat", () => ({
+  useChatStore: (scope) =>
+    mockCreateSessionDeps.chatByScope.get(scope) || {
+      sessionInfo: { llmName: "", model: "" },
+      modelDisplay: "",
+      terrariumTarget: null,
+    },
+}))
+
+vi.mock("@/utils/api", () => ({
+  attachAPI: {},
+}))
+
 import { useTabsStore } from "./tabs.js"
 import { registerTabKind, tabKinds, inspectorInnerTabs, railGroups } from "./tabKindRegistry.js"
 
@@ -23,6 +51,9 @@ beforeEach(() => {
   tabKinds.clear()
   inspectorInnerTabs.clear()
   railGroups.clear()
+  mockCreateSessionDeps.chatByScope.clear()
+  mockCreateSessionDeps.instancesCreate.mockReset()
+  mockCreateSessionDeps.instancesFetchOne.mockReset()
   // Register the 8 built-in kinds with placeholder components so
   // ``loadFromStorage`` doesn't drop them when the snapshot is
   // round-tripped through the registry filter.
@@ -169,6 +200,75 @@ describe("tabs store — surface helpers", () => {
     await tabs.openSurface("alice", "inspector")
     await tabs.detach("alice")
     expect(tabs.tabs).toHaveLength(0)
+  })
+})
+
+describe("tabs store — createSession model inheritance", () => {
+  it("uses the active attach tab model as the LLM override for new sessions", async () => {
+    const tabs = useTabsStore()
+    tabs.openTab({ kind: "dashboard", id: "dashboard" })
+    tabs.openTab({ kind: "attach", id: "attach:agent_1", target: "agent_1" })
+    mockCreateSessionDeps.chatByScope.set("agent_1", {
+      sessionInfo: { llmName: "openrouter/mimo-v2-pro", model: "raw-model" },
+      modelDisplay: "openrouter/mimo-v2-pro",
+      terrariumTarget: null,
+    })
+    mockCreateSessionDeps.instancesCreate.mockResolvedValue("graph_new")
+    mockCreateSessionDeps.instancesFetchOne.mockResolvedValue({
+      id: "graph_new",
+      graph_id: "graph_new",
+      config_name: "new-agent",
+      type: "creature",
+    })
+
+    const id = await tabs.createSession({
+      kind: "creature",
+      configPath: "creatures/general",
+      pwd: "/repo",
+      name: "bob",
+    })
+
+    expect(id).toBe("graph_new")
+    expect(mockCreateSessionDeps.instancesCreate).toHaveBeenCalledWith(
+      "creature",
+      "creatures/general",
+      "/repo",
+      "bob",
+      { onNode: "_host", llm: "openrouter/mimo-v2-pro" },
+    )
+  })
+
+  it("uses the active inspector tab model as the LLM override for new sessions", async () => {
+    const tabs = useTabsStore()
+    tabs.openTab({ kind: "dashboard", id: "dashboard" })
+    tabs.openTab({ kind: "inspector", id: "inspect:agent_1", target: "agent_1" })
+    mockCreateSessionDeps.chatByScope.set("agent_1", {
+      sessionInfo: { llmName: "anthropic/claude-opus-4.7", model: "raw-model" },
+      modelDisplay: "anthropic/claude-opus-4.7",
+      terrariumTarget: null,
+    })
+    mockCreateSessionDeps.instancesCreate.mockResolvedValue("graph_new")
+    mockCreateSessionDeps.instancesFetchOne.mockResolvedValue({
+      id: "graph_new",
+      graph_id: "graph_new",
+      config_name: "new-agent",
+      type: "creature",
+    })
+
+    await tabs.createSession({
+      kind: "creature",
+      configPath: "creatures/general",
+      pwd: "/repo",
+      name: "bob",
+    })
+
+    expect(mockCreateSessionDeps.instancesCreate).toHaveBeenCalledWith(
+      "creature",
+      "creatures/general",
+      "/repo",
+      "bob",
+      { onNode: "_host", llm: "anthropic/claude-opus-4.7" },
+    )
   })
 })
 

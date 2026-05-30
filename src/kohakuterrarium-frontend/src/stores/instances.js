@@ -88,13 +88,15 @@ export const useInstancesStore = defineStore("instances", {
      * Both produce the same Session shape and end up in the same list.
      */
     async create(mode, configPath, pwd, name = null, opts = {}) {
-      const { onNode = "_host" } = opts
+      const { onNode = "_host", llm = "" } = opts
+      const createOpts = { onNode }
+      if (llm) createOpts.llm = llm
       if (mode === "terrarium") {
-        const { terrarium_id } = await terrariumAPI.create(configPath, pwd, name, { onNode })
+        const { terrarium_id } = await terrariumAPI.create(configPath, pwd, name, createOpts)
         await this.fetchAll()
         return terrarium_id
       }
-      const { agent_id, session_id } = await agentAPI.create(configPath, pwd, name, { onNode })
+      const { agent_id, session_id } = await agentAPI.create(configPath, pwd, name, createOpts)
       await this.fetchAll()
       // Prefer the canonical session_id when the backend surfaces it
       // (newer paths do), otherwise fall back to the historical

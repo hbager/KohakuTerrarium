@@ -844,9 +844,9 @@ class LocalTerrariumService:
     async def switch_model(self, creature_id: str, model: str) -> str:
         agent = self._agent(creature_id)
         if hasattr(agent, "switch_model"):
-            agent.switch_model(model)
-        else:
-            agent.config.model = model
+            resolved = agent.switch_model(model)
+            return str(resolved or model)
+        agent.config.model = model
         return model
 
     async def list_plugins(self, creature_id: str) -> list[dict[str, Any]]:

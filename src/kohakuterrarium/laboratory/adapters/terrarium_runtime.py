@@ -702,9 +702,9 @@ class TerrariumRuntimeAdapter:
                 await self._prewarm_profile_by_selector(model)
                 setter = getattr(creature.agent, "switch_model", None)
                 if callable(setter):
-                    setter(model)
-                else:
-                    creature.agent.config.model = model
+                    resolved = setter(model)
+                    return {"model": str(resolved or model)}
+                creature.agent.config.model = model
                 return {"model": model}
 
             case "list_plugins":
