@@ -2,6 +2,7 @@
 env
 .env
 /rule.md
+branch-change-report.md
 ideas/
 example_output/
 novel_log.txt
