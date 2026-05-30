@@ -155,8 +155,10 @@ class TestAttachMetaUpdates:
                 agents = store.meta["agents"]
                 assert "alice" in agents
                 assert "bob" in agents
-                # Two agents → promote to terrarium.
-                assert store.meta["config_type"] == "terrarium"
+                # A runtime group can contain multiple agents while still
+                # being rebuilt from a creature config; do not misclassify it
+                # as a terrarium recipe.
+                assert store.meta["config_type"] == "agent"
             finally:
                 store.close()
         finally:

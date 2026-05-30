@@ -286,8 +286,6 @@ def attach_session_store_for_creature(
                 if creature.agent.config.name not in meta_agents:
                     meta_agents.append(creature.agent.config.name)
                     existing.meta["agents"] = meta_agents
-                    if len(meta_agents) > 1:
-                        existing.meta["config_type"] = "terrarium"
                     _upsert_saved_session_index(existing)
             except Exception:
                 logger.debug("meta agent-list update skipped", exc_info=True)

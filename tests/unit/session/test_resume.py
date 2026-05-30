@@ -372,10 +372,38 @@ class TestDetectSessionType:
 
     def test_terrarium(self, tmp_path):
         path = tmp_path / "x.kohakutr.v2"
+        config_dir = tmp_path / "recipe"
+        config_dir.mkdir()
+        (config_dir / "terrarium.yaml").write_text("name: t\ncreatures: []\n", encoding="utf-8")
         store = SessionStore(str(path))
         try:
             store.meta["format_version"] = 2
-            store.init_meta("s", "terrarium", "/p", "/w", ["a"])
+            store.init_meta("s", "terrarium", str(config_dir), "/w", ["a"])
+        finally:
+            store.close()
+        assert detect_session_type(path) == "terrarium"
+
+    def test_runtime_group_with_creature_config_stays_agent(self, tmp_path):
+        path = tmp_path / "x.kohakutr.v2"
+        config_dir = tmp_path / "creature"
+        _write_agent_config(config_dir)
+        store = SessionStore(str(path))
+        try:
+            store.meta["format_version"] = 2
+            store.init_meta("s", "terrarium", str(config_dir), "/w", ["a", "b"])
+        finally:
+            store.close()
+        assert detect_session_type(path) == "agent"
+
+    def test_real_terrarium_with_agent_config_file_stays_terrarium(self, tmp_path):
+        path = tmp_path / "x.kohakutr.v2"
+        config_dir = tmp_path / "combo"
+        _write_agent_config(config_dir)
+        (config_dir / "terrarium.yaml").write_text("name: t\ncreatures: []\n", encoding="utf-8")
+        store = SessionStore(str(path))
+        try:
+            store.meta["format_version"] = 2
+            store.init_meta("s", "terrarium", str(config_dir), "/w", ["a", "b"])
         finally:
             store.close()
         assert detect_session_type(path) == "terrarium"
@@ -600,11 +628,12 @@ class TestResumeAgent:
         finally:
             store.close()
 
-    def test_rejects_non_agent_session(self, tmp_path, patched_llm):
-        config_dir = tmp_path / "creature"
-        _write_agent_config(config_dir)
+    def test_rejects_real_terrarium_session(self, tmp_path, patched_llm):
+        config_dir = tmp_path / "recipe"
+        config_dir.mkdir()
+        (config_dir / "terrarium.yaml").write_text("name: t\ncreatures: []\n", encoding="utf-8")
         path = self._make_session(tmp_path, config_dir, config_type="terrarium")
-        # A terrarium session must not resume through the agent path.
+        # A real terrarium session must not resume through the agent path.
         with pytest.raises(ValueError, match="terrarium"):
             resume_agent(path)
 
@@ -612,8 +641,9 @@ class TestResumeAgent:
         # The actionable error must name an entry point that ACTUALLY
         # exists today. The legacy ``terrarium.legacy_resume`` module
         # was deleted; pointing users there is a dead end.
-        config_dir = tmp_path / "creature"
-        _write_agent_config(config_dir)
+        config_dir = tmp_path / "recipe"
+        config_dir.mkdir()
+        (config_dir / "terrarium.yaml").write_text("name: t\ncreatures: []\n", encoding="utf-8")
         path = self._make_session(tmp_path, config_dir, config_type="terrarium")
         with pytest.raises(ValueError) as excinfo:
             resume_agent(path)
@@ -626,6 +656,16 @@ class TestResumeAgent:
             or "adopt_session" in message
             or "resume_into_engine" in message
         )
+
+    def test_misclassified_runtime_group_resumes_as_agent(self, tmp_path, patched_llm):
+        config_dir = tmp_path / "creature"
+        _write_agent_config(config_dir)
+        path = self._make_session(tmp_path, config_dir, config_type="terrarium")
+        agent, store = resume_agent(path)
+        try:
+            assert agent.config.name == "resumee"
+        finally:
+            store.close()
 
     def test_recipe_spawned_single_creature_meta_resumes_as_agent(
         self, tmp_path, patched_llm

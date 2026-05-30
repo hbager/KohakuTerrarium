@@ -9,6 +9,9 @@ import os
 from pathlib import Path
 from typing import Any
 
+from kohakuterrarium.core.config import _find_config_file
+from kohakuterrarium.terrarium.config import _find_terrarium_config
+
 from kohakuterrarium.builtins.inputs import create_builtin_input
 from kohakuterrarium.builtins.outputs import create_builtin_output
 from kohakuterrarium.core.agent import Agent
@@ -343,6 +346,10 @@ def resume_agent(
     # agree or a worker-side resume 502s with the very error this guard
     # used to raise.
     config_type = meta.get("config_type")
+    if config_type == "terrarium" and _looks_like_agent_config_path(
+        meta.get("config_path", "")
+    ):
+        config_type = "agent"
     if config_type not in (None, "", "agent"):
         raise ValueError(
             f"Session config_type is {config_type!r}, not 'agent'. "
@@ -421,6 +428,25 @@ def detect_session_type(session_path: str | Path) -> str:
     store = SessionStore(resolved)
     try:
         meta = store.load_meta()
-        return meta.get("config_type", "agent")
+        config_type = meta.get("config_type", "agent")
+        if config_type == "terrarium" and _looks_like_agent_config_path(
+            meta.get("config_path", "")
+        ):
+            return "agent"
+        return config_type
     finally:
         store.close()
+
+
+def _looks_like_agent_config_path(config_path: str) -> bool:
+    if not config_path:
+        return False
+    path = Path(config_path)
+    if not path.is_dir():
+        return False
+    try:
+        _find_terrarium_config(path)
+        return False
+    except FileNotFoundError:
+        pass
+    return _find_config_file(path) is not None
