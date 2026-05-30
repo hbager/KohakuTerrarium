@@ -11,8 +11,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from kohakuterrarium.bootstrap import agent_init as _agent_init
+from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.builtins.inputs.none import NoneInput
 from kohakuterrarium.terrarium import resume as resume_mod
+from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder, _FakeAgent
 from kohakuterrarium.terrarium.creature_host import Creature
 
@@ -212,5 +215,63 @@ class TestResumeIntoEngine:
             # The creature got renamed positionally to "bob".
             c = t.get_creature("alice")
             assert c.name == "bob"
+        finally:
+            await t.shutdown()
+
+    async def test_runtime_group_agent_path_rebuilds_all_saved_agents(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(resume_mod, "detect_session_type", lambda p: "agent")
+
+        def _fake_create(config, llm_override=None):
+            return ScriptedLLM(["OK"])
+
+        monkeypatch.setattr(_bootstrap_llm, "create_llm_provider", _fake_create)
+        monkeypatch.setattr(_agent_init, "create_llm_provider", _fake_create)
+
+        from kohakuterrarium.session.store import SessionStore
+
+        store_path = tmp_path / "group.kohakutr"
+        config_dir = tmp_path / "creature"
+        config_dir.mkdir()
+        (config_dir / "config.yaml").write_text(
+            "name: generic\n"
+            "controller:\n"
+            "  tool_format: bracket\n"
+            "  include_tools_in_prompt: false\n"
+            "  include_hints_in_prompt: false\n"
+            "system_prompt: test\n"
+            "input:\n"
+            "  type: none\n"
+            "output:\n"
+            "  type: stdout\n",
+            encoding="utf-8",
+        )
+        store = SessionStore(store_path)
+        try:
+            store.init_meta(
+                session_id="group",
+                config_type="terrarium",
+                config_path=str(config_dir),
+                pwd=str(tmp_path),
+                agents=["alice", "bob"],
+            )
+            store.save_conversation("alice", [{"role": "user", "content": "a"}])
+            store.save_conversation("bob", [{"role": "user", "content": "b"}])
+            store.flush()
+        finally:
+            store.close()
+
+        t = await TestTerrariumBuilder().build()
+        try:
+            t.attach_session = AsyncMock(wraps=t.attach_session)
+            gid = await resume_mod.resume_into_engine(t, store_path)
+            graph = t._topology.graphs[gid]
+            assert len(graph.creature_ids) == 2
+            assert {t.get_creature(cid).name for cid in graph.creature_ids} == {
+                "alice",
+                "bob",
+            }
+            t.attach_session.assert_awaited_once()
         finally:
             await t.shutdown()

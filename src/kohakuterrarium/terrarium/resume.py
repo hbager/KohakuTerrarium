@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING
 from kohakuterrarium.builtins.inputs.none import NoneInput
 from kohakuterrarium.session.resume import (
     _open_store_with_migration,
+    _rebuild_agent,
     detect_session_type,
     inject_saved_state,
     resume_agent,
@@ -92,6 +93,15 @@ async def _resume_agent_into_engine(
     the Studio / Lab spawn path; without it a worker-side resume boots
     a stdin reader with no TTY and wedges the worker.
     """
+    store = _open_store_with_migration(path)
+    meta = store.load_meta()
+    agents = list(meta.get("agents") or [])
+    if len(agents) > 1:
+        return await _resume_runtime_group_into_engine(
+            engine, store, meta, pwd=pwd, llm_override=llm_override
+        )
+    store.close()
+
     # session.resume.resume_agent does the heavy lifting: opens store
     # with migration, rebuilds Agent from the saved config, injects
     # every state slot, and calls agent.attach_session_store(store).
@@ -122,6 +132,63 @@ async def _resume_agent_into_engine(
         path=str(path),
     )
     return creature.graph_id
+
+
+async def _resume_runtime_group_into_engine(
+    engine: "Terrarium",
+    store: SessionStore,
+    meta: dict,
+    *,
+    pwd: str | None,
+    llm_override: str | None,
+) -> str:
+    config_path = meta.get("config_path", "")
+    config_snapshot = meta.get("config_snapshot") or {}
+    if not config_path and not config_snapshot:
+        store.close()
+        raise ValueError("Session has no config_path or config_snapshot in metadata")
+
+    effective_pwd = pwd or meta.get("pwd", ".")
+    if effective_pwd and os.path.isdir(effective_pwd):
+        os.chdir(effective_pwd)
+
+    sid: str | None = None
+    for agent_name in list(meta.get("agents") or []):
+        agent = _rebuild_agent(
+            config_path=config_path,
+            config_snapshot=config_snapshot,
+            llm_override=llm_override,
+            io_kwargs={"input_module": NoneInput()},
+        )
+        inject_saved_state(agent, store, agent_name)
+        creature_obj = Creature(
+            creature_id=_safe_creature_id(agent.config.name),
+            name=agent.config.name,
+            agent=agent,
+            config=agent.config,
+        )
+        creature = await engine.add_creature(
+            creature_obj,
+            graph=sid,
+            start=True,
+            suppress_io=True,
+        )
+        sid = creature.graph_id
+
+    if sid is None:
+        store.close()
+        raise ValueError("Session has no agents in metadata")
+    await engine.attach_session(sid, store)
+    store.update_status("running")
+    await _topo_snap.replay(engine, sid)
+
+    logger.info(
+        "Runtime group session resumed into engine",
+        session_id=sid,
+        path=str(store.path),
+        creatures=len(meta.get("agents") or []),
+    )
+    return sid
 
 
 async def _resume_terrarium_into_engine(
