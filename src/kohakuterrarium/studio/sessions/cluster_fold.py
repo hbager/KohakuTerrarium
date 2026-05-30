@@ -323,7 +323,7 @@ def persist_cluster_members_to_mirror(
                 if hasattr(tmp_store, "checkpoint"):
                     tmp_store.checkpoint()
             finally:
-                tmp_store.close()
+                tmp_store.close(update_status=False)
         except Exception as e:  # pragma: no cover - defensive
             logger.debug(
                 "CF-6: failed to persist cluster_members",

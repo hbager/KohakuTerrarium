@@ -131,6 +131,51 @@ class TestSessionMirrorWriter:
         finally:
             writer.close()
 
+    def test_close_preserves_mirrored_last_active(self, tmp_path):
+        node = _FakeNode()
+        writer = SessionMirrorWriter(node, tmp_path / "mirror")
+        old_last_active = "2026-05-01T00:00:00+00:00"
+        store = writer.store_for("sess-1")
+        store.init_meta(
+            session_id="sess-1",
+            config_type="agent",
+            config_path="/cfg",
+            pwd="/work",
+            agents=["alice"],
+        )
+        store.meta["last_active"] = old_last_active
+
+        writer.close()
+
+        reopened = SessionStore(str(tmp_path / "mirror" / "sess-1.kohakutr"))
+        try:
+            assert reopened.meta["last_active"] == old_last_active
+        finally:
+            reopened.close(update_status=False)
+
+    def test_lru_eviction_preserves_mirrored_last_active(self, tmp_path):
+        node = _FakeNode()
+        writer = SessionMirrorWriter(node, tmp_path / "mirror", max_open_stores=1)
+        old_last_active = "2026-05-01T00:00:00+00:00"
+        store = writer.store_for("sess-1")
+        store.init_meta(
+            session_id="sess-1",
+            config_type="agent",
+            config_path="/cfg",
+            pwd="/work",
+            agents=["alice"],
+        )
+        store.meta["last_active"] = old_last_active
+
+        writer.store_for("sess-2")
+
+        reopened = SessionStore(str(tmp_path / "mirror" / "sess-1.kohakutr"))
+        try:
+            assert reopened.meta["last_active"] == old_last_active
+        finally:
+            reopened.close(update_status=False)
+            writer.close()
+
     def test_max_open_stores_at_least_one(self, tmp_path):
         node = _FakeNode()
         # Passing 0 should be clamped to 1.

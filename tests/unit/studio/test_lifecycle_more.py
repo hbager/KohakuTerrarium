@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from kohakuterrarium.studio.sessions import lifecycle
+from kohakuterrarium.studio.sessions import cluster_fold, lifecycle
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.terrarium.service import LocalTerrariumService, CreatureInfo
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder, _FakeAgent
@@ -251,6 +251,53 @@ class TestStartTerrariumPackageRef:
             assert captured["path"] == "/resolved/recipe.yaml"
         finally:
             await engine.shutdown()
+
+
+# ── cluster fold persistence keeps saved timestamps ───────────
+
+
+class TestClusterFoldPersistence:
+    def test_persist_members_does_not_touch_last_active(self, tmp_path):
+        from kohakuterrarium.session.store import SessionStore
+
+        mirror_dir = tmp_path / "mirrors"
+        mirror_dir.mkdir()
+        old_last_active = "2026-05-01T00:00:00+00:00"
+        old_created_at = "2026-04-30T00:00:00+00:00"
+        for sid in ("sid-a", "sid-b"):
+            store = SessionStore(str(mirror_dir / f"{sid}.kohakutr"))
+            try:
+                store.init_meta(
+                    session_id=sid,
+                    config_type="agent",
+                    config_path="",
+                    pwd="",
+                    agents=[sid],
+                )
+                store.meta["created_at"] = old_created_at
+                store.meta["last_active"] = old_last_active
+                store.flush()
+            finally:
+                store.close(update_status=False)
+
+        service = SimpleNamespace(
+            _cluster_links={
+                frozenset({("node-a", "sid-a"), ("node-b", "sid-b")})
+            }
+        )
+
+        cluster_fold.persist_cluster_members_to_mirror(service, "sid-a", mirror_dir)
+
+        for sid in ("sid-a", "sid-b"):
+            store = SessionStore(str(mirror_dir / f"{sid}.kohakutr"))
+            try:
+                assert store.meta["last_active"] == old_last_active
+                assert store.meta["cluster_members"] == [
+                    {"sid": "sid-a", "on_node": "node-a"},
+                    {"sid": "sid-b", "on_node": "node-b"},
+                ]
+            finally:
+                store.close(update_status=False)
 
 
 # ── list_sessions filter: on_node None (368) ──────────────────

@@ -266,7 +266,7 @@ class SessionMirrorWriter:
         self._node.unregister_app_extension(NAMESPACE)
         for store in self._stores.values():
             try:
-                store.close()
+                store.close(update_status=False)
             except Exception:  # pragma: no cover - defensive
                 logger.exception("session-sync: failed to close mirror store")
         self._stores.clear()
@@ -306,7 +306,7 @@ class SessionMirrorWriter:
             oldest_id, oldest_store = next(iter(self._stores.items()))
             self._stores.pop(oldest_id, None)
             try:
-                oldest_store.close()
+                oldest_store.close(update_status=False)
             except Exception:  # pragma: no cover - defensive
                 logger.exception(
                     "session-sync: failed to close evicted mirror store %r",
