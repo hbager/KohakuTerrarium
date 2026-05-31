@@ -15,7 +15,17 @@ import threading
 import time
 from pathlib import Path
 
-from kohakuterrarium.utils.logging import configure_utf8_stdio, get_logger, set_level
+import uvicorn
+
+from kohakuterrarium.api.app import create_app
+from kohakuterrarium.packages.locations import PACKAGES_DIR, get_package_root
+from kohakuterrarium.packages.walk import list_packages
+from kohakuterrarium.utils.logging import (
+    configure_utf8_stdio,
+    enable_stderr_logging,
+    get_logger,
+    set_level,
+)
 
 logger = get_logger(__name__)
 
@@ -31,9 +41,6 @@ def _resolve_config_dirs() -> tuple[list[str], list[str]]:
       2. Installed packages (``~/.kohakuterrarium/packages/``)
       3. Local project dirs (``creatures/``, ``terrariums/`` in project root)
     """
-    from kohakuterrarium.packages.locations import PACKAGES_DIR, get_package_root
-    from kohakuterrarium.packages.walk import list_packages
-
     creatures: list[str] = []
     terrariums: list[str] = []
 
@@ -123,8 +130,6 @@ def start_uvicorn_with_port_fallback(
     The thread is daemonised so the process can exit cleanly when the
     webview window closes.
     """
-    import uvicorn
-
     last_exc: Exception | None = None
     for offset in range(max_tries):
         port = requested_port + offset
@@ -229,11 +234,17 @@ def run_web_server(
     """
     configure_utf8_stdio(log=True)
 
-    import uvicorn
-
-    from kohakuterrarium.api.app import create_app
-
     set_level(log_level)
+    # Mirror kohakuterrarium logs to stderr so the daemon's redirected
+    # stderr (~/.kohakuterrarium/run/web.log) captures BOTH uvicorn AND
+    # our own logger output. Without this, ``kt serve logs`` shows only
+    # uvicorn — our INFO logs (e.g. "Event buffered for mid-turn
+    # injection", "Drained N mid-turn buffered event(s)") get
+    # silently routed to a separate file (~/.kohakuterrarium/logs/kt.log)
+    # the user has no reason to know about. Idempotent: if stderr
+    # logging is already on (foreground path), this just resets the
+    # level.
+    enable_stderr_logging(log_level)
     static_dir = None if dev else WEB_DIST_DIR
 
     if not dev and not (static_dir and static_dir.is_dir()):
@@ -382,6 +393,7 @@ def _run_desktop_app_blocking(port: int = 8001, log_level: str = "INFO") -> None
             pass
 
     set_level(log_level)
+    enable_stderr_logging(log_level)
 
     try:
         import webview
@@ -389,8 +401,6 @@ def _run_desktop_app_blocking(port: int = 8001, log_level: str = "INFO") -> None
         print("pywebview is required for 'kt app'.")
         print("Install: pip install 'KohakuTerrarium[desktop]'")
         sys.exit(1)
-
-    from kohakuterrarium.api.app import create_app
 
     if not WEB_DIST_DIR.is_dir():
         logger.error(

@@ -5,7 +5,7 @@
  *   Phase 3 — kind: "inspector"
  *   Phase 4 — kind: "dashboard"
  *   Phase 5 — kinds: "attach", "session-viewer", "studio-editor",
- *             "catalog", "settings", "code-editor", "graph-editor"
+ *             "catalog", "settings", "code-editor"
  */
 
 import { registerTabKind, registerInspectorInnerTab } from "@/stores/tabKindRegistry"
@@ -25,13 +25,9 @@ import CatalogTab from "@/components/shell/tabs/CatalogTab.vue"
 import ExtensionsTab from "@/components/shell/tabs/ExtensionsTab.vue"
 import SettingsTab from "@/components/shell/tabs/SettingsTab.vue"
 import CodeEditorTab from "@/components/shell/tabs/CodeEditorTab.vue"
-import GraphEditorTab from "@/components/graph-editor/GraphEditorTab.vue"
+import AdminTab from "@/components/shell/tabs/AdminTab.vue"
 
 let _registered = false
-
-export function _resetBuiltinTabKindsForTests() {
-  _registered = false
-}
 
 export function registerBuiltinTabKinds() {
   if (_registered) return
@@ -83,5 +79,7 @@ export function registerBuiltinTabKinds() {
   registerTabKind({ kind: "extensions", component: ExtensionsTab })
   registerTabKind({ kind: "settings", component: SettingsTab })
   registerTabKind({ kind: "code-editor", component: CodeEditorTab })
-  registerTabKind({ kind: "graph-editor", component: GraphEditorTab })
+  // Admin portal (L4 user/invitation/token management). The launcher is
+  // gated on the admin role in the rail; the tab itself re-checks.
+  registerTabKind({ kind: "admin", component: AdminTab })
 }

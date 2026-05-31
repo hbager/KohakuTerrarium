@@ -53,6 +53,7 @@ from kohakuterrarium.api.routes.catalog import creatures as catalog_creatures
 from kohakuterrarium.api.routes.catalog import creatures_scan as catalog_creatures_scan
 from kohakuterrarium.api.routes.catalog import extensions as catalog_extensions
 from kohakuterrarium.api.routes.catalog import manifest as catalog_manifest
+from kohakuterrarium.api.routes.catalog import marketplace as catalog_marketplace
 from kohakuterrarium.api.routes.catalog import models as catalog_models
 from kohakuterrarium.api.routes.catalog import modules as catalog_modules
 from kohakuterrarium.api.routes.catalog import packages as catalog_packages
@@ -109,6 +110,7 @@ from kohakuterrarium.api.routes.sessions_v2 import memory as sessions_memory
 from kohakuterrarium.api.routes.sessions_v2 import topology as sessions_topology
 from kohakuterrarium.api.routes.sessions_v2 import wiring as sessions_wiring
 from kohakuterrarium.api.studio import build_studio_router
+from kohakuterrarium.studio.persistence.session_index import close_session_index
 from kohakuterrarium.api.ws import daemon_logs as ws_daemon_logs
 from kohakuterrarium.api.ws import files as ws_files
 from kohakuterrarium.api.ws import io as ws_io
@@ -328,6 +330,15 @@ async def lifespan(app: FastAPI):
                 await host_engine.stop()
             except Exception:  # pragma: no cover - defensive
                 logger.exception("host_engine.stop failed")
+
+        # Release the session-index sidecar's native SQLite handles.
+        # Doing it here (last) means any other shutdown step that
+        # touches the listing endpoint (e.g. a final reconcile) still
+        # has the index open.
+        try:
+            close_session_index()
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("close_session_index failed")
 
 
 def _parse_bind(bind: str) -> tuple[str, int]:
@@ -605,6 +616,15 @@ def _mount_phase0_stubs(app: FastAPI) -> None:
     )
     app.include_router(
         catalog_registry.router, prefix="/api/catalog/registry", tags=["catalog"]
+    )
+    # Marketplace — TerrariumMarket-backed browse + install + source mgmt.
+    # Separate from /api/catalog/registry (which is the legacy bundled
+    # static index) — this one hits live remote sources via
+    # ``packages/marketplace.py``.
+    app.include_router(
+        catalog_marketplace.router,
+        prefix="/api/catalog/marketplace",
+        tags=["catalog"],
     )
     app.include_router(
         catalog_creatures_scan.router,

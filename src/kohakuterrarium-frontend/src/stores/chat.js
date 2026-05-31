@@ -11,7 +11,7 @@ import { useNotificationsStore } from "@/stores/notifications"
 import { useStatusStore } from "@/stores/status"
 import { translate } from "@/utils/i18n"
 import { useLocaleStore } from "@/stores/locale"
-import { getHybridPrefSync, setHybridPref } from "@/utils/uiPrefs"
+import { getHybridPrefSync, removeHybridPref, setHybridPref } from "@/utils/uiPrefs"
 import { wsUrl } from "@/utils/wsUrl"
 
 const BRANCH_RESYNC_DELAY_MS = 350
@@ -51,11 +51,41 @@ function contentSignature(content) {
   return JSON.stringify(normalized)
 }
 
+function textSignature(content) {
+  // Coarser comparator used as a fallback by ``_handleUserInputInjected``
+  // when the strict ``contentSignature`` comparison fails. Strips
+  // multimodal parts and trims whitespace so a queue entry whose
+  // ``contentParts`` slightly differs from the backend's drained
+  // ``data.content`` (extra image part, mismatched dict-vs-typed
+  // shape, trailing whitespace) still matches by the text the user
+  // actually typed. Returns ``""`` when no text content present.
+  if (typeof content === "string") return content.trim()
+  if (!Array.isArray(content)) return ""
+  return content
+    .filter((p) => p && typeof p === "object" && p.type === "text")
+    .map((p) => String(p.text || "").trim())
+    .join("\n")
+    .trim()
+}
+
 function toolResultPayload(result, data = {}) {
+  // Backend flattens whitelisted metadata fields onto the top level
+  // of the WS frame (see ``_STREAM_METADATA_KEYS`` in
+  // studio/attach/_event_stream.py) — including ``canvas_preview``.
+  // History events do the same shape: canvas_preview lives at the
+  // top level of the persisted ``tool_result`` event row. The FE's
+  // ``resultMeta`` is the unified bag we expose to renderers, so
+  // fold the flat keys back into a nested object here. Without this,
+  // ``data.metadata`` is undefined and the canvas store never picks
+  // the file preview up (Feat 1 wire-up bug).
+  let resultMeta = data.result_meta || data.output_meta || data.metadata || null
+  if (data.canvas_preview && (!resultMeta || !resultMeta.canvas_preview)) {
+    resultMeta = { ...(resultMeta || {}), canvas_preview: data.canvas_preview }
+  }
   return {
     result,
     resultParts: normalizeContentParts(result),
-    resultMeta: data.result_meta || data.output_meta || data.metadata || null,
+    resultMeta,
   }
 }
 
@@ -200,7 +230,6 @@ function _resolveSelectedBranches(events, parentPaths, branchView) {
   const turns = [...branchesByTurn.keys()].sort((a, b) => a - b)
   for (const ti of turns) {
     const candidates = branchesByTurn.get(ti).filter((entry) => _pathMatches(entry.path, selected))
-    if (!candidates.length) continue
     if (branchView && Object.prototype.hasOwnProperty.call(branchView, ti)) {
       const requested = branchView[ti]
       const match = candidates.find((entry) => entry.branch === requested)
@@ -208,7 +237,19 @@ function _resolveSelectedBranches(events, parentPaths, branchView) {
         selected.set(ti, match.branch)
         continue
       }
+      // Honor the override STRICTLY even when no candidate carries the
+      // requested branch yet. Edit-regen / regenerate set ``branchView``
+      // to a predicted branch BEFORE the backend's events arrive; the
+      // previous ``Math.max(candidates)`` fallback flipped the render
+      // back to the OLD branch during that gap, which the user
+      // reported as "previous branch content suddenly displayed".
+      // Returning ``requested`` keeps the predicted branch sticky;
+      // ``liveIds`` then renders empty for that (turn, branch) until
+      // the real events land. The next resync rebuilds correctly.
+      selected.set(ti, requested)
+      continue
     }
+    if (!candidates.length) continue
     selected.set(ti, Math.max(...candidates.map((entry) => entry.branch)))
   }
   return selected
@@ -306,18 +347,19 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
   if (!events?.length) return { messages: _convertHistory(messages), pendingJobs: {} }
 
   events = _dedupeAdjacentDuplicateEvents(events)
+  // Drop ``_synthetic_resume``-marked events emitted by the backend's
+  // ``normalize_resumable_events`` when it sees an unfinished
+  // tool_call / subagent_call AND the caller failed to flag that job
+  // as live. These synthetic terminals were the source of Bug 1: a
+  // background-promoted sub-agent (no longer in ``_direct_job_meta``
+  // but still alive in ``subagent_manager``) was wrongly synthesized
+  // as ``interrupted`` and the running bubble flipped to "interrupted
+  // by session resume". The defensive fix is on the FE side because
+  // backend can lag in tracking promoted jobs; the still-live jobs
+  // then fall through to the pendingJobs sweep below and surface
+  // as "running" with no terminal event consumed.
+  events = events.filter((evt) => !evt?._synthetic_resume)
   const { byTurn, liveIds, branchSelection } = _collectBranchMetadata(events, branchView)
-
-  const userMessageEventIds = new Map()
-  for (const evt of events) {
-    if (evt?.type !== "user_message") continue
-    const ti = evt.turn_index
-    const bi = evt.branch_id
-    const eid = evt.event_id
-    if (typeof ti === "number" && typeof bi === "number" && typeof eid === "number") {
-      userMessageEventIds.set(`${ti}/${bi}`, eid)
-    }
-  }
 
   // Pre-pass: compact_replace ranges hide every event whose event_id
   // falls inside the replaced range. Mirrors Python replay_conversation
@@ -343,23 +385,10 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
   const startedJobs = {} // jobId -> tool part reference
   const completedJobs = new Set() // jobIds that received done/error
 
-  function messageId(prefix, evt, fallbackIndex = result.length) {
-    const ti = evt?.turn_index
-    const bi = evt?.branch_id
-    let eid = evt?.event_id
-    if (prefix === "u" && typeof ti === "number" && typeof bi === "number") {
-      eid = userMessageEventIds.get(`${ti}/${bi}`) ?? eid
-    }
-    if (typeof ti === "number" && typeof bi === "number" && typeof eid === "number") {
-      return `${prefix}_${ti}_${bi}_${eid}`
-    }
-    return `h_${fallbackIndex}`
-  }
-
-  function ensureCur(anchorEvt = null) {
+  function ensureCur() {
     if (!cur) {
       cur = {
-        id: messageId("a", anchorEvt),
+        id: "h_" + result.length,
         role: "assistant",
         parts: [],
         timestamp: "",
@@ -369,8 +398,8 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
     return cur
   }
 
-  function appendText(content, anchorEvt = null) {
-    const c = ensureCur(anchorEvt)
+  function appendText(content) {
+    const c = ensureCur()
     const tail = c.parts.length ? c.parts[c.parts.length - 1] : null
     if (tail && tail.type === "text") {
       tail.content += content
@@ -379,8 +408,8 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
     }
   }
 
-  function addTool(name, kind, args, jobId, anchorEvt = null) {
-    const c = ensureCur(anchorEvt)
+  function addTool(name, kind, args, jobId) {
+    const c = ensureCur()
     const tail = c.parts.length ? c.parts[c.parts.length - 1] : null
     if (tail && tail.type === "text") tail._streaming = false
     // Sub-agents run asynchronously in the background — the assistant
@@ -639,15 +668,42 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
       cur = null
       const normalized = normalizeMessageContent(evt.content)
       result.push({
-        id: messageId("u", evt),
+        id: "h_" + result.length,
         role: "user",
         content: normalized.content,
         contentParts: normalized.contentParts,
         timestamp: "",
       })
+    } else if (t === "user_input_injected") {
+      // Mid-turn injection (Feat 3) — the user typed during processing
+      // and the backend folded it into the running turn. Distinct
+      // event type because it shares (turn, branch) with the trigger
+      // that started the turn and would collide with the dedupe above.
+      //
+      // Order invariant: this bubble lands AFTER the assistant that
+      // was streaming when it arrived, and the next text_chunk starts
+      // a FRESH assistant after it. Without resetting ``cur``, every
+      // subsequent text part would keep folding into the round-1
+      // assistant — yielding [user(A), user(B), assistant("to-A to-B")]
+      // instead of [user(A), assistant("to-A"), user(B), assistant("to-B")].
+      if (cur) {
+        for (const p of cur.parts) {
+          if (p.type === "text") p._streaming = false
+        }
+      }
+      cur = null
+      const normalized = normalizeMessageContent(evt.content)
+      result.push({
+        id: "h_" + result.length,
+        role: "user",
+        content: normalized.content,
+        contentParts: normalized.contentParts,
+        injectedMidTurn: true,
+        timestamp: "",
+      })
     } else if (t === "processing_start") {
       cur = {
-        id: messageId("a", evt),
+        id: "h_" + result.length,
         role: "assistant",
         parts: [],
         timestamp: "",
@@ -656,7 +712,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
     } else if (t === "text" || t === "text_chunk") {
       // text_chunk is the Wave C per-chunk streaming format; replay
       // collapses consecutive chunks into one assistant text part.
-      appendText(evt.content || "", evt)
+      appendText(evt.content || "")
     } else if (t === "processing_end" || t === "idle") {
       // Do NOT clear cur if sub-agents might still be adding tools to this message
       // But mark text as done
@@ -703,7 +759,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
           timestamp: "",
         })
       } else if (at === "subagent_start") {
-        addTool(evt.name, "subagent", evt.args || { info: evt.detail }, evt.job_id, evt)
+        addTool(evt.name, "subagent", evt.args || { info: evt.detail }, evt.job_id)
       } else if (at === "subagent_done") {
         updateTool(
           evt.name,
@@ -736,12 +792,12 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
           evt.job_id,
         )
       } else if (at === "tool_start") {
-        addTool(evt.name, "tool", evt.args || { info: evt.detail }, evt.job_id, evt)
+        addTool(evt.name, "tool", evt.args || { info: evt.detail }, evt.job_id)
       } else if (at === "tool_done") {
         updateTool(
           evt.name,
           evt.result || evt.output || evt.detail,
-          { tools_used: evt.tools_used },
+          { tools_used: evt.tools_used, canvas_preview: evt.canvas_preview },
           evt.job_id,
         )
       } else if (at === "tool_error") {
@@ -804,7 +860,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
         timestamp: "",
       })
     } else if (t === "tool_call") {
-      addTool(evt.name, "tool", evt.args || {}, evt.call_id || evt.job_id, evt)
+      addTool(evt.name, "tool", evt.args || {}, evt.call_id || evt.job_id)
     } else if (t === "tool_result") {
       updateTool(
         evt.name,
@@ -816,11 +872,16 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
           output_meta: evt.output_meta,
           result_meta: evt.result_meta,
           metadata: evt.metadata,
+          // Backend persists canvas_preview at the top level of the
+          // tool_result event row (session/output._handle_tool_done).
+          // Forward it so updateTool's resultMeta picks it up — that's
+          // what the canvas store later reads (Feat 1).
+          canvas_preview: evt.canvas_preview,
         },
         evt.call_id || evt.job_id,
       )
     } else if (t === "subagent_call") {
-      addTool(evt.name, "subagent", { task: evt.task || "" }, evt.job_id, evt)
+      addTool(evt.name, "subagent", { task: evt.task || "" }, evt.job_id)
     } else if (t === "subagent_result") {
       updateTool(
         evt.name,
@@ -1104,6 +1165,154 @@ function _parseArgs(args) {
   return args
 }
 
+// ─── Multi-chat-panel group tree helpers (Option E) ──────────────
+//
+// A *group* is the unit of chat surface — one ``ChatPanel`` instance
+// in the workspace. A *groupTree* is a binary split-tree over group
+// ids that mirrors the workspace ``LayoutNode`` shape so the same
+// rendering pattern applies recursively. ``groupTree`` is per-scope
+// and lives entirely in the chat store; the workspace layout tree
+// is NOT involved.
+//
+//   leaf  ->  { type: "leaf", groupId: "g_<n>" }
+//   split ->  { type: "split", direction: "horizontal" | "vertical",
+//                ratio: 0-100, children: [Node, Node] }
+//
+// Helpers here are pure (no store mutation, no side effects) so
+// vitest can pin each one against synthetic trees. Actions in the
+// store mutate via these and persist the result.
+
+/** Depth-first walk over a group tree. ``visit(groupId, path)`` runs
+ *  on every leaf in tree-traversal order. ``path`` is an array of
+ *  child indices used by the resize-handle path lookup. */
+function _walkGroupTree(tree, visit, path = []) {
+  if (!tree) return
+  if (tree.type === "leaf") {
+    visit(tree.groupId, path)
+    return
+  }
+  if (tree.type === "split") {
+    _walkGroupTree(tree.children?.[0], visit, [...path, 0])
+    _walkGroupTree(tree.children?.[1], visit, [...path, 1])
+  }
+}
+
+/** Return the first leaf's groupId in tree-traversal order. */
+function _firstLeafGroupId(tree) {
+  let found = null
+  _walkGroupTree(tree, (gid) => {
+    if (found == null) found = gid
+  })
+  return found
+}
+
+/** Find the path (array of child indices) to the leaf with the given
+ *  groupId. Returns ``null`` if not present. */
+function _findLeafPath(tree, groupId, path = []) {
+  if (!tree) return null
+  if (tree.type === "leaf") return tree.groupId === groupId ? path : null
+  if (tree.type === "split") {
+    const left = _findLeafPath(tree.children?.[0], groupId, [...path, 0])
+    if (left) return left
+    return _findLeafPath(tree.children?.[1], groupId, [...path, 1])
+  }
+  return null
+}
+
+/** Split the leaf with id ``targetGroupId`` into a split node. The
+ *  new group lands on the side indicated by ``edge`` (``"before"`` =
+ *  left/top, ``"after"`` = right/bottom). Returns a new tree.
+ *  No-op if ``targetGroupId`` is not present. */
+function _splitTreeLeaf(tree, targetGroupId, direction, edge, newGroupId) {
+  if (!tree) return tree
+  if (tree.type === "leaf") {
+    if (tree.groupId !== targetGroupId) return tree
+    const movedLeaf = { type: "leaf", groupId: newGroupId }
+    const keptLeaf = { type: "leaf", groupId: tree.groupId }
+    const children = edge === "before" ? [movedLeaf, keptLeaf] : [keptLeaf, movedLeaf]
+    return { type: "split", direction, ratio: 50, children }
+  }
+  if (tree.type === "split") {
+    return {
+      ...tree,
+      children: [
+        _splitTreeLeaf(tree.children?.[0], targetGroupId, direction, edge, newGroupId),
+        _splitTreeLeaf(tree.children?.[1], targetGroupId, direction, edge, newGroupId),
+      ],
+    }
+  }
+  return tree
+}
+
+/** Remove the leaf with the given groupId, collapsing the surviving
+ *  sibling into the parent's slot. Returns the new tree (possibly
+ *  ``null`` if the last leaf was removed). */
+function _pruneTreeLeaf(tree, groupId) {
+  if (!tree) return null
+  if (tree.type === "leaf") {
+    return tree.groupId === groupId ? null : tree
+  }
+  if (tree.type === "split") {
+    const left = _pruneTreeLeaf(tree.children?.[0], groupId)
+    const right = _pruneTreeLeaf(tree.children?.[1], groupId)
+    if (!left && !right) return null
+    if (!left) return right
+    if (!right) return left
+    return { ...tree, children: [left, right] }
+  }
+  return tree
+}
+
+/** Mutate a split's ``ratio`` at the given path, IN PLACE.
+ *
+ *  Why in-place: during a splitter drag, the ratio updates on every
+ *  pointermove. If we replaced ``groupTree`` with a fresh object on
+ *  every move, Vue would unmount + remount the recursive
+ *  ``ChatGroupNode`` tree — the in-flight pointer capture lives on
+ *  the OLD handle's DOM node, so the drag would break after the
+ *  first move. Mutating in place keeps the DOM stable and the
+ *  pointer capture intact. Pinia's reactive proxy still detects the
+ *  mutation on the nested object, so the ``:style`` bindings update.
+ *
+ *  Silent no-op if the path doesn't point at a split node. */
+function _setSplitRatio(tree, path, ratio) {
+  if (!tree || !Array.isArray(path)) return
+  if (path.length === 0) {
+    if (tree.type !== "split") return
+    tree.ratio = Math.max(10, Math.min(90, ratio))
+    return
+  }
+  if (tree.type !== "split") return
+  const [idx, ...rest] = path
+  if (idx !== 0 && idx !== 1) return
+  _setSplitRatio(tree.children?.[idx], rest, ratio)
+}
+
+/** Union of all tabs across the tree, in stable tree-traversal order,
+ *  de-duplicated. */
+function _unionGroupTabs(groups, tree) {
+  if (!tree) return []
+  const out = []
+  const seen = new Set()
+  _walkGroupTree(tree, (gid) => {
+    const g = groups?.[gid]
+    if (!g || !Array.isArray(g.tabs)) return
+    for (const t of g.tabs) {
+      if (seen.has(t)) continue
+      seen.add(t)
+      out.push(t)
+    }
+  })
+  return out
+}
+
+/** Storage key for the per-scope group state. ``scope`` is the
+ *  store's ``_instanceId`` (creature_id or terrarium_id), or
+ *  ``"default"`` for the v1 singleton path. */
+function _groupStorageKey(scope) {
+  return `kt.chat.groupTree.${scope || "default"}`
+}
+
 /**
  * Chat store options. The same options block is fed into a Pinia
  * factory below — one store per scope id (creature_id /
@@ -1186,8 +1395,15 @@ const _chatStoreOptions = {
     /** Connection status for the single instance WS. Used by the UI to
      *  show "reconnecting" banners. "open" | "reconnecting" | "closed" */
     wsStatus: "closed",
-    /** @type {Array<{id: string, content: string, timestamp: string}>} Messages queued while agent is processing */
-    queuedMessages: [],
+    /**
+     * Per-tab user-message queue. Messages submitted while the target
+     * tab is mid-stream sit here until ``_promoteQueuedMessages`` flushes
+     * them into the main message list — and they MUST be tab-scoped so
+     * typing into tab A while tab A's agent is busy does not show a
+     * "queued" banner on tabs B/C the user happens to look at.
+     * @type {Object<string, Array<{id: string, content: string, timestamp: string}>>}
+     */
+    queuedMessagesByTab: {},
     /** @type {number} Monotonic token to ignore stale history/WS callbacks after instance switches */
     _instanceGeneration: 0,
     /** @type {Record<string, number>} Recent user message signatures for cross-tab dedupe */
@@ -1196,6 +1412,52 @@ const _chatStoreOptions = {
     _branchResyncPendingByTab: {},
     /** @type {Record<string, number>} Debounce timers for post-branch history resync */
     _branchResyncTimers: {},
+    /**
+     * Per-tab streaming target — the (turn_index, branch_id) the
+     * backend is currently writing to. Set by ``regenerateLastResponse`` /
+     * ``editMessage`` BEFORE the new chunks land, cleared on
+     * ``processing_end``. Two consumers:
+     *
+     * 1. WS frame routing — text / tool_* / subagent_* frames carry a
+     *    ``branch_id`` (backend-tagged in studio/attach/_event_stream.py).
+     *    Frames whose ``branch_id`` doesn't match the user's currently-
+     *    viewed branch for the streaming turn are dropped from the live
+     *    mutation path — they would otherwise corrupt the sibling
+     *    branch the user actually has on screen. The events are still
+     *    persisted by SessionOutput, so a switch back to the streaming
+     *    branch resyncs the missed content.
+     *
+     * 2. KohakUwUing visibility — only shown when the viewed branch IS
+     *    the one currently generating; the indicator follows the
+     *    running branch, not the tab.
+     * @type {Record<string, {turnIndex: number, branchId: number} | null>}
+     */
+    _streamingBranchByTab: {},
+
+    // ── Multi-chat-panel state (Option E) ───────────────────────
+    //
+    // When ``groupTree`` is ``null`` the chat panel runs in legacy
+    // single-group mode and reads/writes ``tabs``/``activeTab``
+    // directly — visually byte-identical to pre-Option-E. Once the
+    // user explicitly splits (or enables groups), ``groupTree`` is
+    // populated and ``ChatPanelContainer`` switches to rendering the
+    // recursive ``ChatGroupNode``. Every group-mutating action also
+    // syncs ``tabs`` / ``activeTab`` for the legacy readers (chat
+    // store internals, ``SessionHistoryViewer``, scripted-history
+    // viewer, etc.) so the two stay in lock-step.
+    //
+    // Persisted per-scope to ``localStorage[kt.chat.groupTree.<scope>]``.
+
+    /**
+     * @type {Record<string, { tabs: string[], activeTab: string | null, draftText: string }>}
+     */
+    groups: {},
+    /** @type {object | null} */
+    groupTree: null,
+    /** @type {string | null} */
+    focusedGroupId: null,
+    /** Monotonic counter for synthesising new group ids. Persisted. */
+    _groupCounter: 0,
   }),
 
   getters: {
@@ -1217,6 +1479,45 @@ const _chatStoreOptions = {
     /** True when any tab is currently streaming. */
     anyProcessing: (state) => Object.values(state.processingByTab).some(Boolean),
     /**
+     * Per-tab queued-message accessor. Templates that previously read
+     * ``chat.queuedMessages`` should switch to ``chat.activeQueuedMessages``
+     * so the "Queued" banner only appears on the tab where the message
+     * is waiting — typing into tab A's busy stream must not surface a
+     * banner on tab B.
+     */
+    activeQueuedMessages: (state) => {
+      const tab = state.activeTab
+      if (!tab) return []
+      return state.queuedMessagesByTab[tab] || []
+    },
+    /**
+     * True when the active tab is currently generating AND the user is
+     * viewing the very branch that's being generated. The "KohakUwUing..."
+     * label binds to this — a regen / edit-rerun that opens branch 2 is
+     * still generating in the background when the user clicks <1/2> to
+     * see the old branch, but the label belongs to branch 2 (the running
+     * one), not the bubble on screen. Without this gate the label would
+     * mis-attach to whichever branch happens to be visible.
+     *
+     * Defaults to plain ``processing`` when no streaming-branch target
+     * is set (legacy bursts, tail regens that don't carry branch info).
+     */
+    viewingRunningBranch: (state) => {
+      const tab = state.activeTab
+      if (!tab || !state.processingByTab[tab]) return false
+      const target = state._streamingBranchByTab[tab]
+      if (!target) return true
+      const view = state.branchViewByTab[tab]
+      // No explicit override means "latest branch" — the latest branch
+      // for the streaming turn IS the streaming branch, since the
+      // backend always opens a fresh max_branch+1. So an unset view
+      // implies the user is on the running branch.
+      if (!view || !Object.prototype.hasOwnProperty.call(view, target.turnIndex)) {
+        return true
+      }
+      return view[target.turnIndex] === target.branchId
+    },
+    /**
      * Canonical display form of the active model, preferring the
      * ``provider/name[@variations]`` identifier so every display surface
      * shows the same string the user types into ``/model``. Falls back
@@ -1233,6 +1534,12 @@ const _chatStoreOptions = {
       if (!tab || tab.startsWith("ch:")) return null
       return tab
     },
+    /** True when the chat surface is running in multi-group mode (the
+     *  user explicitly split or enabled groups). When false the chat
+     *  panel runs in legacy single-group mode. */
+    groupsActive: (state) => state.groupTree != null,
+    /** The currently-focused group's record, or ``null``. */
+    focusedGroup: (state) => state.groups[state.focusedGroupId] || null,
   },
 
   actions: {
@@ -1298,11 +1605,22 @@ const _chatStoreOptions = {
       this.tokenUsage = {}
       this.runningJobs = {}
       this.unreadCounts = {}
-      this.queuedMessages = []
+      this.queuedMessagesByTab = {}
       this.processingByTab = {}
       this._recentUserInputs = {}
       this._branchResyncPendingByTab = {}
+      this._streamingBranchByTab = {}
       this._clearBranchResyncTimers()
+      // Reset multi-group state — group tree is per-scope, so a
+      // different ``_instanceId`` means a different layout to load.
+      // ``ChatPanelContainer`` calls ``_loadGroupState()`` on mount
+      // after this re-init lands, so saved state for the new scope
+      // is restored without races against the legacy ``_addTab``
+      // calls below.
+      this.groups = {}
+      this.groupTree = null
+      this.focusedGroupId = null
+      this._groupCounter = 0
       this.sessionInfo = {
         sessionId: instance.session_id || instance.id || "",
         model: instance.model || "",
@@ -1380,6 +1698,31 @@ const _chatStoreOptions = {
         this.tabs.push(key)
         this.messagesByTab[key] = []
       }
+      // When groups are active, also drop the tab into the focused
+      // group so backend ``creature_added`` events surface in the
+      // group the user is currently looking at. The ``_syncLegacy…``
+      // call at the end re-derives ``tabs`` from groups, but since
+      // we already pushed above the union order matches the legacy
+      // append. No-op if already present in any group.
+      if (this.groupTree) {
+        let present = false
+        for (const g of Object.values(this.groups)) {
+          if (g.tabs.includes(key)) {
+            present = true
+            break
+          }
+        }
+        if (!present) {
+          const targetId = this.focusedGroupId || _firstLeafGroupId(this.groupTree)
+          if (targetId && this.groups[targetId]) {
+            this.groups[targetId].tabs.push(key)
+            if (!this.groups[targetId].activeTab) {
+              this.groups[targetId].activeTab = key
+            }
+          }
+        }
+        this._syncLegacyFromGroups()
+      }
     },
 
     closeTab(tab) {
@@ -1390,12 +1733,42 @@ const _chatStoreOptions = {
         this.setActiveTab(this.tabs[Math.min(idx, this.tabs.length - 1)] || null)
       }
       this._saveTabs()
+      // Mirror removal into groups when active. ``pruneTab`` already
+      // syncs legacy state — we've done that ourselves above, so call
+      // it after the legacy mutation to keep groups authoritative.
+      if (this.groupTree) {
+        // Snapshot ids to avoid mutation during iteration.
+        const ids = Object.keys(this.groups)
+        for (const gid of ids) {
+          const g = this.groups[gid]
+          if (!g) continue
+          const i2 = g.tabs.indexOf(tab)
+          if (i2 === -1) continue
+          g.tabs.splice(i2, 1)
+          if (g.activeTab === tab) g.activeTab = g.tabs[0] || null
+          if (g.tabs.length === 0) this.removeGroup(gid)
+        }
+        this._syncLegacyFromGroups()
+        this._persistGroupState()
+      }
     },
 
     setActiveTab(tab) {
       this.activeTab = tab
       if (tab) delete this.unreadCounts[tab]
       this._saveTabs()
+      // Mirror to the focused group when groups are active so the
+      // status bar / model switcher / per-group reads stay in sync.
+      // Only updates the focused group; a different group's
+      // ``activeTab`` is unaffected (use ``setGroupActiveTab`` for
+      // explicit per-group changes).
+      if (this.groupTree && this.focusedGroupId) {
+        const g = this.groups[this.focusedGroupId]
+        if (g && tab && g.tabs.includes(tab) && g.activeTab !== tab) {
+          g.activeTab = tab
+          this._persistGroupState()
+        }
+      }
       // Lazy-load history for any newly-focused empty tab. The
       // session endpoint accepts ``(session_id, creature_name)``
       // for both solo and multi-creature sessions, so there's
@@ -1452,9 +1825,13 @@ const _chatStoreOptions = {
 
       this._recentUserInputs[`${tab}:${signature}`] = now
       if (this.processingByTab[tab]) {
-        // Don't put in main chat — hold in queue, shown above input box
+        // Don't put in main chat — hold in this tab's queue, shown
+        // above the input box. The queue is per-tab so a busy stream
+        // on tab A never surfaces a "queued" banner on tab B (Bug 3).
         msg.queued = true
-        this.queuedMessages.push(msg)
+        msg.queuedTab = tab
+        if (!this.queuedMessagesByTab[tab]) this.queuedMessagesByTab[tab] = []
+        this.queuedMessagesByTab[tab].push(msg)
       } else {
         this._addMsg(tab, msg)
       }
@@ -1728,9 +2105,27 @@ const _chatStoreOptions = {
         if (source && !this.processingByTab[source]) {
           this.processingByTab[source] = true
         }
-        this._appendStreamChunk(source, data.content)
+        // Branch isolation — only mutate ``messagesByTab`` when this
+        // chunk belongs to the branch the user is currently viewing.
+        // Off-branch chunks (e.g. user clicked <1/2> to see the old
+        // branch while branch 2 is still streaming) are dropped from
+        // the live mutation path; SessionOutput already persists them
+        // and a switch back to the streaming branch will resync.
+        if (this._frameMatchesViewedBranch(source, data)) {
+          this._appendStreamChunk(source, data.content)
+        }
       } else if (data.type === "processing_start") {
         if (source) this.processingByTab[source] = true
+        // Update the streaming-branch target whenever the backend
+        // tells us which (turn, branch) it just started on. The
+        // optimistic prediction we made in regenerate/editMessage
+        // gets corrected here if the real branch differs.
+        if (source && typeof data.turn_index === "number" && typeof data.branch_id === "number") {
+          this._streamingBranchByTab[source] = {
+            turnIndex: data.turn_index,
+            branchId: data.branch_id,
+          }
+        }
         // Promote queued user messages (agent is now processing them)
         this._promoteQueuedMessages(source)
       } else if (data.type === "processing_end") {
@@ -1935,8 +2330,41 @@ const _chatStoreOptions = {
         return
       }
 
+      if (at === "user_input_injected") {
+        // Feat 3 — backend just folded a buffered user_input into
+        // the current turn. Clear the matching queued banner and
+        // surface the message in the chat as a normal user bubble.
+        // Branch-isolation: only relevant for the viewed branch.
+        if (this._frameMatchesViewedBranch(source, data)) {
+          this._handleUserInputInjected(source, data)
+        }
+        return
+      }
+
+      if (at === "interrupt") {
+        // The agent's controller was cancelled mid-turn (user clicked
+        // interrupt, or the backend's flush-after-interrupt promoted
+        // buffered events into fresh turns). The FE's queue MUST clear
+        // here — otherwise the queued banner sticks forever because the
+        // expected ``user_input_injected`` activity never fires for the
+        // cancelled turn. Promotes the queue into chat history so the
+        // user still sees what they typed; the next turn (started by
+        // the agent's flush-after-interrupt) will pick those messages
+        // up as fresh inputs.
+        this._promoteQueuedMessages(source)
+        return
+      }
+
       // Ensure we have a tab for this source
       if (!this.messagesByTab[source]) return
+      // Branch isolation — every remaining activity below mutates the
+      // displayed message list. If this frame is for a branch the user
+      // isn't currently viewing (e.g. branch 2 is streaming while the
+      // user clicked back to branch 1), DROP the mutation; the event is
+      // still persisted server-side and the next resync picks it up
+      // when the user switches back. Frames without branch metadata
+      // pass through (legacy / non-per-turn activity).
+      if (!this._frameMatchesViewedBranch(source, data)) return
       const msgs = this.messagesByTab[source]
 
       if (at === "wire_inbound") {
@@ -2255,6 +2683,130 @@ const _chatStoreOptions = {
       this._branchResyncTimers = {}
     },
 
+    /**
+     * Decide whether an incoming WS frame's ``(turn_index, branch_id)``
+     * matches the branch the user is currently viewing for that turn.
+     *
+     * Backend frames now carry ``turn_index`` / ``branch_id``; legacy
+     * frames don't. The contract:
+     *
+     *   - Frame has no ``branch_id`` → trusted (legacy stream, assume
+     *     it's for the active branch — most callers have nothing else
+     *     to compare against).
+     *   - Frame's ``branch_id`` matches the user's branch selection
+     *     for that turn (or matches the default-latest when no
+     *     explicit selection) → trusted.
+     *   - Otherwise → reject, return false. The caller drops the
+     *     mutation; the chunk is still persisted server-side and a
+     *     branch switch + resync will surface it later.
+     */
+    _frameMatchesViewedBranch(tab, data) {
+      const fb = data?.branch_id
+      const ft = data?.turn_index
+      if (typeof fb !== "number" || typeof ft !== "number") return true
+      const view = this.branchViewByTab[tab]
+      if (view && Object.prototype.hasOwnProperty.call(view, ft)) {
+        return view[ft] === fb
+      }
+      // No explicit override — the replay defaults each turn to its
+      // latest branch. The streaming target is by construction the
+      // latest branch of its turn (the backend opens max+1 before
+      // emitting any chunk), so an unset view aligns with "viewing
+      // the running branch".
+      const streaming = this._streamingBranchByTab[tab]
+      if (streaming && streaming.turnIndex === ft) {
+        return streaming.branchId === fb
+      }
+      // Fall back to the per-tab branch metadata: latest known branch
+      // for this turn IS what the user sees by default.
+      const cached = this.eventsByTab[tab]
+      if (cached) {
+        let latest = 0
+        for (const evt of cached) {
+          if (evt?.turn_index === ft && typeof evt?.branch_id === "number") {
+            if (evt.branch_id > latest) latest = evt.branch_id
+          }
+        }
+        if (latest > 0) return latest === fb
+      }
+      return true
+    },
+
+    /**
+     * Splice synthetic ``user_input`` + ``user_message`` events for a
+     * newly-opened branch into ``eventsByTab[tab]`` so the chevron
+     * navigator promotes to ``<N/M>`` the instant Save & Rerun / Retry
+     * fires — instead of waiting for the post-turn history resync.
+     * The injected events get fenced with negative ``event_id`` so
+     * the next real resync recognises them as placeholders and the
+     * canonical ones from the backend take over without duplication.
+     *
+     * Caller is responsible for setting ``branchViewByTab[tab][turnIndex]``
+     * to the new branch and calling ``_rebuildMessages`` afterwards.
+     * Returns ``true`` when the splice landed, ``false`` if turn /
+     * branch metadata were missing (callers can still proceed; the
+     * navigator will catch up on resync).
+     */
+    _injectOptimisticBranch(tab, { turnIndex, branchId, content }) {
+      if (!tab || typeof turnIndex !== "number" || typeof branchId !== "number") {
+        return false
+      }
+      const events = this.eventsByTab[tab] || []
+      // Compute parent_branch_path snapshot from currently-selected
+      // branches of prior turns, so the optimistic event's path matches
+      // what the backend will write (otherwise the path-aware replay
+      // hides this branch when the user has chosen non-latest branches
+      // on earlier turns).
+      const view = this.branchViewByTab[tab] || {}
+      const latestByTurn = new Map()
+      for (const evt of events) {
+        const ti = evt?.turn_index
+        const bi = evt?.branch_id
+        if (typeof ti !== "number" || typeof bi !== "number") continue
+        const prev = latestByTurn.get(ti) || 0
+        if (bi > prev) latestByTurn.set(ti, bi)
+      }
+      const parentPath = []
+      for (const [ti, latest] of latestByTurn) {
+        if (ti >= turnIndex) continue
+        const chosen = Object.prototype.hasOwnProperty.call(view, ti) ? view[ti] : latest
+        parentPath.push([ti, chosen])
+      }
+      parentPath.sort((a, b) => a[0] - b[0])
+      // Negative event ids so the natural-number ones the backend
+      // assigns sort after these; the next resync overwrites the cache
+      // wholesale, so the negatives are inherently transient.
+      const baseId = -Date.now()
+      const userInput = {
+        type: "user_input",
+        content,
+        event_id: baseId,
+        turn_index: turnIndex,
+        branch_id: branchId,
+        parent_branch_path: parentPath,
+        _optimistic: true,
+      }
+      const userMessage = {
+        type: "user_message",
+        content,
+        event_id: baseId - 1,
+        turn_index: turnIndex,
+        branch_id: branchId,
+        parent_branch_path: parentPath,
+        _optimistic: true,
+      }
+      const processingStart = {
+        type: "processing_start",
+        event_id: baseId - 2,
+        turn_index: turnIndex,
+        branch_id: branchId,
+        parent_branch_path: parentPath,
+        _optimistic: true,
+      }
+      this.eventsByTab[tab] = [...events, userInput, userMessage, processingStart]
+      return true
+    },
+
     _conversationUserPosition(tab, messageIdx) {
       const msgs = this.messagesByTab[tab] || []
       if (messageIdx == null || messageIdx < 0 || messageIdx >= msgs.length) return null
@@ -2290,6 +2842,24 @@ const _chatStoreOptions = {
       }
       this._markBranchResyncPending(tab)
       const msgs = this.messagesByTab[tab] || []
+      // Resolve the target user message + its turn so we can predict
+      // the freshly-opened branch and promote the chevron navigator
+      // before the backend round-trip completes.
+      let targetUserMsg = null
+      let resolvedTurnIndex = turnIndex
+      if (turnIndex != null) {
+        targetUserMsg = msgs.find((m) => m?.role === "user" && m.turnIndex === turnIndex)
+      } else {
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          if (msgs[i]?.role === "user") {
+            targetUserMsg = msgs[i]
+            if (typeof targetUserMsg.turnIndex === "number") {
+              resolvedTurnIndex = targetUserMsg.turnIndex
+            }
+            break
+          }
+        }
+      }
       // Locally splice for instant feedback. With a specific
       // ``turnIndex`` (retry on non-tail), cut from the matching
       // user message onward so the user sees just-the-rerun-target
@@ -2310,6 +2880,42 @@ const _chatStoreOptions = {
         }
       }
       if (cutAt < msgs.length) msgs.splice(cutAt)
+      // Snapshot state BEFORE the optimistic mutation so the catch
+      // block can roll back cleanly when the API call fails. Without
+      // this the tab gets stuck showing KohakUwUing forever (no WS
+      // processing_end will fire if the backend never started a turn).
+      const previousEvents = this.eventsByTab[tab]
+      const previousBranchView =
+        tab && this.branchViewByTab[tab] ? { ...this.branchViewByTab[tab] } : null
+      const previousStreaming = tab ? this._streamingBranchByTab[tab] : null
+      const previousProcessing = !!this.processingByTab[tab]
+      // Optimistic branch promotion: when we know the turn AND its
+      // current latest branch, synthesise placeholder events into the
+      // event log so the navigator promotes to <N+1/N+1> immediately
+      // and the KohakUwUing label binds to the right branch. The next
+      // resync replaces these with canonical backend events.
+      const predictedBranch =
+        typeof targetUserMsg?.latestBranch === "number" ? targetUserMsg.latestBranch + 1 : null
+      let optimisticApplied = false
+      if (typeof resolvedTurnIndex === "number" && predictedBranch != null) {
+        const originalContent = targetUserMsg?.contentParts || targetUserMsg?.content || ""
+        const injected = this._injectOptimisticBranch(tab, {
+          turnIndex: resolvedTurnIndex,
+          branchId: predictedBranch,
+          content: originalContent,
+        })
+        if (injected) {
+          if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
+          this.branchViewByTab[tab][resolvedTurnIndex] = predictedBranch
+          this._streamingBranchByTab[tab] = {
+            turnIndex: resolvedTurnIndex,
+            branchId: predictedBranch,
+          }
+          this.processingByTab[tab] = true
+          this._rebuildMessages(tab)
+          optimisticApplied = true
+        }
+      }
       try {
         const { agentAPI } = await import("@/utils/api")
         // For terrarium: session_id = the terrarium's id, creature_id =
@@ -2318,15 +2924,42 @@ const _chatStoreOptions = {
         // Unified routing — every session has a graph_id and creatures
         // keyed by name. Solo sessions just have a 1-creature roster.
         const [sid, cid] = [this._instanceGraphId, tab]
-        // Pass current branch selection so the backend can retry on
-        // an older branch correctly (otherwise the agent's in-memory
-        // is on whatever branch it last ran and the retry silently
-        // targets that branch's tail).
-        const branchView = this.branchViewByTab[tab] || null
-        await agentAPI.regenerate(sid, cid, { turnIndex, branchView })
+        // Pass the user's ORIGINAL branch view (pre-optimistic) so the
+        // backend reloads its in-memory conversation under the subtree
+        // the user was actually viewing. The predicted-branch override
+        // we set above is only for our own navigator; the backend
+        // doesn't know about it yet (it opens that branch itself).
+        const branchView = previousBranchView
+        const regenResponse = await agentAPI.regenerate(sid, cid, {
+          turnIndex,
+          branchView,
+        })
+        if (regenResponse?.branch_id != null && regenResponse?.turn_index != null) {
+          // Trust the backend's exact branch_id over our prediction —
+          // the latest seen by the user might lag the persisted state
+          // (e.g. another tab also branched this turn before us). Re-
+          // select the navigator and the streaming target to match.
+          const realTurn = regenResponse.turn_index
+          const realBranch = regenResponse.branch_id
+          if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
+          if (this.branchViewByTab[tab][realTurn] !== realBranch) {
+            this.branchViewByTab[tab][realTurn] = realBranch
+          }
+          this._streamingBranchByTab[tab] = { turnIndex: realTurn, branchId: realBranch }
+        }
         await this._resyncHistory(tab)
       } catch (e) {
         console.warn("Failed to regenerate:", e)
+        if (optimisticApplied && tab) {
+          if (previousEvents == null) delete this.eventsByTab[tab]
+          else this.eventsByTab[tab] = previousEvents
+          if (previousBranchView != null) this.branchViewByTab[tab] = previousBranchView
+          else delete this.branchViewByTab[tab]
+          if (previousStreaming != null) this._streamingBranchByTab[tab] = previousStreaming
+          else delete this._streamingBranchByTab[tab]
+          this.processingByTab[tab] = previousProcessing
+          this._rebuildMessages(tab)
+        }
         this._scheduleBranchResync(tab)
       } finally {
         this._regenInFlight = false
@@ -2363,95 +2996,133 @@ const _chatStoreOptions = {
             ? { [turnIndex]: expectedLatestBranch + 1 }
             : {},
       })
-      let targetMessageIdx = null
+      let validTarget = false
       if (tab) {
         const msgs = this.messagesByTab[tab] || []
-        const isUserAt = (idx) => idx >= 0 && idx < msgs.length && msgs[idx]?.role === "user"
-        if (isUserAt(messageIdx)) {
-          targetMessageIdx = messageIdx
-        } else if (turnIndex != null || userPosition != null) {
-          if (turnIndex != null) {
-            const idx = msgs.findIndex((msg) => msg?.role === "user" && msg?.turnIndex === turnIndex)
-            if (idx !== -1) targetMessageIdx = idx
-          }
-          if (targetMessageIdx == null && userPosition != null) {
-            let seen = -1
-            for (let i = 0; i < msgs.length; i++) {
-              if (msgs[i]?.role !== "user") continue
-              seen += 1
-              if (seen === userPosition) {
-                targetMessageIdx = i
-                break
-              }
-            }
-          }
-        }
-        if (targetMessageIdx != null) {
-          userPosition = userPosition ?? this._conversationUserPosition(tab, targetMessageIdx)
+        if (messageIdx >= 0 && messageIdx < msgs.length && msgs[messageIdx]?.role === "user") {
+          validTarget = true
+          userPosition = userPosition ?? this._conversationUserPosition(tab, messageIdx)
           // Back-compat fallback for servers that only understand the
           // URL index: count rendered conversation rows, excluding
           // decorations. New servers prefer turnIndex/userPosition.
           backendIdx = 0
-          for (let i = 0; i < targetMessageIdx; i++) {
+          for (let i = 0; i < messageIdx; i++) {
             const r = msgs[i]?.role
             if (r === "user" || r === "assistant") backendIdx += 1
           }
         }
       }
-      if (targetMessageIdx == null && turnIndex == null && userPosition == null) {
+      if (!validTarget && turnIndex == null && userPosition == null) {
         delete this._branchResyncPendingByTab[tab]
         this._regenInFlight = false
         return false
       }
       const previousMessages = tab ? [...(this.messagesByTab[tab] || [])] : null
-      if (targetMessageIdx != null && tab) {
-        // Keep the edited user row visible (with the new content) and
-        // drop everything after it — the old assistant response, tool
-        // calls, etc. The target index can be stale after Vue reuses a
-        // keyed row, so resolve by turn/user metadata before splicing.
+      const previousEvents = tab ? this.eventsByTab[tab] : null
+      const previousBranchView =
+        tab && this.branchViewByTab[tab] ? { ...this.branchViewByTab[tab] } : null
+      const previousStreaming = tab ? this._streamingBranchByTab[tab] : null
+      const previousProcessing = tab ? !!this.processingByTab[tab] : false
+      // Optimistic branch promotion: predict the new branch_id and
+      // splice synthetic events so the navigator flips to <N+1/N+1>
+      // BEFORE the API round-trip. ``latestBranch`` came from the
+      // message metadata when the user clicked Edit, so it's the
+      // accurate "previous max" for this turn.
+      const predictedBranch =
+        turnIndex != null && typeof expectedLatestBranch === "number"
+          ? expectedLatestBranch + 1
+          : null
+      let optimisticApplied = false
+      if (validTarget && tab) {
+        // Keep the user row at ``messageIdx`` visible (with the new
+        // content) and drop everything after it — the old assistant
+        // response, tool calls, etc. Previously we spliced from
+        // ``messageIdx`` itself, which made the edited message vanish
+        // until ``_resyncHistory`` ran AFTER the LLM finished. That
+        // gave a several-second gap where the chat showed only the
+        // streaming reply with the question that prompted it gone.
+        // ``_handleUserInput`` dedupes against the visible last-user
+        // message, so the WS replay from the new branch won't double
+        // it up.
         const msgs = this.messagesByTab[tab]
-        const original = msgs[targetMessageIdx]
+        const original = msgs[messageIdx]
         const normalized = normalizeMessageContent(newContent)
-        const rowTurnIndex = turnIndex ?? original.turnIndex
-        const rowLatestBranch = expectedLatestBranch ?? original.latestBranch
-        const optimisticId =
-          rowTurnIndex != null && rowLatestBranch != null
-            ? `u_${rowTurnIndex}_${rowLatestBranch + 1}_pending`
-            : `edit_${original.id || "user"}_${Date.now()}`
         const editedRow = {
           ...original,
-          id: optimisticId,
           content: normalized.content,
           contentParts: normalized.contentParts,
         }
-        msgs.splice(targetMessageIdx, msgs.length - targetMessageIdx, editedRow)
+        msgs.splice(messageIdx, msgs.length - messageIdx, editedRow)
+      }
+      if (predictedBranch != null && tab) {
+        const injected = this._injectOptimisticBranch(tab, {
+          turnIndex,
+          branchId: predictedBranch,
+          content: newContent,
+        })
+        if (injected) {
+          if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
+          this.branchViewByTab[tab][turnIndex] = predictedBranch
+          this._streamingBranchByTab[tab] = {
+            turnIndex,
+            branchId: predictedBranch,
+          }
+          this.processingByTab[tab] = true
+          this._rebuildMessages(tab)
+          optimisticApplied = true
+        }
       }
       try {
         const { agentAPI } = await import("@/utils/api")
         const [sid, cid] = [this._instanceGraphId, tab]
-        // Pass the user's current branch selection so the backend can
-        // reload its in-memory conversation under that subtree before
-        // resolving the edit target. Without this an edit on a
-        // switched-to-older branch silently fails (the agent's
-        // conversation is on whatever branch it last ran).
-        const branchView = this.branchViewByTab[tab] || null
+        // Pass the user's ORIGINAL branch selection (pre-optimistic)
+        // so the backend reloads its in-memory conversation under the
+        // subtree the user was viewing when they clicked Edit. The
+        // predicted-branch override we wrote into ``branchViewByTab``
+        // above is only for our own navigator; the backend doesn't
+        // know about it yet (it opens that branch itself).
+        const branchView = previousBranchView
         const editResponse = await agentAPI.editMessage(sid, cid, backendIdx, newContent, {
           turnIndex,
           userPosition,
           branchView,
         })
         if (turnIndex != null && editResponse?.branch_id != null) {
-          if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
-          this.branchViewByTab[tab][turnIndex] = editResponse.branch_id
           this._markBranchResyncPending(tab, {
             expectedBranchByTurn: { [turnIndex]: editResponse.branch_id },
           })
+          // Realign the navigator if our optimistic guess was off.
+          if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
+          if (this.branchViewByTab[tab][turnIndex] !== editResponse.branch_id) {
+            this.branchViewByTab[tab][turnIndex] = editResponse.branch_id
+          }
+          this._streamingBranchByTab[tab] = {
+            turnIndex,
+            branchId: editResponse.branch_id,
+          }
         }
-        await this._resyncHistory(tab)
-        return true
+        const resynced = await this._resyncHistory(tab)
+        return resynced !== false
       } catch (e) {
         delete this._branchResyncPendingByTab[tab]
         if (previousMessages && tab) this.messagesByTab[tab] = previousMessages
+        if (optimisticApplied && tab) {
+          if (previousEvents !== undefined) {
+            if (previousEvents == null) delete this.eventsByTab[tab]
+            else this.eventsByTab[tab] = previousEvents
+          }
+          if (previousBranchView != null) {
+            this.branchViewByTab[tab] = previousBranchView
+          } else {
+            delete this.branchViewByTab[tab]
+          }
+          if (previousStreaming != null) {
+            this._streamingBranchByTab[tab] = previousStreaming
+          } else {
+            delete this._streamingBranchByTab[tab]
+          }
+          this.processingByTab[tab] = previousProcessing
+        }
         console.warn("Failed to edit message:", e)
         return false
       } finally {
@@ -2499,37 +3170,54 @@ const _chatStoreOptions = {
         const { terrariumAPI } = await import("@/utils/api")
         const data = await terrariumAPI.getHistory(this._instanceGraphId, tab)
         if (!data?.events) return false
-        // Cache fresh events. PRESERVE the user's branch overrides:
-        // wiping ``branchViewByTab`` here was the historical source of
-        // "I switched to branch 1 of turn 2, did an unrelated action,
-        // and was yanked back to the latest branch." The replay's
-        // default-latest semantics already covers any turns the user
-        // hasn't explicitly overridden, so retaining existing overrides
-        // is safe and matches user intent.
-        this.eventsByTab[tab] = data.events
-        if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
-        this._rebuildMessages(tab)
 
+        // Check completeness BEFORE touching state. If a branch op is
+        // pending (regen / edit-and-rerun) and the expected new branch
+        // hasn't landed in /history yet, do NOT clobber the optimistic
+        // ``eventsByTab`` / ``messagesByTab`` with stale data.
+        //
+        // Bug class fixed here (user-reported): with an edit pending
+        // for ``turn=1, expected_branch=2``, a /history fetch that
+        // races ahead of backend persistence may return ONLY old
+        // branch events. ``_resolveSelectedBranches`` then falls back
+        // to ``Math.max(candidates)=1`` (old branch), and the rebuild
+        // POPS the old branch's content onto the screen — even though
+        // ``branchView[1]=2``. Plus this used to return ``false`` →
+        // ``ChatMessage.confirmEdit`` re-opens the edit panel with
+        // the user's text. Guarding the rebuild keeps the optimistic
+        // UI visible until the new branch lands.
         const pending = this._branchResyncPendingByTab[tab]
         const expectedBranchByTurn = pending?.expectedBranchByTurn || {}
+        let complete = true
         if (Object.keys(expectedBranchByTurn).length) {
           const { branchMeta } = _replayEvents([], data.events)
           const branchSelection = branchMeta?.branchSelection || new Map()
-          let complete = true
           for (const [turn, branch] of Object.entries(expectedBranchByTurn)) {
             if (branchSelection.get(Number(turn)) !== branch) {
               complete = false
               break
             }
           }
-          if (!complete) {
-            // Messages already rebuilt with what we have; just keep
-            // retrying so the navigator catches up once the new branch
-            // is fully written to the session store.
-            this._scheduleBranchResync(tab)
-            return false
-          }
         }
+
+        if (!complete) {
+          // Don't replace events / rebuild — keep optimistic state
+          // visible. Schedule a retry so the navigator eventually
+          // catches up once the new branch is fully written.
+          this._scheduleBranchResync(tab)
+          // Return true so callers (editMessage / regenerate) don't
+          // treat this as a hard failure that re-opens the edit panel.
+          // The retry timer will reconcile when the backend catches up.
+          return true
+        }
+
+        // Cache fresh events. PRESERVE the user's branch overrides:
+        // wiping ``branchViewByTab`` here was the historical source of
+        // "I switched to branch 1 of turn 2, did an unrelated action,
+        // and was yanked back to the latest branch."
+        this.eventsByTab[tab] = data.events
+        if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
+        this._rebuildMessages(tab)
         delete this._branchResyncPendingByTab[tab]
         return true
       } catch (e) {
@@ -2557,6 +3245,11 @@ const _chatStoreOptions = {
     /**
      * Switch the active branch for a turn. Re-runs replay against
      * the cached event log; no network round-trip.
+     *
+     * When the user switches AWAY from the streaming branch (or
+     * back to it), schedule a quick resync so any chunks dropped
+     * by the branch-isolation gate while they were elsewhere get
+     * pulled in from the persisted event log.
      */
     selectBranch(turnIndex, branchId) {
       const tab = this.activeTab
@@ -2564,6 +3257,12 @@ const _chatStoreOptions = {
       if (!this.branchViewByTab[tab]) this.branchViewByTab[tab] = {}
       this.branchViewByTab[tab][turnIndex] = branchId
       this._rebuildMessages(tab)
+      // If a stream is still in flight on this tab, an off-branch
+      // switch may have missed chunks; the on-branch path back also
+      // benefits from a fresh pull of persisted chunks.
+      if (this._streamingBranchByTab[tab]) {
+        this._scheduleBranchResync(tab)
+      }
     },
 
     /**
@@ -2636,6 +3335,10 @@ const _chatStoreOptions = {
 
     _handleUserInput(source, data) {
       if (!source || !this.messagesByTab[source]) return
+      // Branch isolation: a user_input echo for a non-viewed branch
+      // (e.g. another tab branched while this tab was on branch 1)
+      // must not push into the visible message list.
+      if (!this._frameMatchesViewedBranch(source, data)) return
       const normalized = normalizeMessageContent(data.content)
       const signature = `${source}:${contentSignature(data.content)}`
       const now = Date.now()
@@ -2655,6 +3358,93 @@ const _chatStoreOptions = {
         contentParts: normalized.contentParts,
         timestamp: data.timestamp || new Date((data.ts || now / 1000) * 1000).toISOString(),
       })
+    },
+
+    _handleUserInputInjected(source, data) {
+      // Backend just folded a buffered ``user_input`` into the
+      // current turn (Feat 3 mid-turn drain). If the FE had a
+      // matching ``queuedMessagesByTab[source]`` entry — the typical
+      // path when the user typed during processing — promote that
+      // exact entry to the visible chat. If no match exists (e.g.
+      // a programmatic/trigger injection), append a fresh user
+      // bubble so the model's view stays consistent with the chat.
+      if (!source) return
+      if (!this.messagesByTab[source]) return
+      const queue = this.queuedMessagesByTab[source] || []
+      const target = contentSignature(data.content || "")
+      const targetText = textSignature(data.content || "")
+      // Try strict JSON signature match first (catches the common
+      // case where FE queued contentParts exactly match the backend's
+      // drained content). Fall back to a text-only comparator so a
+      // queue entry whose shape diverged from the backend's drained
+      // form (e.g. backend emitted a plain string while FE queued a
+      // content-parts list) still pops the right entry instead of
+      // sticking the banner forever AND appending a phantom bubble.
+      let idx = queue.findIndex(
+        (m) => contentSignature(m.contentParts || m.content || "") === target,
+      )
+      if (idx === -1 && targetText) {
+        idx = queue.findIndex(
+          (m) => textSignature(m.contentParts || m.content || "") === targetText,
+        )
+      }
+      if (idx !== -1) {
+        // Snapshot a fresh object before splicing — mutating + reusing
+        // the reactive proxy that just left ``queuedMessagesByTab`` has
+        // historically caused render hiccups when both collections
+        // briefly track the same identity. Building a clean clone
+        // detaches the new message from the queue's reactivity graph.
+        const original = queue[idx]
+        queue.splice(idx, 1)
+        // Close the currently-streaming assistant (if any) before
+        // pushing user(B). Without this, the next text_chunk's
+        // ``_ensureAssistantMsg`` reuses the same assistant because
+        // it's still ``_streaming``, folding round-2 chunks into the
+        // round-1 bubble — same bug class as the replay path.
+        this._closeStreamingAssistant(source)
+        this._addMsg(source, {
+          id: original.id,
+          role: "user",
+          content: original.content,
+          contentParts: original.contentParts,
+          timestamp: original.timestamp,
+          injectedMidTurn: true,
+        })
+        return
+      }
+      // Programmatic / trigger injection — no FE counterpart.
+      const normalized = normalizeMessageContent(data.content || "")
+      const now = Date.now()
+      this._closeStreamingAssistant(source)
+      this._addMsg(source, {
+        id: `u_inj_${now}`,
+        role: "user",
+        content: normalized.content,
+        contentParts: normalized.contentParts,
+        timestamp: data.timestamp || new Date((data.ts || now / 1000) * 1000).toISOString(),
+        injectedMidTurn: true,
+      })
+    },
+
+    _closeStreamingAssistant(source) {
+      // Mark the currently-streaming assistant (last in
+      // ``messagesByTab[source]``) as finished so the NEXT text_chunk
+      // starts a fresh assistant via ``_ensureAssistantMsg`` instead
+      // of folding into the old one. Used by mid-turn injection paths
+      // to keep the interleaving order
+      //   [user(A), assistant("to-A"), user(B), assistant("to-B")]
+      // visible to the user instead of merging round 1 + round 2 text
+      // into one bubble.
+      const msgs = this.messagesByTab[source]
+      if (!msgs || !msgs.length) return
+      const last = msgs[msgs.length - 1]
+      if (!last || last.role !== "assistant") return
+      last._streaming = false
+      if (Array.isArray(last.parts)) {
+        for (const p of last.parts) {
+          if (p && p.type === "text") p._streaming = false
+        }
+      }
     },
 
     _handleChannelMessage(data) {
@@ -2696,16 +3486,21 @@ const _chatStoreOptions = {
       }
     },
 
-    /** Move queued messages from the hold queue into the main chat. */
+    /** Move queued messages for ``source`` from its hold queue into the
+     *  main message list. Other tabs' queues are untouched — they each
+     *  flush on their own ``processing_start``. */
     _promoteQueuedMessages(source) {
-      if (!this.queuedMessages.length) return
+      if (!source) return
+      const queue = this.queuedMessagesByTab[source]
+      if (!queue || !queue.length) return
       const msgs = this.messagesByTab[source]
       if (!msgs) return
-      for (const msg of this.queuedMessages) {
+      for (const msg of queue) {
         delete msg.queued
+        delete msg.queuedTab
         msgs.push(msg)
       }
-      this.queuedMessages = []
+      this.queuedMessagesByTab[source] = []
     },
 
     _ensureAssistantMsg(msgs) {
@@ -2762,6 +3557,14 @@ const _chatStoreOptions = {
 
     _finishStream(source) {
       if (source) this.processingByTab[source] = false
+      // The branch the user just generated on becomes "frozen" — no
+      // more chunks arrive for it. The next resync rebuilds messages
+      // from canonical events (including the persisted text_chunks),
+      // so we drop the streaming-branch target here to free the
+      // navigator from the "this is a live target" gate.
+      if (source && this._streamingBranchByTab[source]) {
+        delete this._streamingBranchByTab[source]
+      }
       const msgs = this.messagesByTab[source]
       if (msgs) {
         const last = msgs[msgs.length - 1]
@@ -2841,13 +3644,20 @@ const _chatStoreOptions = {
       this.tokenUsage = {}
       this.runningJobs = {}
       this.unreadCounts = {}
-      this.queuedMessages = []
+      this.queuedMessagesByTab = {}
       this.processingByTab = {}
       this.eventsByTab = {}
       this.branchViewByTab = {}
       this._recentUserInputs = {}
       this._branchResyncPendingByTab = {}
+      this._streamingBranchByTab = {}
       this._clearBranchResyncTimers()
+      // Drop multi-group state along with the legacy buckets — the
+      // next ``initForInstance`` runs for a different scope.
+      this.groups = {}
+      this.groupTree = null
+      this.focusedGroupId = null
+      this._groupCounter = 0
       this.sessionInfo = {
         sessionId: "",
         model: "",
@@ -2866,6 +3676,7 @@ const _chatStoreOptions = {
       this._historyLoaded = false
       this._wsBuffer = []
       this._branchResyncPendingByTab = {}
+      this._streamingBranchByTab = {}
       this._clearBranchResyncTimers()
       if (this._reconnectTimer) {
         clearTimeout(this._reconnectTimer)
@@ -2918,6 +3729,351 @@ const _chatStoreOptions = {
           this.activeTab = saved.activeTab
         }
       }
+    },
+
+    // ─── Multi-chat-panel actions (Option E) ─────────────────────
+    //
+    // Group state is the source of truth ONLY when ``groupTree`` is
+    // non-null. Otherwise legacy ``tabs`` / ``activeTab`` are
+    // authoritative and the group bucket is empty. The transition
+    // happens lazily via ``enableGroups()`` (called when the user
+    // splits for the first time or when the user toggles the
+    // Settings flag mid-session).
+    //
+    // Every group-mutating action calls ``_syncLegacyFromGroups()``
+    // before returning so back-compat readers (chat-store internals,
+    // the v1 ``SessionHistoryViewer`` viewer, tests) keep observing
+    // a consistent ``tabs`` / ``activeTab``.
+
+    /** Mirror ``tabs[]`` and ``activeTab`` from the current group
+     *  state. Called after every group mutation. Safe to call when
+     *  ``groupTree`` is null — does nothing in that case. */
+    _syncLegacyFromGroups() {
+      if (!this.groupTree) return
+      const union = _unionGroupTabs(this.groups, this.groupTree)
+      this.tabs = union
+      const focused = this.groups[this.focusedGroupId]
+      const nextActive = focused?.activeTab || union[0] || null
+      if (this.activeTab !== nextActive) this.activeTab = nextActive
+    },
+
+    /** Persist groups + groupTree + focusedGroupId to localStorage
+     *  under ``kt.chat.groupTree.<scope>``. Schema version ``1`` so
+     *  future shape changes can migrate. Idempotent and synchronous —
+     *  ``setHybridPref`` debounces internally on the storage side. */
+    _persistGroupState() {
+      const scope = this._instanceId || "default"
+      const key = _groupStorageKey(scope)
+      if (!this.groupTree) {
+        // No groups active — clear any stale storage so the next
+        // load doesn't resurrect a stale tree.
+        try {
+          removeHybridPref(key)
+        } catch {
+          /* swallow */
+        }
+        return
+      }
+      const payload = {
+        version: 1,
+        groups: this.groups,
+        groupTree: this.groupTree,
+        focusedGroupId: this.focusedGroupId,
+        _groupCounter: this._groupCounter,
+      }
+      try {
+        setHybridPref(key, payload, { json: true })
+      } catch {
+        /* swallow — storage may be unavailable */
+      }
+    },
+
+    /** Read persisted group state for the current scope. Returns
+     *  ``true`` if a valid version-1 payload was applied. */
+    _loadGroupState() {
+      const scope = this._instanceId || "default"
+      const key = _groupStorageKey(scope)
+      let saved = null
+      try {
+        saved = getHybridPrefSync(key, null, { json: true })
+      } catch {
+        return false
+      }
+      if (!saved || saved.version !== 1) return false
+      if (!saved.groupTree || !saved.groups) return false
+      // Sanity: every leaf groupId must exist in groups.
+      let ok = true
+      _walkGroupTree(saved.groupTree, (gid) => {
+        if (!saved.groups[gid]) ok = false
+      })
+      if (!ok) return false
+      this.groups = saved.groups
+      this.groupTree = saved.groupTree
+      this.focusedGroupId =
+        saved.focusedGroupId && saved.groups[saved.focusedGroupId]
+          ? saved.focusedGroupId
+          : _firstLeafGroupId(saved.groupTree)
+      this._groupCounter = saved._groupCounter || Object.keys(saved.groups).length
+      this._syncLegacyFromGroups()
+      return true
+    },
+
+    /** Activate multi-group mode by wrapping the current ``tabs`` /
+     *  ``activeTab`` into a single group + single-leaf tree. Safe to
+     *  call when already active (no-op). */
+    enableGroups() {
+      if (this.groupTree) return this.focusedGroupId
+      const legacyTabs = Array.isArray(this.tabs) ? [...this.tabs] : []
+      const legacyActive = this.activeTab || legacyTabs[0] || null
+      this._groupCounter += 1
+      const id = `g_${this._groupCounter}`
+      this.groups = {
+        [id]: {
+          tabs: legacyTabs,
+          activeTab: legacyActive,
+          draftText: "",
+        },
+      }
+      this.groupTree = { type: "leaf", groupId: id }
+      this.focusedGroupId = id
+      this._syncLegacyFromGroups()
+      this._persistGroupState()
+      return id
+    },
+
+    /** Deactivate multi-group mode — collapse back to legacy single-
+     *  group state. Tabs/activeTab survive the transition (taken from
+     *  the previously-focused group, falling back to the union). */
+    disableGroups() {
+      if (!this.groupTree) return
+      // Preserve the focused group's tabs/activeTab as the new
+      // single-surface state — that's the surface the user was last
+      // looking at, so least surprise.
+      const focused = this.groups[this.focusedGroupId]
+      const union = _unionGroupTabs(this.groups, this.groupTree)
+      const nextTabs = focused?.tabs?.length ? [...focused.tabs] : union
+      const nextActive = focused?.activeTab || nextTabs[0] || null
+      this.groups = {}
+      this.groupTree = null
+      this.focusedGroupId = null
+      this.tabs = nextTabs
+      this.activeTab = nextActive
+      // Clear storage so a future page-load doesn't auto-re-enable.
+      this._persistGroupState()
+    },
+
+    /** Allocate a new group with the given tabs. ``activeTab``
+     *  defaults to the first tab. Returns the new groupId. Does NOT
+     *  insert the group into ``groupTree`` — callers are responsible
+     *  for placing it (e.g. via ``splitGroup``). */
+    addGroup(tabs = [], activeTab = null) {
+      this._groupCounter += 1
+      const id = `g_${this._groupCounter}`
+      const tabList = Array.isArray(tabs) ? [...tabs] : []
+      this.groups[id] = {
+        tabs: tabList,
+        activeTab: activeTab || tabList[0] || null,
+        draftText: "",
+      }
+      return id
+    },
+
+    /** Remove a group: drops its entry from ``groups`` and prunes its
+     *  leaf from ``groupTree``. Promotes the surviving sibling when a
+     *  split collapses. If the focused group is removed, focus jumps
+     *  to the new first leaf (or ``null`` when nothing is left). */
+    removeGroup(groupId) {
+      if (!this.groups[groupId]) return
+      delete this.groups[groupId]
+      this.groupTree = _pruneTreeLeaf(this.groupTree, groupId)
+      if (!this.groupTree) {
+        // Last group removed → fall back to legacy single-group
+        // mode so the chat panel keeps rendering something.
+        this.focusedGroupId = null
+        this.groups = {}
+        // Keep tabs / activeTab as-is so the panel re-renders the
+        // last view rather than going blank.
+      } else if (this.focusedGroupId === groupId) {
+        this.focusedGroupId = _firstLeafGroupId(this.groupTree)
+      }
+      this._syncLegacyFromGroups()
+      this._persistGroupState()
+    },
+
+    /** Set a group's active tab. No-op if the group doesn't exist or
+     *  the tab isn't in the group's tab list. */
+    setGroupActiveTab(groupId, tab) {
+      const g = this.groups[groupId]
+      if (!g || !g.tabs.includes(tab)) return
+      g.activeTab = tab
+      if (tab) delete this.unreadCounts[tab]
+      this._syncLegacyFromGroups()
+      this._persistGroupState()
+    },
+
+    /** Bring a group to keyboard focus. Drives which group receives
+     *  the global ``/`` hotkey, where new tabs land, and what the
+     *  StatusBar model switcher reads. */
+    setFocusedGroup(groupId) {
+      if (!this.groups[groupId]) return
+      if (this.focusedGroupId === groupId) return
+      this.focusedGroupId = groupId
+      this._syncLegacyFromGroups()
+      this._persistGroupState()
+    },
+
+    /** Resize the split at ``path`` (array of child indices) to
+     *  ``ratio``. Path ``[]`` targets the root split. Mutates the
+     *  ``groupTree`` in place — see ``_setSplitRatio`` for why.
+     *  Persistence runs on every call; cheap localStorage writes
+     *  during a drag are acceptable, and committing on every move
+     *  means a refresh mid-drag preserves what the user saw. */
+    setGroupSplitRatio(path, ratio) {
+      if (!this.groupTree) return
+      _setSplitRatio(this.groupTree, path || [], ratio)
+      this._persistGroupState()
+    },
+
+    /** Split the target group's leaf in two. The target group stays
+     *  on one side, a fresh group lands on the other (carrying
+     *  ``movedTab`` as its single tab, or empty when ``movedTab`` is
+     *  ``null``).
+     *
+     *  When ``movedTab`` originated in a DIFFERENT group (a drag-to-
+     *  split across the chat-internal tree), pass that group's id as
+     *  ``srcGroupId`` so the tab is removed from there. Without it,
+     *  the tab would be duplicated (left in the source AND in the new
+     *  split's sibling) — that's the
+     *  ``a|b|c drag c onto a's side → a|c|b|c`` bug.
+     *
+     *  Returns the new groupId, or ``null`` on no-op. */
+    splitGroup(targetGroupId, direction, edge, movedTab = null, srcGroupId = null) {
+      if (!this.groups[targetGroupId]) return null
+      if (direction !== "horizontal" && direction !== "vertical") return null
+      if (edge !== "before" && edge !== "after") return null
+      // Refuse the split if it would empty the source group with no
+      // sibling to promote — collapse-then-split races the
+      // tree-mutation reflow. The "moving a tab is the only way to
+      // create a split" path doesn't apply to keyboard / context-menu
+      // splits which pass ``movedTab=null``.
+      const realSrcId = srcGroupId || targetGroupId
+      if (movedTab) {
+        const realSrc = this.groups[realSrcId]
+        if (!realSrc || !realSrc.tabs.includes(movedTab)) return null
+        if (realSrc.tabs.length <= 1 && realSrcId === targetGroupId) return null
+      }
+      const newId = this.addGroup(movedTab ? [movedTab] : [])
+      this.groupTree = _splitTreeLeaf(this.groupTree, targetGroupId, direction, edge, newId)
+      if (movedTab) {
+        // Remove from the REAL source group; the new group already
+        // owns the moved tab via ``addGroup``.
+        const realSrc = this.groups[realSrcId]
+        const idx = realSrc.tabs.indexOf(movedTab)
+        if (idx !== -1) {
+          realSrc.tabs.splice(idx, 1)
+          if (realSrc.activeTab === movedTab) realSrc.activeTab = realSrc.tabs[0] || null
+        }
+        // If the source group emptied (cross-group split where src
+        // had only that one tab), collapse it. The tree-prune is
+        // safe because the split we just did inserted the new leaf
+        // beside the target — the empty leaf is unrelated.
+        if (realSrcId !== targetGroupId && realSrc.tabs.length === 0) {
+          this.removeGroup(realSrcId)
+        }
+      }
+      this.focusedGroupId = newId
+      this._syncLegacyFromGroups()
+      this._persistGroupState()
+      return newId
+    },
+
+    /** Move a tab between groups (or reorder within one). When
+     *  ``dstIndex`` is past the end, appends. If the source group is
+     *  emptied by the move, it is removed and its tree slot collapses. */
+    moveTab(srcGroupId, tab, dstGroupId, dstIndex = -1, opts = {}) {
+      const src = this.groups[srcGroupId]
+      const dst = this.groups[dstGroupId]
+      if (!src || !dst) return
+      const idx = src.tabs.indexOf(tab)
+      if (idx === -1) return
+      // Same-group reorder
+      if (srcGroupId === dstGroupId) {
+        src.tabs.splice(idx, 1)
+        const insertAt = dstIndex < 0 ? src.tabs.length : Math.min(dstIndex, src.tabs.length)
+        src.tabs.splice(insertAt, 0, tab)
+        src.activeTab = tab
+        this._syncLegacyFromGroups()
+        this._persistGroupState()
+        return
+      }
+      // Cross-group move
+      src.tabs.splice(idx, 1)
+      if (src.activeTab === tab) src.activeTab = src.tabs[0] || null
+      // Remove from destination first (if it was already there); we
+      // re-insert at the requested index in canonical position.
+      const dstExisting = dst.tabs.indexOf(tab)
+      if (dstExisting !== -1) dst.tabs.splice(dstExisting, 1)
+      const insertAt = dstIndex < 0 ? dst.tabs.length : Math.min(dstIndex, dst.tabs.length)
+      dst.tabs.splice(insertAt, 0, tab)
+      dst.activeTab = tab
+      if (!opts.preserveFocus) this.focusedGroupId = dstGroupId
+      if (src.tabs.length === 0) {
+        // Source emptied → collapse the group. ``removeGroup`` will
+        // call ``_syncLegacyFromGroups`` + persist on its own.
+        this.removeGroup(srcGroupId)
+        return
+      }
+      this._syncLegacyFromGroups()
+      this._persistGroupState()
+    },
+
+    /** Add ``tab`` to the focused group (or first group) when groups
+     *  are active. When groups are inactive, falls through to
+     *  ``_addTab`` for legacy single-surface behaviour. Idempotent —
+     *  duplicate tabs are no-ops. */
+    ensureTab(tab) {
+      if (!tab) return
+      this._addTab(tab)
+      if (!this.groupTree) return
+      // Already in any group? Done.
+      for (const g of Object.values(this.groups)) {
+        if (g.tabs.includes(tab)) return
+      }
+      const targetId = this.focusedGroupId || _firstLeafGroupId(this.groupTree)
+      if (!targetId) return
+      const g = this.groups[targetId]
+      g.tabs.push(tab)
+      if (!g.activeTab) g.activeTab = tab
+      this._syncLegacyFromGroups()
+      this._persistGroupState()
+    },
+
+    /** Remove ``tab`` from every group + the legacy tabs list. Groups
+     *  emptied as a result collapse. */
+    pruneTab(tab) {
+      if (!tab) return
+      // Legacy tabs
+      const legacyIdx = this.tabs.indexOf(tab)
+      if (legacyIdx !== -1) {
+        this.tabs = this.tabs.filter((t) => t !== tab)
+        if (this.activeTab === tab) {
+          this.activeTab = this.tabs[Math.min(legacyIdx, this.tabs.length - 1)] || null
+        }
+      }
+      if (!this.groupTree) return
+      // Snapshot ids first — ``removeGroup`` mutates the dict while we iterate.
+      const ids = Object.keys(this.groups)
+      for (const gid of ids) {
+        const g = this.groups[gid]
+        if (!g) continue
+        const idx = g.tabs.indexOf(tab)
+        if (idx === -1) continue
+        g.tabs.splice(idx, 1)
+        if (g.activeTab === tab) g.activeTab = g.tabs[0] || null
+        if (g.tabs.length === 0) this.removeGroup(gid)
+      }
+      this._syncLegacyFromGroups()
+      this._persistGroupState()
     },
   },
 }

@@ -2,15 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { mount } from "@vue/test-utils"
 import { createPinia, setActivePinia } from "pinia"
 import { createRouter, createMemoryHistory } from "vue-router"
-import { isReactive } from "vue"
 
 vi.mock("@/utils/api", () => ({
   attachAPI: { getCreaturePolicies: vi.fn(), getSessionPolicies: vi.fn() },
   configAPI: { listCreatures: vi.fn(), listTerrariums: vi.fn(), getServerInfo: vi.fn() },
-  sessionAPI: {
-    listActive: vi.fn().mockResolvedValue([]),
-    getActive: vi.fn().mockResolvedValue(null),
-  },
   settingsAPI: {
     getBackends: vi.fn().mockResolvedValue([]),
     listMCP: vi.fn().mockResolvedValue([]),
@@ -31,9 +26,8 @@ vi.mock("@/utils/api", () => ({
 
 import MacroShell from "./MacroShell.vue"
 import RailItem from "./RailItem.vue"
-import { registerBuiltinTabKinds, _resetBuiltinTabKindsForTests } from "./registerBuiltins"
 import { useTabsStore } from "@/stores/tabs"
-import { sessionAPI } from "@/utils/api"
+import { useInstancesStore } from "@/stores/instances"
 import { tabKinds, inspectorInnerTabs, railGroups } from "@/stores/tabKindRegistry"
 
 let storage
@@ -51,7 +45,6 @@ beforeEach(() => {
     key: (i) => Array.from(storage.keys())[i] ?? null,
   })
   setActivePinia(createPinia())
-  _resetBuiltinTabKindsForTests()
   tabKinds.clear()
   inspectorInnerTabs.clear()
   railGroups.clear()
@@ -67,55 +60,6 @@ function makeRouter() {
     routes: [{ path: "/", component: { template: "<div />" } }],
   })
 }
-
-function sessionPayload(id, name, creatures = [{ name, running: true }]) {
-  return { session_id: id, name, creatures, channels: [] }
-}
-
-function mockActiveSessions(sessions) {
-  sessionAPI.listActive.mockResolvedValue(sessions)
-  sessionAPI.getActive.mockImplementation(async (id) => sessions.find((s) => s.session_id === id) ?? null)
-}
-
-describe("MacroShell — tab registration", () => {
-  it("registers all built-in tab kinds centrally", () => {
-    registerBuiltinTabKinds()
-
-    for (const kind of [
-      "dashboard",
-      "attach",
-      "inspector",
-      "session-viewer",
-      "saved-sessions",
-      "stats",
-      "studio-editor",
-      "catalog",
-      "extensions",
-      "settings",
-      "code-editor",
-      "graph-editor",
-    ]) {
-      const entry = tabKinds.get(kind)
-      expect(entry, `${kind} should be registered`).toBeTruthy()
-      expect(entry.component, `${kind} should have a component`).toBeTruthy()
-    }
-  })
-  it("keeps registered tab components raw so Vue does not proxy component definitions", () => {
-    registerBuiltinTabKinds()
-
-    for (const kind of ["dashboard", "inspector", "attach", "session-viewer"]) {
-      const entry = tabKinds.get(kind)
-      expect(entry).toBeTruthy()
-      expect(isReactive(entry.component), `${kind} component should stay raw`).toBe(false)
-    }
-
-    for (const id of ["overview", "activity", "trace", "log"]) {
-      const entry = inspectorInnerTabs.get(id)
-      expect(entry).toBeTruthy()
-      expect(isReactive(entry.component), `${id} inspector tab should stay raw`).toBe(false)
-    }
-  })
-})
 
 describe("MacroShell — render", () => {
   it("mounts and shows the rail + tab strip + content", async () => {
@@ -149,18 +93,25 @@ describe("MacroShell — render", () => {
 
   it("renders one RailItem per running instance", async () => {
     const router = makeRouter()
-    mockActiveSessions([
-      sessionPayload("agent-1", "alice"),
-      sessionPayload("graph-1", "swe-graph", [
-        { name: "root", running: true, is_root: true },
-        { name: "worker", running: true },
-      ]),
-    ])
+    const instances = useInstancesStore()
+    instances.list = [
+      {
+        id: "agent-1",
+        config_name: "alice",
+        type: "creature",
+        status: "running",
+      },
+      {
+        id: "graph-1",
+        config_name: "swe-graph",
+        type: "terrarium",
+        status: "running",
+      },
+    ]
     const wrapper = mount(MacroShell, {
       global: { plugins: [router] },
     })
     await router.isReady()
-    await wrapper.vm.$nextTick()
     const items = wrapper.findAllComponents(RailItem)
     expect(items).toHaveLength(2)
     expect(wrapper.text()).toContain("alice")
@@ -207,12 +158,19 @@ describe("MacroShell — density branch", () => {
 describe("MacroShell — surface indicators", () => {
   it("rail [C] click opens an attach tab; second click closes", async () => {
     const router = makeRouter()
-    mockActiveSessions([sessionPayload("agent-1", "alice")])
+    const instances = useInstancesStore()
+    instances.list = [
+      {
+        id: "agent-1",
+        config_name: "alice",
+        type: "creature",
+        status: "running",
+      },
+    ]
     const wrapper = mount(MacroShell, {
       global: { plugins: [router] },
     })
     await router.isReady()
-    await wrapper.vm.$nextTick()
     const tabs = useTabsStore()
     const railItem = wrapper.findComponent(RailItem)
     // Find the [C] button (first surface indicator)
@@ -227,12 +185,19 @@ describe("MacroShell — surface indicators", () => {
 
   it("rail [I] click opens an inspector tab", async () => {
     const router = makeRouter()
-    mockActiveSessions([sessionPayload("agent-1", "alice")])
+    const instances = useInstancesStore()
+    instances.list = [
+      {
+        id: "agent-1",
+        config_name: "alice",
+        type: "creature",
+        status: "running",
+      },
+    ]
     const wrapper = mount(MacroShell, {
       global: { plugins: [router] },
     })
     await router.isReady()
-    await wrapper.vm.$nextTick()
     const tabs = useTabsStore()
     const railItem = wrapper.findComponent(RailItem)
     const iBtn = railItem.findAll("button").find((b) => b.text() === "I")

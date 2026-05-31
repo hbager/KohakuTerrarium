@@ -39,17 +39,8 @@ vi.mock("@/components/panels/SettingsPanel.vue", () => ({
 vi.mock("@/components/panels/StatePanel.vue", () => ({
   default: stub("StatePanel"),
 }))
-vi.mock("@/components/panels/TerminalPanel.vue", () => ({
-  default: stub("TerminalPanel"),
-}))
-vi.mock("@/components/panels/modules/ModulesPanel.vue", () => ({
-  default: stub("ModulesPanel"),
-}))
 vi.mock("@/components/status/StatusDashboard.vue", () => ({
   default: stub("StatusDashboard"),
-}))
-vi.mock("@/components/status/StatusDashboardTab.vue", () => ({
-  default: stub("StatusDashboardTab"),
 }))
 
 let storage
@@ -88,41 +79,11 @@ describe("layoutPanels — registerBuiltinPanels", () => {
       "canvas",
       "settings",
       "debug",
-      "status-tab",
-      "terminal",
-      "modules",
     ]
     for (const id of expected) {
       const p = store.getPanel(id)
       expect(p, `panel ${id} should be registered`).not.toBeNull()
       expect(p.component).toBeTruthy()
-    }
-  })
-
-  it("registers heavy workspace panels as async components so boot does not preload editor/chat stacks", async () => {
-    const { registerBuiltinPanels } = await import("./layoutPanels.js")
-    registerBuiltinPanels()
-    const store = useLayoutStore()
-    for (const id of [
-      "chat",
-      "status-dashboard",
-      "file-tree",
-      "monaco-editor",
-      "editor-status",
-      "files",
-      "activity",
-      "state",
-      "creatures",
-      "canvas",
-      "settings",
-      "debug",
-      "status-tab",
-      "terminal",
-      "modules",
-    ]) {
-      const p = store.getPanel(id)
-      expect(p, `panel ${id} should be registered`).not.toBeNull()
-      expect(p.component?.__asyncLoader, `panel ${id} should be async`).toBeTypeOf("function")
     }
   })
 

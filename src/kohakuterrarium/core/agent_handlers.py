@@ -3,6 +3,7 @@
 import asyncio
 import importlib
 
+from kohakuterrarium.core.agent_mid_turn import AgentMidTurnMixin
 from kohakuterrarium.core.agent_pre_dispatch import (
     run_pre_subagent_dispatch,
     run_pre_tool_dispatch,
@@ -43,7 +44,7 @@ _BG_PLACEHOLDER = (
 logger = get_logger(__name__)
 
 
-class AgentHandlersMixin(AgentToolsMixin):
+class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin):
     """Mixin providing event handling and tool execution for the Agent class.
 
     Contains the core event processing loop, tool startup, result collection,
@@ -107,7 +108,7 @@ class AgentHandlersMixin(AgentToolsMixin):
         )
         await self._process_event(event)
 
-    async def _process_event(self, event: TriggerEvent) -> None:
+    async def _process_event(self, event: TriggerEvent) -> bool:
         """Process event using the primary controller.
 
         Uses a lock to prevent concurrent processing. When multiple
@@ -121,11 +122,49 @@ class AgentHandlersMixin(AgentToolsMixin):
         ``_process_event`` at once) the TUI would see overlapping
         renders and the session log would interleave events from two
         turns. Holding the lock around them serializes everything.
+
+        **Opportunistic mid-turn buffering (Feat 3)**: ``user_input``
+        and ``trigger`` events that arrive while the lock is held by
+        another turn DON'T block on the lock. They're appended to
+        ``_pending_mid_turn_inputs`` and drained from inside the
+        current turn's ``_collect_and_push_feedback`` after tool
+        results land. This keeps user follow-ups (typed while the
+        agent is busy) and live triggers (timer fired mid-turn)
+        visible to the LLM on the next round inside the same turn,
+        instead of waiting for the current turn to fully end.
+
+        Rerun events (regenerate / edit-and-rerun) BYPASS the buffer
+        — they must run against the original lock-held turn because
+        the agent's branch-id was pre-incremented for them.
+
+        Returns ``True`` when the call actually ran the event (lock
+        acquired, turn processed) and ``False`` when it was buffered.
+        The WS attach path (``studio/attach/io.py:_process_input``)
+        uses this to suppress the ``idle`` frame on buffered events —
+        otherwise ``idle`` fires immediately, the FE clears the
+        ``processingByTab`` flag, and KohakUwUing blinks off until
+        the next chunk arrives (Bug 1).
         """
+        is_rerun = bool(event.context.get("rerun")) if event.context else False
+        if (
+            self._running
+            and not is_rerun
+            and event.type in ("user_input", "trigger")
+            and self._processing_lock.locked()
+        ):
+            buffer = getattr(self, "_pending_mid_turn_inputs", None)
+            if buffer is not None:
+                buffer.append(event)
+                logger.info(
+                    "Event buffered for mid-turn injection",
+                    event_type=event.type,
+                    pending=len(buffer),
+                )
+                return False
         async with self._processing_lock:
             if not self._running:
                 logger.debug("Dropping event, agent stopped", event_type=event.type)
-                return
+                return True
 
             is_rerun = bool(event.context.get("rerun"))
             is_edited = bool(event.context.get("edited"))
@@ -224,6 +263,7 @@ class AgentHandlersMixin(AgentToolsMixin):
                 inject_skill_path_hint(self)
 
             await self._process_event_with_controller(event, self.controller)
+            return True
 
     # ------------------------------------------------------------------
     # Main processing loop (split into phases)
@@ -651,6 +691,14 @@ class AgentHandlersMixin(AgentToolsMixin):
                     "[Tasks promoted to background — results arrive later. "
                     "Continue with other work.]"
                 )
+
+        # Feat 3 — drain mid-turn buffered user_input/trigger events
+        # AFTER tool results are appended (so the native
+        # assistant.tool_calls → role=tool pairing stays intact) and
+        # BEFORE the next LLM round so the model sees the new input.
+        injected_count = await self._drain_mid_turn_pending_inputs(controller)
+        if injected_count:
+            native_results_added = True
 
         # No feedback means we're done
         if not feedback_parts and not native_results_added:

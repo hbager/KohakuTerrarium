@@ -14,6 +14,7 @@ from kohakuterrarium.studio.sessions.lifecycle import (
     get_session_store,
     list_session_stores,
 )
+from kohakuterrarium.terrarium.creature_ops import agent_live_job_ids
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.terrarium import TerrariumService
 from kohakuterrarium.studio._runtime import as_engine
@@ -85,7 +86,7 @@ async def edit_message(
     turn_index: int | None = None,
     user_position: int | None = None,
     branch_view: dict[int, int] | None = None,
-) -> bool:
+) -> bool | dict[str, object]:
     """Edit a user message at ``msg_idx`` and re-run from there.
 
     ``branch_view`` lets the caller edit a message on a NON-LATEST
@@ -136,13 +137,13 @@ def history(
     creature = find_creature(engine, session_id, creature_id)
     agent = creature.agent
 
-    # Currently-in-flight job ids — promoted background sub-agents stay
-    # in ``_direct_job_meta`` until their final completion clears them,
-    # so they're the canonical "still running" set. Without this hint
-    # ``normalize_resumable_events`` would synthesize an interrupted
-    # ``subagent_result`` for the live bg sub-agent and the UI would
-    # flash "interrupted" until the real result event arrived.
-    live_job_ids: set[str] = set(getattr(agent, "_direct_job_meta", {}).keys())
+    # Currently-in-flight job ids — union of foreground (direct_job_meta)
+    # AND background-promoted (subagent_manager / executor) jobs so a
+    # promoted sub-agent that was dropped from ``_direct_job_meta`` is
+    # still treated as live. Without the union, ``normalize_resumable_events``
+    # synthesises an "Interrupted by session resume" terminal for the
+    # live bg sub-agent and the UI flips to "interrupted" (Bug 1).
+    live_job_ids: set[str] = agent_live_job_ids(agent)
 
     events: list[dict] = []
     if hasattr(agent, "session_store") and agent.session_store:

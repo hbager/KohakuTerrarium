@@ -97,6 +97,7 @@ class GroupAddNodeTool(BaseTool):
                 pwd=pwd,
                 is_privileged=False,
                 parent_creature_id=gctx.caller.creature_id,
+                suppress_io=True,
             )
         except Exception as exc:
             return err(f"failed to spawn creature from {config_path!r}: {exc}")

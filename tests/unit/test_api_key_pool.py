@@ -16,7 +16,7 @@ def test_key_pool_round_robin():
 def test_get_api_key_loads_yaml_list_as_pool(tmp_path, monkeypatch):
     path = tmp_path / "api_keys.yaml"
     path.write_text("openai:\n  - sk-one\n  - sk-two\n", encoding="utf-8")
-    monkeypatch.setattr(api_keys, "KEYS_PATH", path)
+    monkeypatch.setenv("KT_CONFIG_DIR", str(tmp_path))
 
     pool = api_keys.get_api_key("openai")
 
@@ -28,7 +28,7 @@ def test_get_api_key_loads_yaml_list_as_pool(tmp_path, monkeypatch):
 def test_list_api_keys_masks_key_lists(tmp_path, monkeypatch):
     path = tmp_path / "api_keys.yaml"
     path.write_text("openai:\n  - sk-abcdef1234\n  - sk-ghijkl5678\n", encoding="utf-8")
-    monkeypatch.setattr(api_keys, "KEYS_PATH", path)
+    monkeypatch.setenv("KT_CONFIG_DIR", str(tmp_path))
 
     assert api_keys.list_api_keys()["openai"] == "sk-a...1234, sk-g...5678"
 

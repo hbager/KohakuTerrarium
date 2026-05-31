@@ -19,19 +19,6 @@ from kohakuterrarium.terrarium.service import TerrariumService
 router = APIRouter()
 
 
-def _latest_branch_for_turn(history: dict, turn_index: int | None) -> int | None:
-    if turn_index is None:
-        return None
-    latest: int | None = None
-    for evt in history.get("events") or []:
-        if evt.get("turn_index") != turn_index:
-            continue
-        branch_id = evt.get("branch_id")
-        if isinstance(branch_id, int) and (latest is None or branch_id > latest):
-            latest = branch_id
-    return latest
-
-
 @router.post("/{session_id}/creatures/{creature_id}/chat")
 async def chat_creature(
     session_id: str,
@@ -40,7 +27,7 @@ async def chat_creature(
     service: TerrariumService = Depends(get_service),
 ):
     """Non-streaming HTTP chat fallback — collects the streaming chunks."""
-    cid = await resolve_creature_id(service, creature_id)
+    cid = await resolve_creature_id(service, creature_id, session_id)
     content = req.content if req.content is not None else (req.message or "")
     try:
         chunks: list[str] = []
@@ -58,14 +45,21 @@ async def regenerate_creature(
     req: RegenerateRequest | None = None,
     service: TerrariumService = Depends(get_service),
 ):
-    cid = await resolve_creature_id(service, creature_id)
+    cid = await resolve_creature_id(service, creature_id, session_id)
     turn_index = req.turn_index if req is not None else None
     branch_view = req.branch_view if req is not None else None
     try:
-        await service.regenerate(cid, turn_index=turn_index, branch_view=branch_view)
-        return {"status": "regenerating", "turn_index": turn_index}
+        result = await service.regenerate(
+            cid, turn_index=turn_index, branch_view=branch_view
+        )
     except KeyError:
         raise HTTPException(404, f"creature {creature_id!r} not found")
+    # Pass through ``turn_index`` / ``branch_id`` from the service so
+    # the frontend can promote the <N/M> navigator the instant the API
+    # call returns, instead of waiting for the post-turn resync.
+    if isinstance(result, dict):
+        return result
+    return {"status": "regenerating", "turn_index": turn_index}
 
 
 @router.post("/{session_id}/creatures/{creature_id}/messages/{msg_idx}/edit")
@@ -83,9 +77,9 @@ async def edit_creature_message(
         ]
     else:
         content = req.content
-    cid = await resolve_creature_id(service, creature_id)
+    cid = await resolve_creature_id(service, creature_id, session_id)
     try:
-        edit_result = await service.edit_message(
+        edited = await service.edit_message(
             cid,
             msg_idx,
             content,
@@ -95,23 +89,22 @@ async def edit_creature_message(
         )
     except KeyError:
         raise HTTPException(404, f"creature {creature_id!r} not found")
-    edited = bool(edit_result.get("edited")) if isinstance(edit_result, dict) else bool(edit_result)
     if not edited:
         raise HTTPException(400, "Invalid edit target; expected a user message")
-    response = {
+    # Newer service implementations return a dict carrying the just-
+    # opened branch_id / turn_index so the frontend's navigator can
+    # promote immediately. Older ones still return ``True`` — fall
+    # back to echoing the request fields then.
+    if isinstance(edited, dict):
+        return {
+            "user_position": req.user_position,
+            **edited,
+        }
+    return {
         "status": "edited",
         "turn_index": req.turn_index,
         "user_position": req.user_position,
     }
-    branch_id = edit_result.get("branch_id") if isinstance(edit_result, dict) else None
-    if branch_id is None:
-        try:
-            branch_id = _latest_branch_for_turn(await service.chat_history(cid), req.turn_index)
-        except Exception:
-            branch_id = None
-    if branch_id is not None:
-        response["branch_id"] = branch_id
-    return response
 
 
 @router.post("/{session_id}/creatures/{creature_id}/messages/{msg_idx}/rewind")
@@ -121,7 +114,7 @@ async def rewind_creature(
     msg_idx: int,
     service: TerrariumService = Depends(get_service),
 ):
-    cid = await resolve_creature_id(service, creature_id)
+    cid = await resolve_creature_id(service, creature_id, session_id)
     try:
         await service.rewind(cid, msg_idx)
         return {"status": "rewound"}
@@ -177,7 +170,7 @@ async def creature_history(
             "events": events,
             "is_processing": False,
         }
-    cid = await resolve_creature_id(service, creature_id)
+    cid = await resolve_creature_id(service, creature_id, session_id)
     try:
         return await service.chat_history(cid)
     except KeyError:
@@ -190,7 +183,7 @@ async def creature_branches(
     creature_id: str,
     service: TerrariumService = Depends(get_service),
 ):
-    cid = await resolve_creature_id(service, creature_id)
+    cid = await resolve_creature_id(service, creature_id, session_id)
     try:
         return await service.chat_branches(cid)
     except KeyError:

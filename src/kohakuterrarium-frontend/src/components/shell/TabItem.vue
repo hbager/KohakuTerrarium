@@ -1,13 +1,13 @@
 <template>
-  <div class="group h-8 flex items-center gap-1.5 pl-3 pr-1.5 text-xs border-r border-warm-200 dark:border-warm-700 cursor-pointer select-none shrink-0" :class="active ? 'bg-warm-50 dark:bg-warm-950 text-warm-800 dark:text-warm-200 border-b-2 border-b-iolite' : 'text-warm-500 hover:bg-warm-200/40 dark:hover:bg-warm-800/40'" :draggable="true" @click="$emit('activate')" @mousedown.middle.prevent="onMiddleClick" @dragstart="onDragStart" @dragover.prevent @drop="$emit('drop', $event)" @contextmenu.prevent="onContextMenu">
+  <div class="group h-8 flex items-center gap-1.5 pl-3 pr-1.5 text-xs border-r border-warm-200 dark:border-warm-700 cursor-pointer select-none shrink-0" :class="active ? 'bg-warm-50 dark:bg-warm-950 text-warm-800 dark:text-warm-200 border-b-2 border-b-iolite' : 'text-warm-500 hover:bg-warm-200/40 dark:hover:bg-warm-800/40'" :draggable="true" @click="$emit('activate')" @mousedown.middle.prevent="onMiddleClick" @dragstart="onDragStart" @dragover.prevent @drop.stop.prevent="$emit('drop', $event)" @contextmenu.prevent="onContextMenu">
     <!-- Pinned indicator. Dashboard's kind icon is already a house, so
          we don't render an extra one beside it; the kind icon below
          is enough on its own. -->
     <span v-if="isPinned && !isDashboard" class="i-carbon-pin-filled text-iolite text-xs shrink-0" />
     <span :class="[iconClass, isDashboard ? 'text-iolite' : '']" class="text-sm shrink-0" />
     <span class="truncate max-w-32">{{ label }}</span>
-    <button class="i-carbon-renew ml-1 opacity-0 group-hover:opacity-100 hover:text-iolite" :title="t('shell.tab.refreshTip')" @click.stop="onRefresh" />
-    <button v-if="!isDashboard" class="i-carbon-close opacity-0 group-hover:opacity-100 hover:text-warm-700" :title="t('shell.tab.closeTab')" @click.stop="$emit('close')" />
+    <button class="i-carbon-renew ml-1 hover-only-action hover:text-iolite" :title="t('shell.tab.refreshTip')" @click.stop="onRefresh" />
+    <button v-if="!isDashboard" class="i-carbon-close hover-only-action hover:text-warm-700" :title="t('shell.tab.closeTab')" @click.stop="$emit('close')" />
   </div>
 
   <TabContextMenu v-if="menuOpen" :tab="tab" :is-pinned="isPinned" :position="menuPos" :index="tabIndex" :total="totalTabs" @close="menuOpen = false" @refresh="onRefresh" @toggle-pin="togglePin" @close-tab="$emit('close')" @close-left="closeLeft" @close-right="closeRight" @close-others="closeOthers" @close-all="closeAll" />
@@ -18,6 +18,7 @@ import { computed, ref } from "vue"
 
 import TabContextMenu from "@/components/shell/TabContextMenu.vue"
 import { useTabsStore } from "@/stores/tabs"
+import { useSplitDrag } from "@/composables/useSplitDrag"
 import { useI18n } from "@/utils/i18n"
 
 const { t } = useI18n()
@@ -25,10 +26,14 @@ const { t } = useI18n()
 const props = defineProps({
   tab: { type: Object, required: true },
   active: { type: Boolean, default: false },
+  // When part of a tab-group, dragging emits the typed split-drag
+  // payload so the tab can be moved/split across groups.
+  groupId: { type: String, default: null },
 })
 const emit = defineEmits(["activate", "close", "drop"])
 
 const tabs = useTabsStore()
+const drag = useSplitDrag()
 const menuOpen = ref(false)
 const menuPos = ref({ x: 0, y: 0 })
 
@@ -38,6 +43,12 @@ const tabIndex = computed(() => tabs.tabs.findIndex((t) => t.id === props.tab.id
 const totalTabs = computed(() => tabs.tabs.length)
 
 function onDragStart(ev) {
+  if (props.groupId) {
+    // Group member → typed payload (sets text/plain too) so the tab
+    // can be moved or split across macro tab-groups.
+    drag.onTabDragStart(ev, props.groupId, props.tab.id)
+    return
+  }
   ev.dataTransfer.effectAllowed = "move"
   ev.dataTransfer.setData("text/plain", props.tab.id)
 }

@@ -38,7 +38,7 @@
           <span class="text-warm-400 font-mono text-[10px]">
             {{ chat.getJobElapsed(job) }}
           </span>
-          <button class="text-warm-400 hover:text-coral transition-colors opacity-0 group-hover:opacity-100" :title="t('common.stopTask')" @click="stopJob(jobId, job.name)">
+          <button class="text-warm-400 hover:text-coral transition-colors hover-only-action" :title="t('common.stopTask')" @click="stopJob(jobId, job.name)">
             <span class="i-carbon-close text-[10px]" />
           </button>
         </div>
@@ -75,7 +75,12 @@ const props = defineProps({
   instance: { type: Object, default: null },
 })
 
-const chat = useChatStore()
+// Bind to the instance prop EXPLICITLY — matches StatusDashboard's
+// pattern.  Two sessions with the same creature config name share
+// scope when ``injectScope()`` returns null and ``useChatStore()``
+// falls back to the "default" singleton, which is what produced the
+// "identical token usage across two sessions" symptom.
+const chat = useChatStore(props.instance?.id || props.instance?.graph_id || undefined)
 const { t } = useI18n()
 
 const jobCount = computed(() => Object.keys(chat.runningJobs || {}).length)

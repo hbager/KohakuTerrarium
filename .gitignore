@@ -18,6 +18,14 @@ poc/
 .coverage*
 kt-tipo-agent/
 *-old/
+kt-paper/
+
+# Registry hub frontend lives in a dedicated companion repo
+# (Kohaku-Lab/kohaku-registry-hub).  Cloned locally into
+# ./registry-hub/ for convenient side-by-side development with the
+# framework; never committed back into this repo.  See
+# plans/1.5.0-roadmap/07-registry-hub/ for the design + impl plan.
+/registry-hub/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -96,3 +104,9 @@ dep/
 # ``scripts/prep_local_briefcase.py`` before ``briefcase create``.
 # Either way the contents are build artifacts, not source.
 /bundled-release/
+
+# Mobile-UX audit working tree — Playwright + Pillow renders, MD
+# write-ups, capture/annotate scripts.  Lives in-tree for sharing
+# inside the agent loop but never committed (binary screenshots +
+# rapidly-iterated notes).
+/audit/

@@ -34,6 +34,21 @@ from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
+
+def branch_status_payload(agent: Any, status: str) -> dict[str, Any]:
+    """Status dict for ``regenerate`` / ``edit_message`` carrying the
+    agent's just-opened ``(turn_index, branch_id)`` so the frontend
+    navigator promotes without waiting for the post-turn resync.
+    """
+    out: dict[str, Any] = {"status": status}
+    ti, bi = getattr(agent, "_turn_index", None), getattr(agent, "_branch_id", None)
+    if isinstance(ti, int):
+        out["turn_index"] = ti
+    if isinstance(bi, int):
+        out["branch_id"] = bi
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Env / system prompt / working dir
 # ---------------------------------------------------------------------------
@@ -113,10 +128,11 @@ def agent_patch_scratchpad(
         try:
             store.save_state(agent.config.name, scratchpad=result)
         except Exception as e:  # pragma: no cover - defensive
-            logger.debug(
+            logger.warning(
                 "scratchpad snapshot persist skipped",
                 agent=getattr(getattr(agent, "config", None), "name", "?"),
                 error=str(e),
+                exc_info=True,
             )
     return result
 
@@ -534,10 +550,48 @@ def _resumable_events(
         return []
 
 
+def agent_live_job_ids(agent: Any) -> set[str]:
+    """Best-effort union of "still actually running" job ids on an agent.
+
+    ``_direct_job_meta`` only tracks jobs the controller is *currently*
+    awaiting in the foreground turn. A background-promoted sub-agent
+    (or executor-backed background tool) is dropped from
+    ``_direct_job_meta`` the moment it's promoted, even though
+    ``subagent_manager`` / ``executor`` still own its live task. Bug 1
+    surfaces because ``normalize_resumable_events`` synthesised an
+    "Interrupted by session resume" terminal for those background jobs
+    — the frontend then rendered the still-live bubble as interrupted.
+    Union all three sources so the synthesis only fires for genuinely
+    dead jobs.
+    """
+    live: set[str] = set(getattr(agent, "_direct_job_meta", {}).keys())
+    sub_mgr = getattr(agent, "subagent_manager", None)
+    if sub_mgr is not None:
+        try:
+            for status in sub_mgr.get_running_jobs():
+                jid = getattr(status, "job_id", None)
+                if isinstance(jid, str) and jid:
+                    live.add(jid)
+        except Exception:  # pragma: no cover - defensive
+            pass
+    executor = getattr(agent, "executor", None)
+    if executor is not None:
+        get_running = getattr(executor, "get_running_jobs", None)
+        if callable(get_running):
+            try:
+                for status in get_running():
+                    jid = getattr(status, "job_id", None)
+                    if isinstance(jid, str) and jid:
+                        live.add(jid)
+            except Exception:  # pragma: no cover - defensive
+                pass
+    return live
+
+
 def chat_history_for(engine: Terrarium, creature_id: str) -> dict[str, Any]:
     creature = engine.get_creature(creature_id)
     agent = creature.agent
-    live_jobs = set(getattr(agent, "_direct_job_meta", {}).keys())
+    live_jobs = agent_live_job_ids(agent)
     # Agent-attached store is primary; the engine's lifecycle-attached
     # store (``_session_stores[graph_id]``) is the fallback for agents
     # that never got an agent-level attach (older terrarium recipes).
@@ -806,6 +860,7 @@ def normalize_command_args(args: str | dict[str, Any] | None) -> str:
 __all__ = [
     "agent_env",
     "agent_execute_command",
+    "agent_live_job_ids",
     "agent_get_module_options",
     "agent_get_native_tool_options",
     "agent_get_plugin_options",

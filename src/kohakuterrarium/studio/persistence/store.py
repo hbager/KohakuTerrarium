@@ -1,22 +1,26 @@
-"""Saved-session list / delete / index for the persistence layer.
+"""Per-session filesystem + history helpers for the persistence layer.
 
-Verbatim port of the listing helpers and per-target history shaping
-that previously lived in ``api/routes/sessions.py``. The HTTP route
-files in ``api/routes/persistence/`` provide the FastAPI surface; all
-filesystem and SessionStore logic lives here so the CLI and HTTP
-share one implementation.
+The HTTP route files in ``api/routes/persistence/`` provide the
+FastAPI surface; all filesystem + per-store helpers live here so
+CLI and HTTP share one implementation.
+
+Listing, search, and aggregation no longer live here — they are
+served by the session-index sidecar
+(``studio/persistence/session_index/``).  This module owns only the
+per-session operations: resolve / list-files / delete / history /
+disk-usage.
 """
 
+import gc
 import os
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.studio.persistence import session_index as persistent_index
+from kohakuterrarium.studio.persistence.session_index import (
+    get_session_index_default,
+)
 from kohakuterrarium.studio.persistence.viewer.paths import (
     all_session_files,
     all_versions_for_session,
@@ -34,13 +38,6 @@ logger = get_logger(__name__)
 # below also accept an explicit ``session_dir`` argument so callers
 # that need full isolation (CLI tooling) can opt out of the singleton.
 _SESSION_DIR = Path.home() / ".kohakuterrarium" / "sessions"
-
-
-# In-memory session index (built once, refreshed on demand)
-_session_index: list[dict] = []
-_index_built_at: float = 0
-_index_signature: tuple[tuple[str, float], ...] = ()
-_index_rebuild_lock = threading.RLock()
 
 
 def _session_dir() -> Path:
@@ -73,359 +70,9 @@ def _session_dir() -> Path:
     return config_dir() / "sessions"
 
 
-def _max_mtime(path: Path) -> float:
-    """Most-recent mtime across the session file + its SQLite sidecars.
-
-    SQLite WAL mode writes most data to ``foo.kohakutr-wal`` and
-    ``foo.kohakutr-shm`` *before* the main file is checkpointed.
-    Reading only the main file's mtime would mis-order in-progress
-    sessions — the canonical file may be hours behind the active wal.
-
-    O(N) with three ``stat`` calls per session — `path` always exists
-    (caller is :func:`pick_canonical_per_session`); the ``-wal`` and
-    ``-shm`` sidecars are checked via :func:`os.path.exists` first and
-    only stat'd when present. Returns 0 if the main file vanished
-    between listdir and stat.
-    """
-    try:
-        best = path.stat().st_mtime
-    except OSError:
-        return 0.0
-    for sidecar_suffix in ("-wal", "-shm"):
-        sidecar = str(path) + sidecar_suffix
-        if not os.path.exists(sidecar):
-            continue
-        try:
-            mt = os.stat(sidecar).st_mtime
-        except OSError:
-            continue
-        if mt > best:
-            best = mt
-    return best
-
-
-def _extract_text_preview(content: Any, limit: int = 200) -> str:
-    """Pull display text out of an event's ``content`` field.
-
-    Multi-modal events store ``content`` as a list of parts
-    ``[{"type":"text","text":"..."}, {"type":"image_url",...}]``. We
-    flatten by joining every text part with a space; non-text parts
-    contribute a single ``[image]`` / ``[file]`` token so the user
-    sees that *something* multi-modal exists without leaking a base64
-    blob into the preview.
-
-    String content passes through unchanged.
-    """
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content[:limit]
-    if isinstance(content, list):
-        bits: list[str] = []
-        for part in content:
-            if isinstance(part, str):
-                bits.append(part)
-            elif isinstance(part, dict):
-                kind = part.get("type") or ""
-                if kind == "text":
-                    bits.append(str(part.get("text") or ""))
-                elif kind == "image_url" or kind == "image":
-                    bits.append("[image]")
-                elif kind == "file":
-                    bits.append("[file]")
-                else:
-                    # Unknown structured part — keep a hint without
-                    # dumping internals.
-                    bits.append(f"[{kind or 'attachment'}]")
-        return " ".join(b for b in bits if b)[:limit]
-    if isinstance(content, dict):
-        # Single multi-modal part stored as a dict.
-        return _extract_text_preview([content], limit)
-    return str(content)[:limit]
-
-
-def _read_session_entry(path: Path) -> dict:
-    """Open one session file, extract index payload, close. Used in pool."""
-    try:
-        store = SessionStore(path)
-        try:
-            meta = store.load_meta()
-
-            # Read first user message for preview. Multi-modal events
-            # carry ``content`` as a list of parts; flatten via
-            # :func:`_extract_text_preview` so the listing surface
-            # never embeds a base64 image blob.
-            preview = ""
-            try:
-                agent_name = (meta.get("agents") or [""])[0]
-                if agent_name:
-                    events = store.get_resumable_events(agent_name)
-                    for evt in events:
-                        if evt.get("type") == "user_input":
-                            preview = _extract_text_preview(evt.get("content"))
-                            if preview:
-                                break
-            except Exception as e:
-                logger.debug(
-                    "Failed to read session preview", error=str(e), exc_info=True
-                )
-
-            lineage = meta.get("lineage") or {}
-            forked_children = meta.get("forked_children") or []
-            # Cheap probe for "does this session have a vector index?".
-            # Reading the ``vec_dimensions`` state key the index builder
-            # writes is enough to answer the boolean. We DELIBERATELY
-            # avoid opening a fresh ``SessionMemory`` here even though
-            # it'd be more authoritative — the listing scans every
-            # saved session with up to 32 worker threads, and each
-            # SessionMemory open holds 3 native SQLite handles whose
-            # release timing is touchy on Windows (see the
-            # ``SessionMemory.close()`` docstring). A bare state read
-            # uses the already-open SessionStore's handle and never
-            # opens a new one.
-            has_vector_index = False
-            try:
-                saved_dims = store.state.get("vec_dimensions")
-                if isinstance(saved_dims, int) and saved_dims > 0:
-                    has_vector_index = True
-            except (KeyError, Exception) as e:
-                logger.debug(
-                    "Failed to probe vector index",
-                    error=str(e),
-                    path=str(path),
-                )
-            return {
-                # Canonical name strips the version suffix so v1+v2 of
-                # the same session show as one entry — and the name
-                # round-trips through delete/resume cleanly.
-                "name": normalize_session_stem(path),
-                "filename": path.name,
-                "config_type": meta.get("config_type", "unknown"),
-                "config_path": meta.get("config_path", ""),
-                "terrarium_name": meta.get("terrarium_name", ""),
-                "agents": meta.get("agents", []),
-                "status": meta.get("status", ""),
-                "created_at": meta.get("created_at", ""),
-                "last_active": meta.get("last_active", ""),
-                "preview": preview,
-                "pwd": meta.get("pwd", ""),
-                "format_version": meta.get("format_version", 1),
-                "has_vector_index": has_vector_index,
-                # Per-saved ``node_id`` (added 2026-05-13): the
-                # ``SessionMirrorWriter`` stamps this on the first
-                # mirrored event arrival so the saved-session listing
-                # can colour / badge entries by originating worker.
-                # Absent (``""``) entries are host-local; the frontend
-                # treats absent and ``"_host"`` identically.
-                "node_id": meta.get("on_node", ""),
-                # Wave E lineage for the fork tree in the lister.
-                "parent_session_id": (
-                    (lineage.get("fork") or {}).get("parent_session_id")
-                    if isinstance(lineage, dict)
-                    else None
-                ),
-                "fork_point": (
-                    (lineage.get("fork") or {}).get("fork_point")
-                    if isinstance(lineage, dict)
-                    else None
-                ),
-                "forked_children": [
-                    c.get("session_id") if isinstance(c, dict) else c
-                    for c in forked_children
-                ],
-                "migrated_from_version": (
-                    lineage.get("migration", {}).get("source_version")
-                    if isinstance(lineage, dict)
-                    else None
-                ),
-            }
-        finally:
-            store.close(update_status=False)
-    except Exception as e:
-        _ = e  # corrupt session file, show as error entry
-        return {
-            "name": normalize_session_stem(path),
-            "filename": path.name,
-            "error": True,
-        }
-
-
-def _entry_time_ts(entry: dict, fallback: float = 0.0) -> float:
-    """Sortable timestamp matching the session-list display time."""
-    for key in ("last_active", "created_at"):
-        value = entry.get(key)
-        if not value:
-            continue
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
-            try:
-                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt.timestamp()
-            except ValueError:
-                continue
-    return fallback
-
-
-def _session_file_signature(
-    session_dir: Path | None = None,
-) -> tuple[list[Path], tuple[tuple[str, float], ...]]:
-    """Return canonical files plus a cheap change signature."""
-    session_dir = session_dir or _session_dir()
-    if not session_dir.exists():
-        return [], ()
-    session_files = pick_canonical_per_session(session_dir)
-    signature = tuple((str(path), _max_mtime(path)) for path in session_files)
-    return session_files, signature
-
-
-# Cap thread count: SQLite-over-network is GIL-friendly for I/O but
-# a runaway pool also opens too many file handles. ``min(32, cpus*4)``
-# matches Python's default ThreadPoolExecutor heuristic.
-_MAX_INDEX_WORKERS = min(32, (os.cpu_count() or 4) * 4)
-
-
-def build_session_index() -> list[dict]:
-    """Build index of all sessions. Cached in memory."""
-    with _index_rebuild_lock:
-        return _build_session_index_unlocked()
-
-
-def _build_session_index_unlocked() -> list[dict]:
-    """Build index of all sessions. Caller must hold ``_index_rebuild_lock``.
-
-    Two-phase:
-
-    1. **mtime sort** — stat the session file + its ``-wal`` / ``-shm``
-       sidecars to derive a true "last touched" timestamp without
-       opening the database. This is O(N) tiny syscalls — fast enough
-       to handle thousands of sessions in milliseconds.
-    2. **Parallel reads** — open each SessionStore on a worker thread
-       to read meta + first user-message preview. SQLite open + a
-       handful of point queries is I/O-bound, so the GIL doesn't
-       serialise the wait. Workers are capped at
-       :data:`_MAX_INDEX_WORKERS`.
-    """
-    global _session_index, _index_built_at, _index_signature
-
-    session_dir = _session_dir()
-    session_files, signature = _session_file_signature(session_dir)
-    if not session_files:
-        _session_index = []
-        _index_signature = signature
-        _index_built_at = time.time()
-        return _session_index
-
-    # Wave D auto-migration leaves both ``foo.kohakutr`` (v1 rollback)
-    # and ``foo.kohakutr.v2`` (live) on disk. Surface only the highest-
-    # versioned file per logical session; delete/resume still reach
-    # both files via ``all_versions_for_session``.
-    session_files = pick_canonical_per_session(session_dir)
-
-    # Phase 1: sort by max(file, wal, shm) mtime — newest first. This
-    # is the canonical sort key for the index; we never re-sort by
-    # DB-derived ``last_active`` because that would require every
-    # entry's meta to be readable + parseable just to order the list.
-    # Strict O(N) — three stats per session, sidecars existence-
-    # checked first.
-    sortable = sorted(
-        ((p, _max_mtime(p)) for p in session_files),
-        key=lambda pair: pair[1],
-        reverse=True,
-    )
-    ordered_paths = [p for p, _ in sortable]
-
-    # Phase 2: parallel SQLite opens to extract meta + preview for
-    # display. ``ThreadPoolExecutor.map`` preserves input order, so we
-    # can pair each result with the mtime fallback collected above.
-    if not ordered_paths:
-        results = []
-    else:
-        worker_count = min(_MAX_INDEX_WORKERS, len(ordered_paths))
-        with ThreadPoolExecutor(max_workers=worker_count) as pool:
-            results = list(pool.map(_read_session_entry, ordered_paths))
-
-    # Final sort uses the same timestamp the workspace list displays.
-    # File/WAL/SHM mtime is only a fallback for corrupt/legacy entries
-    # without meta timestamps; using mtime first made the visible order
-    # disagree with ``last_active``.
-    mtime_by_path = {p: mt for p, mt in sortable}
-    results = [
-        entry
-        for entry, _path in sorted(
-            zip(results, ordered_paths),
-            key=lambda pair: _entry_time_ts(pair[0], mtime_by_path.get(pair[1], 0.0)),
-            reverse=True,
-        )
-    ]
-
-    _session_index = results
-    _index_signature = signature
-    _index_built_at = time.time()
-    return results
-
-
-def get_session_index(max_age: float = 30.0) -> list[dict]:
-    """Get cached session index, rebuild if stale or files changed."""
-    _files, signature = _session_file_signature()
-    if signature == _index_signature and time.time() - _index_built_at <= max_age:
-        return _session_index
-
-    with _index_rebuild_lock:
-        _files, signature = _session_file_signature()
-        if signature == _index_signature and time.time() - _index_built_at <= max_age:
-            return _session_index
-        return _build_session_index_unlocked()
-
-
 def all_session_files_default() -> list[Path]:
     """Every session file under the default ``_SESSION_DIR`` (Wave-D-aware)."""
     return all_session_files(_session_dir())
-
-
-def list_sessions_page(
-    *,
-    limit: int = 20,
-    offset: int = 0,
-    search: str = "",
-    refresh: bool = False,
-) -> dict[str, Any]:
-    """Page saved sessions via the persistent materialized index.
-
-    Unlike the legacy in-memory index, this does not open every session
-    SQLite database on normal list calls. ``refresh=True`` performs an
-    explicit repair/backfill of ``sessions_index.sqlite`` first.
-    """
-    session_dir = _session_dir()
-    if refresh:
-        persistent_index.refresh_index(session_dir)
-    return persistent_index.query_sessions(
-        session_dir,
-        limit=limit,
-        offset=offset,
-        search=search,
-    )
-
-
-def session_stats() -> dict[str, Any]:
-    """Aggregations over the persistent saved-session index.
-
-    Pure read of ``sessions_index.sqlite`` after first-run lightweight
-    backfill. Returns:
-
-        {
-            "count": int,
-            "by_config_type":  {<type>: <n>, ...},
-            "by_status":       {<status>: <n>, ...},
-            "by_recency":      {"1d": <n>, "7d": <n>, "30d": <n>, "older": <n>},
-            "by_format_version": {"1": <n>, "2": <n>, ...},
-            "agents_top": [[<agent>, <n>], ...],
-            "average_age_seconds": float | None,
-        }
-    """
-    return persistent_index.query_stats(_session_dir())
 
 
 def disk_usage() -> dict[str, Any]:
@@ -565,12 +212,64 @@ def session_history_payload(store: SessionStore, target: str) -> dict[str, Any]:
     }
 
 
+def _unlink_with_retry(path: Path, attempts: int = 5, base_delay: float = 0.05) -> None:
+    """Best-effort ``unlink`` with exponential backoff.
+
+    The motivating bug (#59): on Windows the user views a session in
+    the viewer, the viewer route closes its ``SessionStore`` (which
+    ``del``s the native ``_inner`` handles), but the OS-level file
+    lock on ``.kohakutr`` / ``-wal`` / ``-shm`` can linger for a few
+    milliseconds while Python's refcount-driven destructor finishes
+    inside the worker thread.  A delete fired immediately after the
+    view close then races and raises ``PermissionError`` (WinError
+    32, "the process cannot access the file because it is being
+    used by another process").
+
+    Five attempts with 50 / 100 / 200 / 400 / 800 ms gaps cover that
+    window cheaply (worst-case ~1.5 s before re-raise — still a
+    snappy interaction).  POSIX never hits this branch because
+    ``unlink`` succeeds on first try regardless of open handles.
+    """
+    last_exc: OSError | None = None
+    for i in range(attempts):
+        try:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return  # already gone — idempotent.
+        except PermissionError as e:
+            last_exc = e
+            # Nudge CPython to release any straggling C-side handles
+            # before the next try (KohakuVault's native ``_KVault``
+            # holds the SQLite connection via refcount).
+            gc.collect()
+            time.sleep(base_delay * (2**i))
+    assert last_exc is not None
+    raise last_exc
+
+
+def _sidecars_for(path: Path) -> list[Path]:
+    """Return existing ``-wal`` / ``-shm`` sidecars for a SQLite file."""
+    out: list[Path] = []
+    for suffix in ("-wal", "-shm"):
+        sidecar = path.with_name(path.name + suffix)
+        if sidecar.exists():
+            out.append(sidecar)
+    return out
+
+
 def delete_session_files(session_name: str) -> list[Path]:
     """Delete every on-disk file belonging to ``session_name``.
 
     Returns the list of deleted paths. Returns an empty list when no
     matching file exists; the caller maps that to a 404. Falls back to
     fuzzy lookup if the user passes a legacy raw stem.
+
+    Also drops the deleted entries from the session-index sidecar
+    so the next ``list``/``stats`` call doesn't surface them.  Both
+    callers (the FastAPI route and ``Studio.persistence.delete``)
+    flow through here; without this purge the Studio surface returns
+    deleted sessions until the next ``reconcile()``.
     """
     targets = all_versions_for_session_default(session_name)
     if not targets:
@@ -583,19 +282,45 @@ def delete_session_files(session_name: str) -> list[Path]:
     if not targets:
         return []
 
-    global _index_built_at, _session_index, _index_signature
-    deleted: list[Path] = []
-    deleted_names = {normalize_session_stem(path) for path in targets}
+    # Each main file may have ``-wal`` + ``-shm`` sidecars.  Delete
+    # them too — orphan sidecars don't show up as phantom list rows
+    # (the listing globs ``*.kohakutr*``, not ``-wal``) but they
+    # waste disk and would confuse a re-create of a session with the
+    # same name.  Sidecars first so the main file's lock can release
+    # cleanly.
     for path in targets:
-        path.unlink(missing_ok=True)
-        deleted.append(path)
-        # Also remove SQLite WAL/SHM sidecars so Windows doesn't leave
-        # orphaned lock files that prevent future operations.
-        for suffix in ("-wal", "-shm"):
-            Path(str(path) + suffix).unlink(missing_ok=True)
-    _session_index = [s for s in _session_index if s.get("name") not in deleted_names]
-    _index_signature = ()
-    _index_built_at = 0
-    for name in deleted_names:
-        persistent_index.delete_session_name(name, session_dir=_session_dir())
-    return deleted
+        for sidecar in _sidecars_for(path):
+            try:
+                _unlink_with_retry(sidecar)
+            except OSError as e:
+                logger.warning(
+                    "Failed to remove SQLite sidecar",
+                    sidecar=str(sidecar),
+                    error=str(e),
+                )
+
+    for path in targets:
+        _unlink_with_retry(path)
+
+    _purge_index_entries(targets)
+    return targets
+
+
+def _purge_index_entries(deleted_paths: list[Path]) -> None:
+    """Drop the just-deleted filenames from the session-index sidecar.
+
+    Best-effort: an exception here doesn't block the delete from
+    succeeding — the next ``reconcile`` would catch the orphans
+    anyway.  The previously-route-side eager purge moved here so
+    every caller path (FastAPI, ``Studio.persistence.delete``) goes
+    through the same flow.
+    """
+    try:
+        session_dir = _session_dir()
+        index = get_session_index_default(session_dir)
+        for path in deleted_paths:
+            index.delete(path.name)
+    except Exception as exc:  # noqa: BLE001 — best-effort
+        logger.warning(
+            "session-index purge after delete failed", error=str(exc), exc_info=True
+        )

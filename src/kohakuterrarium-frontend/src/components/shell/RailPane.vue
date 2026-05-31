@@ -4,7 +4,7 @@
       <!-- Brand + cluster pill + command palette trigger -->
       <div class="relative flex items-center gap-2 px-3 py-3">
         <BrandMark class="w-7 h-7 rounded-full shrink-0" />
-        <span class="text-sm flex-1 truncate">
+        <span class="kt-text-body flex-1 truncate">
           <span class="font-bold text-amber">Kohaku</span>
           <span class="font-light text-iolite-light dark:text-iolite-light">Terrarium</span>
         </span>
@@ -42,8 +42,8 @@
         <HostStatusChip :show-label="true" @open="openHostPicker" />
       </div>
       <div class="flex items-center justify-between gap-2 px-3 py-2">
-        <button class="w-5 h-5 flex items-center justify-center text-warm-400 hover:text-warm-700" :class="theme.dark ? 'i-carbon-sun' : 'i-carbon-moon'" :title="theme.dark ? t('shell.rail.themeToLight') : t('shell.rail.themeToDark')" @click="theme.toggle()" />
-        <button class="text-[10px] uppercase tracking-wider text-warm-400 hover:text-warm-700" :title="t('shell.rail.cycleLocale')" @click="cycleLocale">
+        <button class="w-9 h-9 sm:w-5 sm:h-5 flex items-center justify-center text-warm-400 hover:text-warm-700 rounded sm:rounded-none" :class="theme.dark ? 'i-carbon-sun' : 'i-carbon-moon'" :title="theme.dark ? t('shell.rail.themeToLight') : t('shell.rail.themeToDark')" @click="theme.toggle()" />
+        <button class="text-xs sm:text-[10px] uppercase tracking-wider text-warm-400 hover:text-warm-700 px-2 py-1 rounded" :title="t('shell.rail.cycleLocale')" @click="cycleLocale">
           {{ locale.current ?? "en" }}
         </button>
       </div>

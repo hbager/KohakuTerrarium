@@ -336,8 +336,14 @@ export default {
 
   "chat.noMessagesYet": "尚无消息",
   "chat.getStarted": "发送消息开始使用",
-  "chat.processing": "处理中...",
+  "chat.processing": "KohakUwUing...",
   "chat.queued": "排队中",
+  "chat.pendingBanner": ({ count }) =>
+    count === 1 ? "有 1 个待处理请求等待回复" : `有 ${count} 个待处理请求等待回复`,
+  "chat.pendingShow": "查看",
+  "chat.toolBatchHeader": ({ count }) => `${count} 次工具调用`,
+  "chat.toolBatchExpand": "展开工具调用",
+  "chat.toolBatchCollapse": "折叠工具调用",
   "chat.selectTab": "请选择分页...",
   "chat.sendToChannel": "发送到 {channel} 频道...",
   "chat.messagePlaceholder": "输入消息...",

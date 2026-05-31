@@ -1,11 +1,11 @@
 <template>
   <div>
     <div class="px-3 py-1">
-      <span class="text-[10px] uppercase tracking-wider text-warm-500 font-medium"> {{ t("shell.rail.quick") }} </span>
+      <span class="kt-text-caption uppercase tracking-wider text-warm-500 font-medium"> {{ t("shell.rail.quick") }} </span>
     </div>
     <div class="flex flex-col gap-0.5">
-      <button v-for="entry in entries" :key="entry.id" class="flex items-center gap-2 px-3 py-1.5 text-sm text-warm-600 dark:text-warm-400 hover:bg-warm-300/50 dark:hover:bg-warm-700/50 hover:text-warm-800 dark:hover:text-warm-200 cursor-pointer text-left" @click="entry.action">
-        <span :class="entry.icon" class="text-sm shrink-0" />
+      <button v-for="entry in entries" :key="entry.id" class="flex items-center gap-2 px-3 py-1.5 kt-text-body text-warm-600 dark:text-warm-400 hover:bg-warm-300/50 dark:hover:bg-warm-700/50 hover:text-warm-800 dark:hover:text-warm-200 cursor-pointer text-left" @click="entry.action">
+        <span :class="entry.icon" class="kt-text-body shrink-0" />
         <span>{{ entry.label }}</span>
       </button>
     </div>
@@ -25,12 +25,22 @@ import NewCreatureModal from "@/components/shell/modals/NewCreatureModal.vue"
 import NewTerrariumModal from "@/components/shell/modals/NewTerrariumModal.vue"
 import ResumeSessionModal from "@/components/shell/modals/ResumeSessionModal.vue"
 import AdvancedStartModal from "@/components/shell/modals/AdvancedStartModal.vue"
+import GraphEditorTab from "@/components/graph-editor/GraphEditorTab.vue"
+import { registerTabKind, tabKindRegistry } from "@/stores/tabKindRegistry"
+import { useAuthStore } from "@/stores/auth"
 import { useTabsStore } from "@/stores/tabs"
 import { useStudioWorkspaceStore } from "@/stores/studio/workspace"
 import { buildStudioTabId } from "@/utils/tabsUrl"
 import { useI18n } from "@/utils/i18n"
 
+// Register the graph-editor tab kind once at module load. Idempotent
+// guard against repeated registrations (HMR / multiple rail mounts).
+if (!tabKindRegistry.has("graph-editor")) {
+  registerTabKind({ kind: "graph-editor", component: GraphEditorTab })
+}
+
 const tabs = useTabsStore()
+const auth = useAuthStore()
 const ws = useStudioWorkspaceStore()
 const modal = ref(null)
 const { t } = useI18n()
@@ -123,5 +133,18 @@ const entries = computed(() => [
     icon: "i-carbon-settings",
     action: () => tabs.openTab({ kind: "settings", id: "settings" }),
   },
+  // Admin portal — only for an admin-role user on a multi-user host.
+  // ``isAdmin`` is false on single-user / anonymous hosts, so this
+  // entry simply doesn't render there.
+  ...(auth.isAdmin
+    ? [
+        {
+          id: "admin",
+          label: t("shell.quick.admin"),
+          icon: "i-carbon-user-admin",
+          action: () => tabs.openTab({ kind: "admin", id: "admin" }),
+        },
+      ]
+    : []),
 ])
 </script>

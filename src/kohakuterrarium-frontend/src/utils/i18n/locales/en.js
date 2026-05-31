@@ -384,7 +384,7 @@ export default {
 
   "chat.noMessagesYet": "No messages yet",
   "chat.getStarted": "Send a message to get started",
-  "chat.processing": "Processing...",
+  "chat.processing": "KohakUwUing...",
   "chat.queued": "queued",
   "chat.selectTab": "Select a tab...",
   "chat.sendToChannel": "Send to {channel} channel...",
@@ -402,6 +402,17 @@ export default {
   "chat.dropToAttach": "Drop files to attach",
   "chat.queueShowMore": ({ count }) => `+${count} more queued`,
   "chat.queueCollapse": "Show fewer",
+  "chat.pendingBanner": ({ count }) =>
+    count === 1
+      ? "1 pending request needs your reply"
+      : `${count} pending requests need your reply`,
+  "chat.pendingShow": "show",
+  "chat.attachFile": "Attach file",
+  "chat.attachImage": "Attach image",
+  "chat.moreActions": "More actions",
+  "chat.toolBatchHeader": ({ count }) => `${count} tool calls`,
+  "chat.toolBatchExpand": "Expand tool calls",
+  "chat.toolBatchCollapse": "Collapse tool calls",
   "chat.cumulativeInputTokens": "Cumulative input tokens",
   "chat.cachedInputTokens": "Cached input tokens",
   "chat.cumulativeOutputTokens": "Cumulative output tokens",
@@ -1108,6 +1119,7 @@ export default {
   "shell.quick.sessions": "Sessions",
   "shell.quick.stats": "Stats",
   "shell.quick.settings": "Settings",
+  "shell.quick.admin": "Admin",
 
   // Tab strip context menu + tooltips
   "shell.tab.refresh": "Refresh content",
@@ -1331,6 +1343,134 @@ export default {
   "hostPicker.removeAction": "Remove",
   "hostPicker.editAction": "Edit",
   "hostPicker.noHosts": "No hosts saved yet. Add one above, or scan a host QR.",
+  "hostPicker.adminToken": "Admin token",
+  "hostPicker.adminTokenOptional": "(only if host has admin token)",
+  "hostPicker.adminTokenPlaceholder": "kt-admin-token",
+  "hostPicker.adminTokenSet": "admin set",
+  "hostPicker.session": "Session",
+  "hostPicker.notSignedIn": "Not signed in",
+
+  // ── Auth — L4 user accounts ─────────────────────────────────────
+  "auth.login.title": "Log in",
+  "auth.login.hint": ({ host }) => (host ? `Log in to ${host}` : "Log in to this host"),
+  "auth.login.username": "Username",
+  "auth.login.password": "Password",
+  "auth.login.submit": "Log in",
+  "auth.login.register": "Register",
+  "auth.login.toggleToRegister": "Need an account? Register",
+  "auth.login.toggleToLogin": "Have an account? Log in",
+  "auth.login.invitationToken": "Invitation token",
+  "auth.login.invitationHint": "This host requires an invitation token to register.",
+  "auth.login.registrationClosed":
+    "This host does not allow self-registration. Ask the operator to add you (kt admin users add).",
+  "auth.login.invalidCredentials": "Invalid username or password.",
+  "auth.login.connectionFailed":
+    "Could not reach the host. Check the URL and host token, then try again.",
+  "auth.login.cancel": "Cancel",
+  "auth.user.menuTitle": ({ username }) => `Logged in as ${username}`,
+  "auth.user.logout": "Log out",
+  "auth.gate.required": "This host requires login. Please sign in to continue.",
+  "auth.admin.title": "Admin token required",
+  "auth.admin.hint":
+    "This operation needs the host's admin token (X-Admin-Token). Paste it below — it will be stored locally and sent on future config-mutating requests.",
+  "auth.admin.placeholder": "kt-admin-token",
+  "auth.admin.submit": "Save & retry",
+  "auth.admin.cancel": "Cancel",
+
+  // ── Account self-service (L4 — current user) ────────────────────
+  "auth.account.signedInAs": ({ username }) => `Signed in as ${username}`,
+  "auth.account.lastLogin": "Last login",
+  "auth.account.never": "never",
+  "auth.account.changePassword": "Change password",
+  "auth.account.currentPassword": "Current password",
+  "auth.account.newPassword": "New password",
+  "auth.account.confirmPassword": "Confirm new password",
+  "auth.account.passwordMismatch": "New passwords do not match.",
+  "auth.account.passwordChanged": "Password changed.",
+  "auth.account.passwordWrong": "Current password is incorrect.",
+  "auth.account.passwordFailed": ({ error }) => `Could not change password: ${error}`,
+  "auth.account.tokens": "API tokens",
+  "auth.account.tokensHint":
+    "Personal access tokens for the API / CLI. The secret is shown only once, at creation.",
+  "auth.account.tokenNamePlaceholder": "my-laptop",
+  "auth.account.createToken": "Create token",
+  "auth.account.newTokenTitle": "New token — copy it now",
+  "auth.account.newTokenHint":
+    "This is the only time the secret is shown. Store it somewhere safe.",
+  "auth.account.copy": "Copy",
+  "auth.account.copied": "Copied to clipboard",
+  "auth.account.copyFailed": "Clipboard unavailable — copy it manually.",
+  "auth.account.noTokens": "No API tokens yet.",
+  "auth.account.created": "Created",
+  "auth.account.lastUsed": "Last used",
+  "auth.account.revoke": "Revoke",
+  "auth.account.revokeConfirm": ({ name }) =>
+    `Revoke token "${name}"? Any client using it will stop working.`,
+  "auth.account.revoked": "Token revoked.",
+
+  // ── Admin portal (L4 — admin-role user management) ──────────────
+  "admin.portal.title": "Admin",
+  "admin.portal.subtitle": "Manage users, invitations, and host security for this server.",
+  "admin.portal.notAuthorized": "You need an admin account to view this page.",
+  "admin.portal.tabs.users": "Users",
+  "admin.portal.tabs.invitations": "Invitations",
+  "admin.portal.tabs.security": "Security",
+
+  "admin.users.subtitle": "All accounts on this host.",
+  "admin.users.create": "Create user",
+  "admin.users.username": "Username",
+  "admin.users.password": "Password",
+  "admin.users.role": "Role",
+  "admin.users.active": "Active",
+  "admin.users.created": "Created",
+  "admin.users.lastLogin": "Last login",
+  "admin.users.actions": "Actions",
+  "admin.users.delete": "Delete",
+  "admin.users.deleteConfirm": ({ username }) =>
+    `Delete user "${username}"? This cannot be undone.`,
+  "admin.users.deleted": "User deleted.",
+  "admin.users.createdOk": "User created.",
+  "admin.users.you": "you",
+  "admin.users.none": "No users.",
+
+  "admin.invitations.subtitle": "Single-use registration tokens.",
+  "admin.invitations.create": "Create invitation",
+  "admin.invitations.id": "ID",
+  "admin.invitations.role": "Role",
+  "admin.invitations.expiresInHours": "Expires in (hours)",
+  "admin.invitations.expiresOptional": "(blank = no expiry)",
+  "admin.invitations.expiresAt": "Expires",
+  "admin.invitations.created": "Created",
+  "admin.invitations.createdOk": "Invitation created.",
+  "admin.invitations.noExpiry": "no expiry",
+  "admin.invitations.newTitle": "Invitation created — copy the token now",
+  "admin.invitations.linkHint":
+    "Give this token to the invitee — they paste it into the invitation field when registering. Shown only once.",
+  "admin.invitations.copyToken": "Copy token",
+  "admin.invitations.revoke": "Revoke",
+  "admin.invitations.revokeConfirm":
+    "Revoke this invitation? It can no longer be used to register.",
+  "admin.invitations.revoked": "Invitation revoked.",
+  "admin.invitations.none": "No active invitations.",
+
+  "admin.security.subtitle":
+    "Rotate the host (L2) and admin (L3) tokens. Rotation is live — clients must use the new value immediately.",
+  "admin.security.hostToken": "Host token (L2)",
+  "admin.security.adminToken": "Admin token (L3)",
+  "admin.security.enabled": "enabled",
+  "admin.security.disabled": "disabled",
+  "admin.security.tail": ({ tail }) => `enabled — ends with …${tail}`,
+  "admin.security.rotateHost": "Rotate host token",
+  "admin.security.rotateAdmin": "Rotate admin token",
+  "admin.security.rotateHostConfirm":
+    "Rotate the host token now? Existing clients must update to the new token or they will be rejected.",
+  "admin.security.rotateAdminConfirm":
+    "Rotate the admin token now? You must use the new token for further config changes.",
+  "admin.security.rotated": "Token rotated.",
+  "admin.security.newTokenTitle": "New token — copy it now",
+  "admin.security.newTokenHint":
+    "Shown once. Your local copy for this host was updated automatically.",
+  "admin.security.copy": "Copy",
 
   // ── Codex login modal (URL + device-code path, Android-friendly) ─
   "codexLogin.title": "Sign in to Codex",

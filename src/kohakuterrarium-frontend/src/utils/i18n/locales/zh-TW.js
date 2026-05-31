@@ -336,8 +336,14 @@ export default {
 
   "chat.noMessagesYet": "尚無訊息",
   "chat.getStarted": "傳送訊息開始使用",
-  "chat.processing": "處理中...",
+  "chat.processing": "KohakUwUing...",
   "chat.queued": "排隊中",
+  "chat.pendingBanner": ({ count }) =>
+    count === 1 ? "有 1 個待處理請求等待回覆" : `有 ${count} 個待處理請求等待回覆`,
+  "chat.pendingShow": "檢視",
+  "chat.toolBatchHeader": ({ count }) => `${count} 次工具呼叫`,
+  "chat.toolBatchExpand": "展開工具呼叫",
+  "chat.toolBatchCollapse": "收合工具呼叫",
   "chat.selectTab": "請選擇分頁...",
   "chat.sendToChannel": "傳送到 {channel} 頻道...",
   "chat.messagePlaceholder": "輸入訊息...",

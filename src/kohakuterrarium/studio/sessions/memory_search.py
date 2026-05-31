@@ -24,6 +24,9 @@ from kohakuterrarium.studio.sessions.memory_build import (
     build_index as _build_index,
 )
 from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def _live_store_for_path(
@@ -34,7 +37,7 @@ def _live_store_for_path(
     Returns ``(live_agent, live_store)``; both are ``None`` when the
     session is not currently running OR ``engine`` is ``None`` (lab-host
     mode runs no host agent engine — live creatures live on workers
-    and the host has nothing to walk).  The caller then opens a fresh
+    and the host has nothing to walk). The caller then opens a fresh
     ``SessionStore`` if needed.
     """
     if engine is None:
@@ -108,6 +111,7 @@ async def search_session_memory(
     """
     store: SessionStore | None = None
     live_store: SessionStore | None = None
+    memory: SessionMemory | None = None
     try:
         # Find the live creature (if running) to reuse its store
         # and embedder — same pattern as the search_memory builtin tool.
@@ -134,31 +138,35 @@ async def search_session_memory(
                 embedder = None
 
         memory = SessionMemory(str(path), embedder=embedder, store=store)
-        try:
-            # Index unindexed events (idempotent — skips already indexed)
-            meta = store.load_meta()
-            for agent_name in meta.get("agents", []):
-                events = store.get_events(agent_name)
-                if events:
-                    memory.index_events(agent_name, events)
 
-            results = memory.search(query=q, mode=mode, k=k, agent=agent)
-        finally:
+        # Index unindexed events (idempotent — skips already indexed)
+        meta = store.load_meta()
+        for agent_name in meta.get("agents", []):
+            events = store.get_events(agent_name)
+            if events:
+                memory.index_events(agent_name, events)
+
+        results = memory.search(query=q, mode=mode, k=k, agent=agent)
+    except Exception as e:
+        # Log the FULL traceback so we can diagnose 500s (the
+        # HTTPException detail is one line and gets surfaced to the
+        # client; the traceback is what we actually need server-side).
+        logger.exception(
+            "memory_search failed",
+            path=str(path),
+            query=q,
+            mode=mode,
+            k=k,
+            agent=agent,
+        )
+        raise HTTPException(500, f"Memory search failed: {type(e).__name__}: {e}")
+    finally:
+        if memory is not None:
             close = getattr(memory, "close", None)
             if callable(close):
                 close()
-
-        # Release the SessionMemory's own SQLite handles — without this
-        # they linger until GC and (on Windows) block a later delete of
-        # the .kohakutr file. The shared SessionStore is closed only
-        # when it isn't a live creature's store.
-        memory.close()
-        if not live_store:
-            store.close(update_status=False)
-    except Exception as e:
         if store is not None and not live_store:
             store.close(update_status=False)
-        raise HTTPException(500, f"Memory search failed: {e}")
 
     return {
         "session_name": path.stem,

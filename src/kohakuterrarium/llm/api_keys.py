@@ -11,9 +11,9 @@ Resolution order in :func:`get_api_key`:
 1. **Registered resolver** (see :func:`register_api_key_resolver`).
    Lab workers install a resolver that reads from a pre-populated
    :class:`IdentityCache`, so worker creatures making LLM calls
-   transparently route through the controller's host-canonical identity
-   store. Standalone Studio never registers one and falls straight
-   through to the local file.
+   transparently route through the controller's host-canonical
+   identity store. Standalone Studio never registers one and falls
+   straight through to the local file.
 2. Stored key in ``~/.kohakuterrarium/api_keys.yaml``.
 3. Environment variable.
 4. Empty :class:`KeyPool` (not found).
@@ -33,7 +33,7 @@ logger = get_logger(__name__)
 
 # Import-time defaults — kept for back-compat with callers that import
 # these names for *display* (``cli/identity_keys.py``, the studio
-# identity routes).  The actual read / write paths go through
+# identity routes). The actual read / write paths go through
 # :func:`_keys_path`, which resolves ``config_dir()`` fresh on every
 # call so ``KT_CONFIG_DIR`` (test isolation, operator re-homing) always
 # wins — a module constant computed once at import would not.
@@ -55,10 +55,10 @@ PROVIDER_KEY_MAP: dict[str, str] = {
     "mimo": "MIMO_API_KEY",
 }
 
-# Process-wide sync resolver hook.  ``Callable[[str], str]`` — given a
-# provider name (already normalised), returns a key or ``""``.  Set by
+# Process-wide sync resolver hook. ``Callable[[str], str]`` — given a
+# provider name (already normalised), returns a key or ``""``. Set by
 # :func:`register_api_key_resolver` and cleared by
-# :func:`clear_api_key_resolver`.  Single slot: each process has at
+# :func:`clear_api_key_resolver`. Single slot: each process has at
 # most one active resolver (workers install one; the host doesn't).
 _resolver: Callable[[str], str] | None = None
 
@@ -68,7 +68,7 @@ def register_api_key_resolver(resolver: Callable[[str], str]) -> None:
 
     Designed for the worker side of multi-node mode: the worker
     pre-fetches keys via :class:`IdentityCache` at spawn time, then
-    registers a resolver that does a sync dict lookup.  See
+    registers a resolver that does a sync dict lookup. See
     :class:`kohakuterrarium.laboratory.identity_cache.IdentityCache`.
     """
     global _resolver
@@ -76,7 +76,7 @@ def register_api_key_resolver(resolver: Callable[[str], str]) -> None:
 
 
 def clear_api_key_resolver() -> None:
-    """Remove any installed resolver.  Idempotent."""
+    """Remove any installed resolver. Idempotent."""
     global _resolver
     _resolver = None
 
@@ -175,9 +175,13 @@ def get_api_key(provider_or_env: str) -> KeyPool:
     """Get an API key pool by provider name or env var name.
 
     Resolution order:
-      0. Registered resolver (lab worker → IdentityCache).  When a
+      0. Registered resolver (lab worker → IdentityCache). When a
          resolver is installed (worker mode), this is the authoritative
-         source after the worker/host identity cache lookup.
+         source — falling through to the worker's local file / env on
+         a resolver miss would silently leak whatever credentials the
+         worker operator happens to have locally and violate the
+         host-canonical identity design. So: resolver miss in worker
+         mode returns an empty KeyPool immediately.
       1. Stored key in ~/.kohakuterrarium/api_keys.yaml (standalone /
          no-resolver only).
       2. Environment variable (standalone / no-resolver only).
@@ -254,5 +258,5 @@ def _load_api_keys() -> dict[str, str | list[str]]:
             data = yaml.safe_load(f)
             return data if isinstance(data, dict) else {}
     except Exception as e:
-        logger.debug("Failed to load API keys file", error=str(e))
+        logger.warning("Failed to load API keys file", error=str(e), exc_info=True)
         return {}

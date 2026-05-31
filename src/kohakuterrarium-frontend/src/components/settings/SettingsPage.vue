@@ -238,7 +238,7 @@
 
           <div class="card p-4 border-l-3 border-l-sapphire dark:border-l-sapphire-light">
             <div class="font-medium text-warm-700 dark:text-warm-300 mb-3">{{ t("settings.mcp.addServer") }}</div>
-            <div class="grid grid-cols-2 gap-3">
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
                 <label class="text-[11px] text-warm-400 mb-1 block">{{ t("settings.mcp.name") }}</label>
                 <el-input v-model="mcpForm.name" size="small" placeholder="my-server" />
@@ -275,6 +275,9 @@
       <!-- ════════════════════════ Account (Codex usage) ════════════════════════ -->
       <el-tab-pane :label="t('settings.tabs.account')" name="account">
         <div class="settings-pane flex flex-col gap-4 max-w-xl">
+          <!-- KohakuTerrarium account (L4) — only when logged into a
+               multi-user host.  Provider/Codex usage follows below. -->
+          <AccountSection v-if="auth.currentUser" />
           <div v-if="codexUsageLoading" class="text-warm-400 text-sm py-4 text-center">{{ t("common.loading") }}</div>
           <div v-else-if="codexUsageError" class="card p-4 border-l-3 border-l-coral">
             <p class="text-sm text-warm-600 dark:text-warm-400">{{ codexUsageError }}</p>
@@ -386,28 +389,28 @@
                 <el-option v-for="option in localeOptions" :key="option.value" :label="option.label" :value="option.value" />
               </el-select>
             </div>
-            <div class="flex items-center justify-between mb-2">
+            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 mb-2">
               <div>
                 <span class="text-sm text-warm-600 dark:text-warm-400">{{ t("settings.prefs.desktopZoom") }}</span>
                 <span class="text-[11px] text-warm-400 ml-2">{{ Math.round(theme.desktopZoom * 100) }}%</span>
               </div>
               <div class="flex items-center gap-2">
-                <button class="w-7 h-7 rounded border border-warm-300 dark:border-warm-600 text-warm-500 hover:text-warm-700 dark:hover:text-warm-300 flex items-center justify-center text-sm" @click="theme.setDesktopZoom(theme.desktopZoom - 0.05)">-</button>
+                <button class="w-10 h-10 sm:w-7 sm:h-7 rounded border border-warm-300 dark:border-warm-600 text-warm-500 hover:text-warm-700 dark:hover:text-warm-300 flex items-center justify-center text-base sm:text-sm" @click="theme.setDesktopZoom(theme.desktopZoom - 0.05)">-</button>
                 <input type="range" :value="theme.desktopZoom" :min="MIN_UI_ZOOM" :max="MAX_UI_ZOOM" step="0.05" class="w-28 accent-iolite" @input="theme.setDesktopZoom(parseFloat($event.target.value))" />
-                <button class="w-7 h-7 rounded border border-warm-300 dark:border-warm-600 text-warm-500 hover:text-warm-700 dark:hover:text-warm-300 flex items-center justify-center text-sm" @click="theme.setDesktopZoom(theme.desktopZoom + 0.05)">+</button>
-                <button class="text-[11px] text-warm-400 hover:text-iolite px-1" @click="theme.setDesktopZoom(DEFAULT_DESKTOP_ZOOM)">{{ t("common.reset") }}</button>
+                <button class="w-10 h-10 sm:w-7 sm:h-7 rounded border border-warm-300 dark:border-warm-600 text-warm-500 hover:text-warm-700 dark:hover:text-warm-300 flex items-center justify-center text-base sm:text-sm" @click="theme.setDesktopZoom(theme.desktopZoom + 0.05)">+</button>
+                <button class="text-xs sm:text-[11px] text-warm-400 hover:text-iolite px-1" @click="theme.setDesktopZoom(DEFAULT_DESKTOP_ZOOM)">{{ t("common.reset") }}</button>
               </div>
             </div>
-            <div class="flex items-center justify-between">
+            <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
               <div>
                 <span class="text-sm text-warm-600 dark:text-warm-400">{{ t("settings.prefs.mobileZoom") }}</span>
                 <span class="text-[11px] text-warm-400 ml-2">{{ Math.round(theme.mobileZoom * 100) }}%</span>
               </div>
               <div class="flex items-center gap-2">
-                <button class="w-7 h-7 rounded border border-warm-300 dark:border-warm-600 text-warm-500 hover:text-warm-700 dark:hover:text-warm-300 flex items-center justify-center text-sm" @click="theme.setMobileZoom(theme.mobileZoom - 0.05)">-</button>
+                <button class="w-10 h-10 sm:w-7 sm:h-7 rounded border border-warm-300 dark:border-warm-600 text-warm-500 hover:text-warm-700 dark:hover:text-warm-300 flex items-center justify-center text-base sm:text-sm" @click="theme.setMobileZoom(theme.mobileZoom - 0.05)">-</button>
                 <input type="range" :value="theme.mobileZoom" :min="MIN_UI_ZOOM" :max="MAX_UI_ZOOM" step="0.05" class="w-28 accent-iolite" @input="theme.setMobileZoom(parseFloat($event.target.value))" />
-                <button class="w-7 h-7 rounded border border-warm-300 dark:border-warm-600 text-warm-500 hover:text-warm-700 dark:hover:text-warm-300 flex items-center justify-center text-sm" @click="theme.setMobileZoom(theme.mobileZoom + 0.05)">+</button>
-                <button class="text-[11px] text-warm-400 hover:text-iolite px-1" @click="theme.setMobileZoom(DEFAULT_MOBILE_ZOOM)">{{ t("common.reset") }}</button>
+                <button class="w-10 h-10 sm:w-7 sm:h-7 rounded border border-warm-300 dark:border-warm-600 text-warm-500 hover:text-warm-700 dark:hover:text-warm-300 flex items-center justify-center text-base sm:text-sm" @click="theme.setMobileZoom(theme.mobileZoom + 0.05)">+</button>
+                <button class="text-xs sm:text-[11px] text-warm-400 hover:text-iolite px-1" @click="theme.setMobileZoom(DEFAULT_MOBILE_ZOOM)">{{ t("common.reset") }}</button>
               </div>
             </div>
           </div>
@@ -423,6 +426,7 @@
 import { computed, reactive, ref, onMounted, watch } from "vue"
 import { ElMessage, ElMessageBox } from "element-plus"
 
+import AccountSection from "@/components/account/AccountSection.vue"
 import AboutPanel from "@/components/settings/AboutPanel.vue"
 import AdvancedPanel from "@/components/settings/AdvancedPanel.vue"
 import BackendForm from "@/components/settings/BackendForm.vue"
@@ -433,14 +437,15 @@ import SitesPane from "@/components/settings/SitesPane.vue"
 import UpdatesPanel from "@/components/settings/UpdatesPanel.vue"
 import SitePicker from "@/components/cluster/SitePicker.vue"
 import { useDensity } from "@/composables/useDensity"
+import { useAuthStore } from "@/stores/auth"
 import { useClusterStore } from "@/stores/cluster"
 import { LOCALE_DISPLAY_NAMES, SUPPORTED_LOCALES, useLocaleStore } from "@/stores/locale"
 import { DEFAULT_DESKTOP_ZOOM, DEFAULT_MOBILE_ZOOM, MAX_UI_ZOOM, MIN_UI_ZOOM, useThemeStore } from "@/stores/theme"
 import { useI18n } from "@/utils/i18n"
-import { fireModelCatalogChanged } from "@/utils/layoutEvents"
-import { configAPI, settingsAPI } from "@/utils/api"
 
 const cluster = useClusterStore()
+const auth = useAuthStore()
+import { configAPI, settingsAPI } from "@/utils/api"
 
 const theme = useThemeStore()
 const localeStore = useLocaleStore()
@@ -492,7 +497,6 @@ async function saveKey(provider) {
     await loadKeys()
     await loadBackends()
     await loadPresets()
-    fireModelCatalogChanged({ reason: "key-saved", provider })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || t("settings.keys.saveFailed"))
   }
@@ -538,8 +542,6 @@ async function runCodexLoginRemote(node) {
     ElMessage.success(`Codex login successful on ${node}`)
     await loadKeys()
     await loadBackends()
-    await loadPresets()
-    fireModelCatalogChanged({ reason: "codex-login" })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || "Codex login failed")
   } finally {
@@ -660,8 +662,6 @@ async function saveBackend() {
     closeBackendForm()
     await loadBackends()
     await loadKeys()
-    await loadPresets()
-    fireModelCatalogChanged({ reason: "backend-saved", provider: backendName })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || "Failed to save provider")
   }
@@ -674,8 +674,6 @@ async function deleteBackend(name) {
     if (editingBackendName.value === name) closeBackendForm()
     await loadBackends()
     await loadKeys()
-    await loadPresets()
-    fireModelCatalogChanged({ reason: "backend-deleted", provider: name })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || "Failed to delete provider")
   }
@@ -706,10 +704,6 @@ async function loadPresets() {
       const match = allPresets.value.find((p) => presetKey(p) === selectedPresetKey.value)
       if (match) {
         editorPreset.value = match
-      } else {
-        selectedPresetKey.value = ""
-        editorPreset.value = null
-        showEditor.value = false
       }
     }
   } catch {
@@ -794,7 +788,6 @@ async function handleSavePreset(payload) {
     // variation_groups) without requiring a manual re-click.
     selectedPresetKey.value = `${payload.provider}/${payload.name}`
     await loadPresets()
-    fireModelCatalogChanged({ reason: "profile-saved", provider: payload.provider, name: payload.name })
     const saved = allPresets.value.find((p) => presetKey(p) === selectedPresetKey.value)
     if (saved) selectPreset(saved)
   } catch (err) {
@@ -802,25 +795,14 @@ async function handleSavePreset(payload) {
   }
 }
 
-function modelSelectorForPreset(preset) {
-  if (!preset || !preset.name) return ""
-  const base = preset.provider ? `${preset.provider}/${preset.name}` : preset.name
-  const entries = Object.entries(preset.selected_variations || {})
-    .filter(([, value]) => value)
-    .sort(([a], [b]) => a.localeCompare(b))
-  if (!entries.length) return base
-  return `${base}@${entries.map(([group, option]) => `${group}=${option}`).join(",")}`
-}
-
 async function handleSetDefault(preset) {
-  const identifier = modelSelectorForPreset(preset)
-  if (!identifier) return
+  if (!preset || !preset.name) return
   try {
-    await settingsAPI.setDefaultModel(identifier)
-    ElMessage.success(t("settings.models.defaultSet", { name: identifier }))
+    await settingsAPI.setDefaultModel(preset.name)
+    ElMessage.success(t("settings.models.defaultSet", { name: preset.name }))
     await loadPresets()
     // Refresh the editor's bound preset so the badge flips.
-    const refreshed = (allPresets.value || []).find((p) => p.name === preset.name && p.provider === preset.provider)
+    const refreshed = (presets.value || []).find((p) => p.name === preset.name && p.provider === preset.provider)
     if (refreshed) editorPreset.value = refreshed
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || t("settings.models.defaultSetFailed"))
@@ -849,7 +831,6 @@ async function confirmDeletePreset(name) {
     ElMessage.success(t("settings.models.deleted", { name }))
     cancelEdit()
     await loadPresets()
-    fireModelCatalogChanged({ reason: "profile-deleted", provider: preset.provider, name })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || t("settings.models.deleteFailed"))
   }

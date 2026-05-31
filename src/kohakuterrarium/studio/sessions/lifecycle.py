@@ -18,8 +18,8 @@ from typing import Any
 import kohakuterrarium.terrarium.channels as channel_module
 from kohakuterrarium.packages.resolve import is_package_ref, resolve_package_path
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.studio.persistence import session_index
 from kohakuterrarium.studio.sessions import cluster_fold, remote_meta, stop as _stop
+from kohakuterrarium.studio.sessions import index_hooks as _index_hooks
 from kohakuterrarium.studio.sessions.find import (
     apply_creature_name,
     apply_creature_name as _apply_creature_name,  # noqa: F401 — legacy alias
@@ -36,6 +36,7 @@ from kohakuterrarium.terrarium import TerrariumService
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.utils.config_dir import config_dir
 from kohakuterrarium.utils.logging import get_logger
+from kohakuterrarium.utils.mobile_sandbox import default_workdir
 
 logger = get_logger(__name__)
 
@@ -46,8 +47,7 @@ _meta: dict[str, dict[str, Any]] = {}
 # Per-session attached SessionStore (keyed by session_id == graph_id).
 _session_stores: dict[str, SessionStore] = {}
 
-# Legacy private aliases — tests reach in via these names; kept as thin
-# delegators so the extraction into ``cluster_fold`` is a no-op for callers.
+# Legacy private aliases — tests reach in via these names.
 _cluster_groups = cluster_fold.cluster_groups
 _sid_to_primary = cluster_fold.sid_to_primary
 _fold_session_listings = cluster_fold.fold_session_listings
@@ -79,25 +79,6 @@ def _session_dir() -> str:
     # KT_SESSION_DIR overrides; else config_dir() / "sessions" so KT_CONFIG_DIR
     # alone isolates test runs from the operator's real config.
     return os.environ.get("KT_SESSION_DIR") or str(config_dir() / "sessions")
-
-
-def _upsert_saved_session_index(store: SessionStore | None) -> None:
-    """Best-effort update of the persistent saved-session summary row."""
-    if store is None:
-        return
-    try:
-        path = Path(store.path)
-        session_index.upsert_session_meta(
-            path,
-            session_index.snapshot_store_meta(store),
-            session_dir=path.parent,
-        )
-    except Exception as e:  # pragma: no cover - index must not break runtime
-        logger.debug(
-            "Saved-session index update skipped",
-            error=str(e),
-            exc_info=True,
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +152,7 @@ async def start_creature(
         _meta[sid] = {
             "name": creature.name,
             "config_path": config_path or "",
-            "pwd": pwd or os.getcwd(),
+            "pwd": pwd or str(default_workdir()),
             "created_at": _now_iso(),
         }
         logger.info("Creature session started", session_id=sid, creature_id=cid)
@@ -286,9 +267,10 @@ def attach_session_store_for_creature(
                 if creature.agent.config.name not in meta_agents:
                     meta_agents.append(creature.agent.config.name)
                     existing.meta["agents"] = meta_agents
-                    _upsert_saved_session_index(existing)
+                    if len(meta_agents) > 1:
+                        existing.meta["config_type"] = "terrarium"
             except Exception:
-                logger.debug("meta agent-list update skipped", exc_info=True)
+                logger.warning("meta agent-list update skipped", exc_info=True)
             _retro_install_channel_persistence(engine, sid)
             return
 
@@ -309,7 +291,7 @@ def attach_session_store_for_creature(
         _session_stores[sid] = store
         # Mirror to engine map so channel-persistence callback finds it.
         engine._session_stores[sid] = store
-        _upsert_saved_session_index(store)
+        _index_hooks.attach(sid, store, sess_dir)
         _retro_install_channel_persistence(engine, sid)
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("Session store creation failed", error=str(e))
@@ -399,7 +381,7 @@ async def start_terrarium(
             session_id=sid,
             config_type="terrarium",
             config_path=config_path or "",
-            pwd=pwd or os.getcwd(),
+            pwd=pwd or str(default_workdir()),
             agents=[c.name for c in cfg.creatures] + (["root"] if cfg.root else []),
             terrarium_name=cfg.name,
             terrarium_channels=[
@@ -421,14 +403,14 @@ async def start_terrarium(
         )
         await engine.attach_session(sid, store)
         _session_stores[sid] = store
-        _upsert_saved_session_index(store)
+        _index_hooks.attach(sid, store, sess_dir)
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("Session store creation failed", error=str(e))
 
     _meta[sid] = {
         "name": (name.strip() if name and name.strip() else cfg.name),
         "config_path": config_path or "",
-        "pwd": pwd or os.getcwd(),
+        "pwd": pwd or str(default_workdir()),
         "created_at": _now_iso(),
         "has_root": cfg.root is not None,
     }
@@ -781,9 +763,7 @@ def _persist_cluster_members_to_mirror(service, session_id):
 async def stop_session(service: "TerrariumService", session_id: str) -> None:
     """Thin delegator — see :func:`studio.sessions.stop.stop_session`.
 
-    Passes the lifecycle-owned ``_meta`` / ``_session_stores`` registries
-    by reference so the extracted helper mutates the same state every
-    other lifecycle function reads.
+    Passes the lifecycle-owned registries by reference.
     """
     await _stop.stop_session(
         service,
@@ -791,6 +771,7 @@ async def stop_session(service: "TerrariumService", session_id: str) -> None:
         meta=_meta,
         session_stores=_session_stores,
         mirror_dir=Path(_session_dir()) / "mirror",
+        index_hooks=_index_hooks.registry(),
     )
 
 

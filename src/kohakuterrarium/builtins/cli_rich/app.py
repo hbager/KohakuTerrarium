@@ -44,6 +44,7 @@ from rich.text import Text
 
 from kohakuterrarium.builtins.cli_rich.app_multi import AppMultiCreatureMixin
 from kohakuterrarium.builtins.cli_rich.app_output import AppOutputMixin
+from kohakuterrarium.builtins.cli_rich.app_pickers import AppPickersMixin
 from kohakuterrarium.builtins.cli_rich.commit import ScrollbackCommitter, SessionReplay
 from kohakuterrarium.builtins.cli_rich.composer import Composer
 from kohakuterrarium.builtins.cli_rich.dialogs.bus_overlay import BusInteractiveOverlay
@@ -74,7 +75,7 @@ logger = get_logger(__name__)
 DEFAULT_WIDTH = 100
 
 
-class RichCLIApp(AppOutputMixin, AppMultiCreatureMixin):
+class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
     """Single-Application orchestrator for ``--mode cli``.
 
     Output events from the agent's OutputRouter (``on_text_chunk``,
@@ -253,7 +254,9 @@ class RichCLIApp(AppOutputMixin, AppMultiCreatureMixin):
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.debug("render ticker iteration failed", error=str(e))
+                logger.warning(
+                    "render ticker iteration failed", error=str(e), exc_info=True
+                )
                 await asyncio.sleep(active_sleep)
 
     def _loop_exception_handler(self, loop, context: dict) -> None:
@@ -473,7 +476,7 @@ class RichCLIApp(AppOutputMixin, AppMultiCreatureMixin):
             else:
                 self.live_region.footer.update_cursor(0, 0, 0)
         except Exception as e:
-            logger.debug("cursor pos update failed", error=str(e))
+            logger.warning("cursor pos update failed", error=str(e), exc_info=True)
         ansi = self.live_region.footer_to_ansi(width)
         return ANSI(ansi) if ansi else ""
 
@@ -483,7 +486,9 @@ class RichCLIApp(AppOutputMixin, AppMultiCreatureMixin):
         try:
             return self.app.output.get_size().columns
         except Exception as e:
-            logger.debug("Could not determine terminal width", error=str(e))
+            logger.warning(
+                "Could not determine terminal width", error=str(e), exc_info=True
+            )
             return DEFAULT_WIDTH
 
     # ── Submission ──
@@ -493,20 +498,21 @@ class RichCLIApp(AppOutputMixin, AppMultiCreatureMixin):
         if not text.strip():
             return
 
-        # Cancel any still-running pending task before spawning a new one,
-        # so the processing-flag toggles and invalidate calls can't race
-        # across two concurrent ``_send`` wrappers. The agent itself
-        # queues user inputs sequentially via its input module, so this
-        # cancellation is purely about the UI wrapper — the agent turn
-        # already in progress will finish normally.
+        # Feat 3 mid-turn: queue in live region (not chat history) and
+        # leave _pending_task alone. Canonical line is committed by
+        # RichCLIOutput._dispatch on user_input_injected from drain.
+        is_slash = text.startswith("/")
+        is_at_name = self.multi_creature_enabled and text.startswith("@")
+        if self._processing and not is_slash and not is_at_name:
+            self.live_region.add_queued_input(text)
+            self._invalidate()
+            spawn(self._mid_turn_inject(text))
+            return
+
         if self._pending_task and not self._pending_task.done():
             self._pending_task.cancel()
 
-        # @name retargeting — runs BEFORE the slash-command check so
-        # ``@bob /help`` would send "/help" to bob (which then routes
-        # through bob's own command path, not the host UI's). Plain
-        # `@name` with no body is treated as regular text and falls
-        # through to the agent — parse_at_name returns None there.
+        # @name retargets (runs before slash so @bob /help routes to bob).
         if self.multi_creature_enabled:
             redirect = parse_at_name(text)
             if redirect is not None:
@@ -527,16 +533,12 @@ class RichCLIApp(AppOutputMixin, AppMultiCreatureMixin):
                     )
                 return
 
-        # Print user message into scrollback (via run_in_terminal so the
-        # app area is correctly redrawn below it).
         self._commit_user_message(text)
 
-        # Slash command path
         if text.startswith("/"):
             self._pending_task = spawn(self._handle_slash(text))
             return
 
-        # Send to agent (in a background task so the UI stays responsive)
         self._processing = True
         self.live_region.set_processing(True)
         self._invalidate()
@@ -549,17 +551,20 @@ class RichCLIApp(AppOutputMixin, AppMultiCreatureMixin):
             finally:
                 self._processing = False
                 self.live_region.set_processing(False)
-                # Turn is over — close any tool-block sequence whose
-                # closing rule was deferred waiting for a next commit.
-                # Without this, a turn that ends on a tool call leaves
-                # the bottom ``═══`` rule un-emitted until something
-                # else commits (next user message, interrupt, etc.).
-                # User-visible symptom: "hanging" open tool box while
-                # the agent sits idle post-turn.
+                # Close any deferred tool-block rule (hanging ═══ fix).
                 self.committer.flush_block_close()
                 self._invalidate()
 
         self._pending_task = spawn(_send())
+
+    async def _mid_turn_inject(self, text: str) -> None:
+        # Feat 3 mid-turn follow-up. Does NOT touch _pending_task.
+        try:
+            await self.agent.inject_input(text, source="cli")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.exception("Mid-turn inject failed", error=str(e))
 
     # ── Slash command dispatch ──
 
@@ -818,7 +823,7 @@ class RichCLIApp(AppOutputMixin, AppMultiCreatureMixin):
             try:
                 request_exit()
             except Exception as e:
-                logger.debug("input request_exit failed", error=str(e))
+                logger.warning("input request_exit failed", error=str(e), exc_info=True)
 
     def _on_toggle_expand(self) -> None:
         """Expand/collapse the most recent top-level tool block."""
@@ -844,109 +849,6 @@ class RichCLIApp(AppOutputMixin, AppMultiCreatureMixin):
             return
         self._pending_task = spawn(self._handle_slash(f"/model {selector}"))
 
-    def _picker_handle_key(self, key: str) -> bool:
-        """Forward a named-key event to whichever overlay is open.
-
-        Composer bindings call this on every named key (``up``, ``enter``,
-        ``escape``, ``tab``, ``backspace``, …). The first overlay that
-        claims to own the keyboard (``visible``) gets the key; if it
-        consumes it, the composer skips its own default handling.
-        """
-        if self.bus_overlay.visible:
-            consumed = self.bus_overlay.handle_key(key)
-            if consumed:
-                self._invalidate()
-            return consumed
-        if self.model_picker.visible:
-            consumed = self.model_picker.handle_key(key)
-            if consumed:
-                self._invalidate()
-            return consumed
-        if self.module_picker.visible:
-            consumed = self.module_picker.handle_key(key)
-            if consumed:
-                self._invalidate()
-            return consumed
-        if self.settings_overlay.visible:
-            consumed = self.settings_overlay.handle_key(key)
-            if consumed:
-                self._invalidate()
-            return consumed
-        if self.agent_overlay is not None and self.agent_overlay.visible:
-            consumed = self.agent_overlay.handle_key(key)
-            if consumed:
-                self._invalidate()
-            return consumed
-        return False
-
-    def _picker_handle_text(self, char: str) -> bool:
-        """Forward a printable-character event to whichever overlay wants text.
-
-        Invoked from the composer's ``Keys.Any`` binding which is
-        conditionally active only when ``_picker_captures_input`` is
-        True — so this runs only for forms inside the settings overlay.
-        """
-        if self.bus_overlay.captures_input():
-            consumed = self.bus_overlay.handle_text(char)
-            if consumed:
-                self._invalidate()
-            return consumed
-        if self.module_picker.visible and self.module_picker.is_capturing_text():
-            consumed = self.module_picker.handle_text(char)
-            if consumed:
-                self._invalidate()
-            return consumed
-        if self.module_picker.visible:
-            # In list mode, ``t`` toggles current row. Consume any
-            # other char so it doesn't leak into the textarea.
-            consumed = self.module_picker.handle_text(char)
-            if consumed:
-                self._invalidate()
-            return consumed
-        if self.settings_overlay.visible:
-            # Settings list mode wants ``d`` for delete (and silently
-            # consumes other letters so they don't leak into the chat
-            # textarea behind the overlay); form mode wants every
-            # printable char as field input. Same handler covers both
-            # — handle_text already routes by ``self.mode``.
-            consumed = self.settings_overlay.handle_text(char)
-            if consumed:
-                self._invalidate()
-            return consumed
-        if self.agent_overlay is not None and self.agent_overlay.visible:
-            consumed = self.agent_overlay.handle_text(char)
-            if consumed:
-                self._invalidate()
-            return consumed
-        return False
-
-    def _picker_captures_input(self) -> bool:
-        """True when an overlay is capturing printable characters.
-
-        Drives the ``Condition`` filter on the composer's ``Keys.Any``
-        binding — we only intercept text when an overlay genuinely wants
-        it (form mode), so list-mode keystrokes still go through the
-        normal ``handle_key`` path.
-        """
-        if self.bus_overlay.captures_input():
-            return True
-        if self.module_picker.visible:
-            # Modal: consume both list-mode and form-mode chars so
-            # nothing leaks into the chat textarea behind the
-            # overlay.
-            return True
-        if self.settings_overlay.visible:
-            # Settings is also modal — list mode reserves ``d`` for
-            # delete and silently swallows the rest, form mode routes
-            # printable chars into the active field. Either way the
-            # composer's textarea must NOT receive these keystrokes,
-            # so claim them unconditionally while the overlay is up.
-            return True
-        if self.agent_overlay is not None and self.agent_overlay.visible:
-            # Topic 08 — printable chars go into the overlay's filter.
-            return True
-        return False
-
     def _get_composer_text(self) -> str:
         """Read the composer textarea contents — for the bus overlay's
         ``ask_text`` flow (user types into the existing input field
@@ -964,7 +866,7 @@ class RichCLIApp(AppOutputMixin, AppMultiCreatureMixin):
             if text:
                 buf.insert_text(text)
         except Exception as e:
-            logger.debug("set_composer_text failed", error=str(e), exc_info=True)
+            logger.warning("set_composer_text failed", error=str(e), exc_info=True)
 
     def _on_clear_screen(self) -> None:
         # Send the standard "clear scrollback + screen" escape — handled
