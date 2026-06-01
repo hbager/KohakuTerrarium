@@ -277,7 +277,7 @@ def _upgrade_bare_default(bare: str) -> str:
         provider, canonical = aliased
         return f"{provider}/{canonical}"
 
-    all_presets = get_all_presets()
+    all_presets = _all_preset_definitions()
     hits = [prov for (prov, name) in all_presets if name == bare]
     if not hits:
         return ""
@@ -288,7 +288,51 @@ def _upgrade_bare_default(bare: str) -> str:
 
 
 def set_default_model(model_name: str) -> None:
-    _save_yaml(_serialize_user_data(load_presets(), load_backends(), model_name))
+    identifier = _canonical_default_identifier(model_name)
+    _save_yaml(_serialize_user_data(load_presets(), load_backends(), identifier))
+
+
+def _canonical_default_identifier(model_name: str) -> str:
+    base_name, selections = parse_variation_selector(model_name or "")
+    if not base_name:
+        return ""
+    if "/" in base_name:
+        return model_name
+
+    upgraded = _upgrade_bare_default(base_name)
+    if upgraded:
+        suffix = ""
+        if selections:
+            suffix = "@" + ",".join(
+                f"{group}={option}"
+                for group, option in sorted(selections.items())
+                if option
+            )
+        return upgraded + suffix
+
+    profile = _legacy_default_profile_by_model(base_name, selections=selections)
+    if profile is None:
+        return model_name
+    return profile_to_identifier(profile)
+
+
+def _legacy_default_profile_by_model(
+    model: str, selections: dict[str, str] | None = None
+) -> LLMProfile | None:
+    matches = [
+        preset
+        for preset in _all_preset_definitions().values()
+        if preset.model == model
+    ]
+    if not matches:
+        return None
+    preferred = {preset.provider: preset for preset in matches if preset.provider}
+    for preferred_provider in _LEGACY_MODEL_PROVIDER_PREFERENCE:
+        chosen = preferred.get(preferred_provider)
+        if chosen is not None:
+            return _resolve_preset(chosen, load_backends(), selections)
+    chosen = sorted(matches, key=lambda preset: (preset.provider or "", preset.name))[0]
+    return _resolve_preset(chosen, load_backends(), selections)
 
 
 def save_profile(profile: LLMProfile | LLMPreset) -> None:
@@ -716,6 +760,13 @@ def list_all() -> list[dict[str, Any]]:
     default = get_default_model()
     default_base, default_selections = parse_variation_selector(default) if default else ("", {})
     default_provider, default_bare = _split_provider_prefix(default_base)
+    if default_base and not default_provider:
+        resolved_default = _legacy_default_profile_by_model(
+            default_base, selections=default_selections
+        )
+        if resolved_default is not None:
+            default_provider = resolved_default.provider
+            default_bare = resolved_default.name
     for entry in result:
         is_default = False
         if default_base:
@@ -725,7 +776,7 @@ def list_all() -> list[dict[str, Any]]:
                     and entry["name"] == default_bare
                 )
             else:
-                is_default = entry["name"] == default_base or entry["model"] == default_base
+                is_default = entry["name"] == default_base
         entry["is_default"] = is_default
         if is_default:
             preset = definitions.get((entry["provider"], entry["name"]))

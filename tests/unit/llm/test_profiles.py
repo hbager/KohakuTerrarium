@@ -699,16 +699,63 @@ class TestLoadProfilesAndListAll:
         assert codex_54[0]["model"] == "my-custom"
 
     def test_list_all_default_marking_handles_bare_default(self):
-        # a legacy unqualified default falls back to name/model matching
+        # a legacy unqualified default is upgraded to one canonical provider/name
+        # before marking badges; it must not light up every provider sharing the name.
         from kohakuterrarium.llm.backends import save_yaml_store
 
         save_yaml_store({"version": 3, "default_model": "gpt-4o"})
         entries = list_all()
-        # 'gpt-4o' is a bare name shared across providers — every entry
-        # with that name is flagged (documented bare-name fallback)
         gpt4o = [e for e in entries if e["is_default"]]
-        assert gpt4o
-        assert all(e["name"] == "gpt-4o" for e in gpt4o)
+        assert len(gpt4o) == 1
+        assert (gpt4o[0]["provider"], gpt4o[0]["name"]) == ("codex", "gpt-4o")
+
+    def test_list_all_default_marking_handles_bare_model_id_once(self):
+        from kohakuterrarium.llm.backends import load_backends, save_yaml_store
+        from kohakuterrarium.llm.preset_store import load_presets, serialize_user_data
+
+        for provider in ("aaa-custom", "zzz-custom"):
+            save_backend(LLMBackend(name=provider, backend_type="openai"))
+            save_profile(
+                LLMPreset(
+                    name="gpt-5.5-custom",
+                    model="api-model-shared",
+                    provider=provider,
+                )
+            )
+        save_yaml_store(
+            serialize_user_data(load_presets(), load_backends(), "api-model-shared")
+        )
+
+        entries = list_all()
+        defaults = [e for e in entries if e["is_default"]]
+
+        assert len(defaults) == 1
+        assert (defaults[0]["provider"], defaults[0]["name"]) == (
+            "aaa-custom",
+            "gpt-5.5-custom",
+        )
+
+    def test_list_all_default_marking_handles_ambiguous_bare_preset_name_once(self):
+        from kohakuterrarium.llm.backends import load_backends, save_yaml_store
+        from kohakuterrarium.llm.preset_store import load_presets, serialize_user_data
+
+        for provider in ("openai", "openrouter"):
+            save_profile(
+                LLMPreset(
+                    name="gpt-5.5-custom",
+                    model=f"{provider}-model",
+                    provider=provider,
+                )
+            )
+        save_yaml_store(
+            serialize_user_data(load_presets(), load_backends(), "gpt-5.5-custom")
+        )
+
+        entries = list_all()
+        defaults = [e for e in entries if e["is_default"]]
+
+        assert len(defaults) == 1
+        assert defaults[0]["name"] == "gpt-5.5-custom"
 
 
 # ---------------------------------------------------------------------------
