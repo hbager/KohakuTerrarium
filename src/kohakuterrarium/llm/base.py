@@ -10,10 +10,12 @@ from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Protocol, runtime_checkable
 
 from kohakuterrarium.llm.message import Message
-from kohakuterrarium.llm.recovery import RetryPolicy
+from kohakuterrarium.llm.recovery import ErrorClass, RetryPolicy
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+API_KEY_FAILOVER_LIMIT = 5
 
 
 @dataclass
@@ -311,6 +313,31 @@ class BaseLLMProvider:
         with no creature restart.
         """
         return False
+
+    def _api_key_failover_limit(self) -> int:
+        pool = getattr(self, "_api_key_pool", None)
+        if not pool or not getattr(pool, "is_pool", False):
+            return 1
+        return min(len(pool), API_KEY_FAILOVER_LIMIT)
+
+    def _should_failover_api_key(
+        self, error_class: ErrorClass, failed_keys: int
+    ) -> bool:
+        return (
+            error_class is not ErrorClass.OVERFLOW
+            and failed_keys < self._api_key_failover_limit() - 1
+        )
+
+    def _log_api_key_failover(
+        self, error_class: ErrorClass, failed_keys: int, error: BaseException
+    ) -> None:
+        logger.warning(
+            "provider_api_key_failover",
+            failed_keys=failed_keys,
+            max_keys=self._api_key_failover_limit(),
+            error_class=error_class.value,
+            error=str(error),
+        )
 
     def translate_provider_native_tool(self, tool: Any) -> dict | None:
         """Translate a KT provider-native tool into a wire-format tool spec.

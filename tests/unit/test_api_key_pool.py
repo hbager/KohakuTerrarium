@@ -1,7 +1,15 @@
+import pytest
+
 from kohakuterrarium.llm import api_keys
 from kohakuterrarium.llm.api_keys import KeyPool
-from kohakuterrarium.llm.openai import OpenAIProvider
 from kohakuterrarium.llm.litellm_provider import LiteLLMProvider
+from kohakuterrarium.llm.openai import OpenAIProvider
+
+
+class _StatusError(Exception):
+    def __init__(self, status_code: int):
+        super().__init__(f"HTTP {status_code}")
+        self.status_code = status_code
 
 
 def test_key_pool_round_robin():
@@ -45,11 +53,115 @@ def test_openai_provider_applies_rotating_authorization_header():
     assert second["extra_headers"]["Authorization"] == "Bearer k2"
 
 
+@pytest.mark.asyncio
+async def test_openai_provider_user_error_failover_stops_after_five_keys():
+    provider = OpenAIProvider(
+        api_key=KeyPool(["k1", "k2", "k3", "k4", "k5", "k6"]),
+        model="gpt-test",
+    )
+    seen_keys: list[str] = []
+
+    async def always_unauthorized(messages):
+        create_kwargs: dict = {}
+        provider._apply_request_api_key(create_kwargs)
+        seen_keys.append(create_kwargs["extra_headers"]["Authorization"])
+        raise _StatusError(401)
+
+    provider._raw_complete_chat = always_unauthorized
+
+    with pytest.raises(_StatusError):
+        await provider._complete_chat([])
+
+    assert seen_keys == [
+        "Bearer k1",
+        "Bearer k2",
+        "Bearer k3",
+        "Bearer k4",
+        "Bearer k5",
+    ]
+
+    next_request: dict = {}
+    provider._apply_request_api_key(next_request)
+    assert next_request["extra_headers"]["Authorization"] == "Bearer k6"
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_rate_limit_failover_stops_after_five_keys(monkeypatch):
+    provider = OpenAIProvider(
+        api_key=KeyPool(["k1", "k2", "k3", "k4", "k5", "k6"]),
+        model="gpt-test",
+        retry_policy={"base_delay": 0, "jitter": 0, "max_retries": 20},
+    )
+    seen_keys: list[str] = []
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr("kohakuterrarium.llm.openai.asyncio.sleep", fake_sleep)
+
+    async def always_rate_limited(messages):
+        create_kwargs: dict = {}
+        provider._apply_request_api_key(create_kwargs)
+        seen_keys.append(create_kwargs["extra_headers"]["Authorization"])
+        raise _StatusError(429)
+
+    provider._raw_complete_chat = always_rate_limited
+
+    with pytest.raises(_StatusError):
+        await provider._complete_chat([])
+
+    assert seen_keys == [
+        "Bearer k1",
+        "Bearer k2",
+        "Bearer k3",
+        "Bearer k4",
+        "Bearer k5",
+    ]
+    assert sleeps == []
+
+    next_request: dict = {}
+    provider._apply_request_api_key(next_request)
+    assert next_request["extra_headers"]["Authorization"] == "Bearer k6"
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_user_error_failover_returns_when_later_key_succeeds():
+    provider = OpenAIProvider(api_key=KeyPool(["k1", "k2", "k3"]), model="gpt-test")
+    seen_keys: list[str] = []
+
+    async def succeeds_on_third_key(messages):
+        create_kwargs: dict = {}
+        provider._apply_request_api_key(create_kwargs)
+        key = create_kwargs["extra_headers"]["Authorization"]
+        seen_keys.append(key)
+        if key != "Bearer k3":
+            raise _StatusError(403)
+        return "ok"
+
+    provider._raw_complete_chat = succeeds_on_third_key
+
+    assert await provider._complete_chat([]) == "ok"
+    assert seen_keys == ["Bearer k1", "Bearer k2", "Bearer k3"]
+
+
 def test_litellm_provider_rotates_api_key_in_params():
     provider = LiteLLMProvider(model="openai/gpt-test", api_key=KeyPool(["k1", "k2"]))
 
     first = provider._build_params([], stream=False)
     second = provider._build_params([], stream=False)
+
+    assert first["api_key"] == "k1"
+    assert second["api_key"] == "k2"
+
+
+def test_litellm_provider_with_model_preserves_rotating_key_pool():
+    provider = LiteLLMProvider(model="openai/gpt-test", api_key=KeyPool(["k1", "k2"]))
+
+    clone = provider.with_model("openai/gpt-other")
+
+    first = clone._build_params([], stream=False)
+    second = clone._build_params([], stream=False)
 
     assert first["api_key"] == "k1"
     assert second["api_key"] == "k2"

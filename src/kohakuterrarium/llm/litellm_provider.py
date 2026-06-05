@@ -22,6 +22,7 @@ from kohakuterrarium.llm.base import (
     NativeToolCall,
     ToolSchema,
 )
+from kohakuterrarium.llm.recovery import classify_openai_error
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -71,7 +72,7 @@ class LiteLLMProvider(BaseLLMProvider):
         )
         return LiteLLMProvider(
             model=name,
-            api_key=self._api_key,
+            api_key=self._api_key_pool or self._api_key,
             config=new_config,
             **self._extra_kwargs,
         )
@@ -84,91 +85,106 @@ class LiteLLMProvider(BaseLLMProvider):
         provider_native_tools: list[Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        params = self._build_params(messages, tools=tools, stream=True, **kwargs)
+        api_key_failures = 0
+        while True:
+            params = self._build_params(messages, tools=tools, stream=True, **kwargs)
 
-        try:
-            response = await litellm.acompletion(**params)
+            try:
+                response = await litellm.acompletion(**params)
 
-            pending_tool_calls: dict[int, dict[str, str]] = {}
+                pending_tool_calls: dict[int, dict[str, str]] = {}
 
-            async for chunk in response:
-                delta = chunk.choices[0].delta if chunk.choices else None
-                if delta is None:
+                async for chunk in response:
+                    delta = chunk.choices[0].delta if chunk.choices else None
+                    if delta is None:
+                        continue
+
+                    if delta.content:
+                        yield delta.content
+
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index if hasattr(tc, "index") else 0
+                            entry = pending_tool_calls.setdefault(
+                                idx, {"id": "", "name": "", "arguments": ""}
+                            )
+                            if tc.id:
+                                entry["id"] = tc.id
+                            if tc.function:
+                                if tc.function.name:
+                                    entry["name"] = tc.function.name
+                                if tc.function.arguments:
+                                    entry["arguments"] += tc.function.arguments
+
+                self._last_tool_calls = [
+                    NativeToolCall(
+                        id=tc["id"],
+                        name=tc["name"],
+                        arguments=tc["arguments"],
+                    )
+                    for tc in pending_tool_calls.values()
+                    if tc["name"]
+                ]
+                return
+
+            except Exception as e:
+                cls = classify_openai_error(e)
+                api_key_failures += 1
+                if self._should_failover_api_key(cls, api_key_failures - 1):
+                    self._log_api_key_failover(cls, api_key_failures, e)
                     continue
-
-                if delta.content:
-                    yield delta.content
-
-                if delta.tool_calls:
-                    for tc in delta.tool_calls:
-                        idx = tc.index if hasattr(tc, "index") else 0
-                        entry = pending_tool_calls.setdefault(
-                            idx, {"id": "", "name": "", "arguments": ""}
-                        )
-                        if tc.id:
-                            entry["id"] = tc.id
-                        if tc.function:
-                            if tc.function.name:
-                                entry["name"] = tc.function.name
-                            if tc.function.arguments:
-                                entry["arguments"] += tc.function.arguments
-
-            self._last_tool_calls = [
-                NativeToolCall(
-                    id=tc["id"],
-                    name=tc["name"],
-                    arguments=tc["arguments"],
-                )
-                for tc in pending_tool_calls.values()
-                if tc["name"]
-            ]
-
-        except Exception as e:
-            logger.error("LiteLLM streaming error", error=str(e))
-            raise
+                logger.error("LiteLLM streaming error", error=str(e))
+                raise
 
     async def _complete_chat(
         self,
         messages: list[dict[str, Any]],
         **kwargs: Any,
     ) -> ChatResponse:
-        params = self._build_params(messages, stream=False, **kwargs)
+        api_key_failures = 0
+        while True:
+            params = self._build_params(messages, stream=False, **kwargs)
 
-        try:
-            response = await litellm.acompletion(**params)
+            try:
+                response = await litellm.acompletion(**params)
 
-            message = response.choices[0].message
-            content = message.content or ""
-            finish_reason = response.choices[0].finish_reason or "stop"
+                message = response.choices[0].message
+                content = message.content or ""
+                finish_reason = response.choices[0].finish_reason or "stop"
 
-            usage = {}
-            if hasattr(response, "usage") and response.usage:
-                usage = {
-                    "prompt_tokens": response.usage.prompt_tokens or 0,
-                    "completion_tokens": response.usage.completion_tokens or 0,
-                    "total_tokens": response.usage.total_tokens or 0,
-                }
+                usage = {}
+                if hasattr(response, "usage") and response.usage:
+                    usage = {
+                        "prompt_tokens": response.usage.prompt_tokens or 0,
+                        "completion_tokens": response.usage.completion_tokens or 0,
+                        "total_tokens": response.usage.total_tokens or 0,
+                    }
 
-            if hasattr(message, "tool_calls") and message.tool_calls:
-                self._last_tool_calls = [
-                    NativeToolCall(
-                        id=tc.id,
-                        name=tc.function.name,
-                        arguments=tc.function.arguments,
-                    )
-                    for tc in message.tool_calls
-                ]
+                if hasattr(message, "tool_calls") and message.tool_calls:
+                    self._last_tool_calls = [
+                        NativeToolCall(
+                            id=tc.id,
+                            name=tc.function.name,
+                            arguments=tc.function.arguments,
+                        )
+                        for tc in message.tool_calls
+                    ]
 
-            return ChatResponse(
-                content=content,
-                finish_reason=finish_reason,
-                usage=usage,
-                model=response.model or self.config.model,
-            )
+                return ChatResponse(
+                    content=content,
+                    finish_reason=finish_reason,
+                    usage=usage,
+                    model=response.model or self.config.model,
+                )
 
-        except Exception as e:
-            logger.error("LiteLLM completion error", error=str(e))
-            raise
+            except Exception as e:
+                cls = classify_openai_error(e)
+                api_key_failures += 1
+                if self._should_failover_api_key(cls, api_key_failures - 1):
+                    self._log_api_key_failover(cls, api_key_failures, e)
+                    continue
+                logger.error("LiteLLM completion error", error=str(e))
+                raise
 
     def _next_api_key(self) -> str | None:
         if self._api_key_pool:

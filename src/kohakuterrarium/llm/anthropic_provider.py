@@ -244,6 +244,7 @@ class AnthropicProvider(BaseLLMProvider):
         """Stream a native Anthropic Messages response with KT retries."""
         current = messages
         attempt = 0
+        api_key_failures = 0
         overflow_recovered = False
         while True:
             try:
@@ -266,6 +267,13 @@ class AnthropicProvider(BaseLLMProvider):
                             recovered_messages=len(recovered),
                         )
                         continue
+                if cls is not ErrorClass.OVERFLOW:
+                    api_key_failures += 1
+                    if self._should_failover_api_key(cls, api_key_failures - 1):
+                        self._log_api_key_failover(cls, api_key_failures, exc)
+                        continue
+                    if self._api_key_failover_limit() > 1:
+                        raise
                 if (
                     cls in self._retry_policy.retry_classes
                     and attempt < self._retry_policy.max_retries
@@ -364,6 +372,7 @@ class AnthropicProvider(BaseLLMProvider):
     ) -> ChatResponse:
         current = messages
         attempt = 0
+        api_key_failures = 0
         overflow_recovered = False
         while True:
             try:
@@ -382,6 +391,13 @@ class AnthropicProvider(BaseLLMProvider):
                             recovered_messages=len(recovered),
                         )
                         continue
+                if cls is not ErrorClass.OVERFLOW:
+                    api_key_failures += 1
+                    if self._should_failover_api_key(cls, api_key_failures - 1):
+                        self._log_api_key_failover(cls, api_key_failures, exc)
+                        continue
+                    if self._api_key_failover_limit() > 1:
+                        raise
                 if (
                     cls in self._retry_policy.retry_classes
                     and attempt < self._retry_policy.max_retries
