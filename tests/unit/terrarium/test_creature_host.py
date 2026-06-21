@@ -2,8 +2,13 @@
 
 import asyncio
 
+import pytest
 
-from kohakuterrarium.terrarium.creature_host import Creature
+from kohakuterrarium.builtins.inputs.none import NoneInput
+from kohakuterrarium.builtins.outputs.none import NoneOutput
+from kohakuterrarium.builtins.outputs.stdout import StdoutOutput
+from kohakuterrarium.terrarium.creature_host import Creature, build_creature
+from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.testing.terrarium import _FakeAgent
 
 
@@ -14,6 +19,103 @@ def _creature(*, name="alice", agent=None, **kw):
         agent=agent or _FakeAgent(name=name),
         **kw,
     )
+
+
+# ── build_creature: llm= instance injection (E5) ───────────────
+
+
+class TestBuildCreatureLLMInjection:
+    def test_provider_instance_flows_to_agent(self, tmp_path):
+        # ``engine.add_creature(path, llm=ScriptedLLM(...))`` must bind
+        # the instance — this is the engine-side seam that replaces the
+        # old two-site create_llm_provider monkeypatch.
+        (tmp_path / "config.yaml").write_text(
+            "name: scripted\ninput:\n  type: none\noutput:\n  type: stdout\n",
+            encoding="utf-8",
+        )
+        scripted = ScriptedLLM(["hi"])
+        creature = build_creature(str(tmp_path), llm=scripted, io="none")
+        assert creature.agent.llm is scripted
+
+
+# ── typed turn drivers on Creature (E3) ────────────────────────
+
+
+class TestCreatureTurnAPI:
+    def _creature_cfg(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "name: turnc\ninput:\n  type: none\noutput:\n  type: none\n",
+            encoding="utf-8",
+        )
+        return str(tmp_path)
+
+    async def test_run_returns_result(self, tmp_path):
+        c = build_creature(
+            self._creature_cfg(tmp_path),
+            llm=ScriptedLLM(["creature reply"]),
+            io="headless",
+        )
+        await c.start()
+        try:
+            result = await c.run("hi")
+            assert result.ok
+            assert "creature reply" in result.text
+        finally:
+            await c.stop()
+
+    async def test_attach_streams_a_chat_turn(self, tmp_path):
+        from kohakuterrarium.core.turn import TextChunk
+
+        c = build_creature(
+            self._creature_cfg(tmp_path),
+            llm=ScriptedLLM(["observed"]),
+            io="headless",
+        )
+        await c.start()
+        try:
+            async with c.attach() as stream:
+                await c.run("hi")
+                text = ""
+                while "observed" not in text:
+                    ev = await asyncio.wait_for(stream._queue.get(), timeout=2)
+                    if isinstance(ev, TextChunk):
+                        text += ev.text
+                assert "observed" in text
+        finally:
+            await c.stop()
+
+
+# ── build_creature: io= modes (E12) ────────────────────────────
+
+
+class TestBuildCreatureIOModes:
+    def _write_cfg(self, tmp_path):
+        # Config declares cli input + stdout output — the io= modes
+        # must override what the config says.
+        (tmp_path / "config.yaml").write_text(
+            "name: iomodes\ninput:\n  type: none\noutput:\n  type: stdout\n",
+            encoding="utf-8",
+        )
+        return str(tmp_path)
+
+    def test_headless_silences_default_output(self, tmp_path):
+        creature = build_creature(
+            self._write_cfg(tmp_path), llm=ScriptedLLM(["x"]), io="headless"
+        )
+        assert isinstance(creature.agent.output_router.default_output, NoneOutput)
+        assert isinstance(creature.agent.input, NoneInput)
+
+    def test_none_keeps_config_output(self, tmp_path):
+        creature = build_creature(
+            self._write_cfg(tmp_path), llm=ScriptedLLM(["x"]), io="none"
+        )
+        # Input suppressed, but the config's stdout output still boots.
+        assert isinstance(creature.agent.input, NoneInput)
+        assert isinstance(creature.agent.output_router.default_output, StdoutOutput)
+
+    def test_invalid_io_value_raises(self, tmp_path):
+        with pytest.raises(ValueError, match="io= must be"):
+            build_creature(self._write_cfg(tmp_path), io="quiet")
 
 
 # ── start / stop ───────────────────────────────────────────────
@@ -327,3 +429,62 @@ class TestReapInputTask:
         await c._reap_input_task()
         # Reaped.
         assert c._input_task is None
+
+
+class TestApplyCreatureName:
+    """P0 regression pins — the display-name rename must follow onto
+    every name-keyed recorder, INCLUDING a SessionOutput attached
+    before the rename (the engine's autosession attaches during
+    add_creature; events recorded under the stale config name are
+    invisible to history reads, which use the display name)."""
+
+    def _creature(self, agent_name="alice"):
+        from types import SimpleNamespace
+
+        session_output = SimpleNamespace(
+            _agent_name=agent_name, _event_key_prefix=agent_name
+        )
+        agent = SimpleNamespace(
+            config=SimpleNamespace(name=agent_name),
+            executor=SimpleNamespace(_agent_name=agent_name),
+            trigger_manager=SimpleNamespace(_agent_name=agent_name),
+            compact_manager=SimpleNamespace(_agent_name=agent_name),
+            _session_output=session_output,
+        )
+        creature = SimpleNamespace(
+            name=agent_name,
+            agent=agent,
+            config=SimpleNamespace(name=agent_name),
+        )
+        return creature, session_output
+
+    def test_rename_retargets_session_output(self):
+        from kohakuterrarium.terrarium.creature_host import apply_creature_name
+
+        creature, out = self._creature()
+        apply_creature_name(creature, "warm-ember")
+        assert creature.name == "warm-ember"
+        assert creature.agent.config.name == "warm-ember"
+        # The live event recorder follows — future events key under the
+        # display name the history endpoint resolves.
+        assert out._agent_name == "warm-ember"
+        assert out._event_key_prefix == "warm-ember"
+
+    def test_rename_keeps_custom_attached_prefix(self):
+        from kohakuterrarium.terrarium.creature_host import apply_creature_name
+
+        creature, out = self._creature()
+        # Wave F attached agents record under a host-scoped namespace —
+        # a rename must not clobber it.
+        out._event_key_prefix = "host:attached:reviewer:1"
+        apply_creature_name(creature, "warm-ember")
+        assert out._agent_name == "warm-ember"
+        assert out._event_key_prefix == "host:attached:reviewer:1"
+
+    def test_rename_without_session_output(self):
+        from kohakuterrarium.terrarium.creature_host import apply_creature_name
+
+        creature, _ = self._creature()
+        creature.agent._session_output = None
+        apply_creature_name(creature, "warm-ember")
+        assert creature.agent.config.name == "warm-ember"

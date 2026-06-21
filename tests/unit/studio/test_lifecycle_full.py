@@ -18,17 +18,9 @@ from kohakuterrarium.testing.terrarium import (
     _FakeAgent,
 )
 
-
-@pytest.fixture(autouse=True)
-def _reset_module_state():
-    """Lifecycle keeps _meta and _session_stores as module-globals.
-    Reset them between tests so failures don't leak.
-    """
-    lifecycle._meta.clear()
-    lifecycle._session_stores.clear()
-    yield
-    lifecycle._meta.clear()
-    lifecycle._session_stores.clear()
+# Session bookkeeping is instance-scoped (studio.sessions.registry) —
+# each test builds its own engine/service, so no module-state reset is
+# needed between tests.
 
 
 # ── start_creature (local, in-memory config) ──────────────────
@@ -117,7 +109,7 @@ class TestStartCreatureLocal:
             )
             assert sess.home_node == "worker-1"
             # _meta entry retained.
-            assert sess.session_id in lifecycle._meta
+            assert sess.session_id in lifecycle.meta_for(svc)
         finally:
             await engine.shutdown()
 
@@ -150,9 +142,9 @@ class TestAttachSessionStoreForCreature:
             )
             assert creature.agent._attached is not None
             sid = creature.graph_id
-            assert sid in lifecycle._session_stores
+            assert sid in lifecycle.stores_for(svc)
             # Cleanup
-            store = lifecycle._session_stores[sid]
+            store = lifecycle.stores_for(svc)[sid]
             store.close()
         finally:
             await t.shutdown()
@@ -180,7 +172,7 @@ class TestAttachSessionStoreForCreature:
             try:
                 lifecycle.attach_session_store_for_creature(svc, creature)
                 # Reused — same store.
-                assert lifecycle._session_stores[sid] is existing
+                assert lifecycle.stores_for(svc)[sid] is existing
                 assert attached[0] is existing
             finally:
                 existing.close()
@@ -207,8 +199,10 @@ class TestStartTerrarium:
         from kohakuterrarium.terrarium.config import TerrariumConfig
 
         cfg = TerrariumConfig(name="test-terra", creatures=[], channels=[])
+        seen_apply_kwargs: dict = {}
 
-        async def _apply(c, pwd=None, llm_override=None):
+        async def _apply(c, pwd=None, llm=None, strict=True, session=None):
+            seen_apply_kwargs.update(strict=strict, session=session)
             return SimpleNamespace(graph_id="g-new", creature_ids=set())
 
         engine.apply_recipe = _apply
@@ -222,6 +216,45 @@ class TestStartTerrarium:
             sess = await lifecycle.start_terrarium(svc, config=cfg)
             assert sess.session_id == "g-new"
             assert sess.name == "test-terra"
+            # Studio mints its own (richer-meta) store right after the
+            # recipe applies — engine autosession MUST stay off for
+            # this call or the same ``<gid>.kohakutr`` gets a second
+            # live handle (leak; Windows file lock on saved delete).
+            assert seen_apply_kwargs["session"] is False
+        finally:
+            await engine.shutdown()
+
+    async def test_autosession_engine_single_store_handle(self, tmp_path, monkeypatch):
+        # REGRESSION PIN: on an autosession engine
+        # (``Terrarium(session_dir=...)`` — every API-server engine) a
+        # Studio terrarium spawn must produce exactly ONE live store
+        # handle: the Studio-minted one.  The engine-autosession path
+        # minting a sibling handle at the same path leaked it forever —
+        # on Windows the lingering SQLite handle locked the file, so
+        # deleting the saved session after stop failed with WinError 32.
+        from kohakuterrarium.terrarium.config import TerrariumConfig
+
+        session_dir = tmp_path / "sessions"
+        session_dir.mkdir()
+        monkeypatch.setenv("KT_SESSION_DIR", str(session_dir))
+        engine = Terrarium(session_dir=str(session_dir))
+        svc = LocalTerrariumService(engine)
+        cfg = TerrariumConfig(name="solo-terra", creatures=[], channels=[])
+        try:
+            sess = await lifecycle.start_terrarium(svc, config=cfg)
+            sid = sess.session_id
+            # One store file, owned by Studio — the engine minted (and
+            # therefore owns) nothing.
+            files = list(session_dir.glob("*.kohakutr"))
+            assert [f.name for f in files] == [f"{sid}.kohakutr"]
+            assert engine._owned_sessions == set()
+            store = lifecycle.get_session_store(svc, sid)
+            assert store is not None
+            assert engine._session_stores[sid] is store
+            # Stop closes the single handle; the file is then deletable
+            # (on Windows a leaked second handle makes this raise).
+            await lifecycle.stop_session(svc, sid)
+            files[0].unlink()
         finally:
             await engine.shutdown()
 
@@ -244,7 +277,7 @@ class TestListGetSession:
         t = await TestTerrariumBuilder().build()
         svc = LocalTerrariumService(t)
         try:
-            lifecycle._meta["remote-sid"] = {
+            lifecycle.meta_for(svc)["remote-sid"] = {
                 "name": "remote-sess",
                 "on_node": "worker-1",
             }
@@ -267,7 +300,7 @@ class TestListGetSession:
         t = await TestTerrariumBuilder().build()
         svc = LocalTerrariumService(t)
         try:
-            lifecycle._meta["sid-r"] = {
+            lifecycle.meta_for(svc)["sid-r"] = {
                 "name": "rs",
                 "on_node": "worker-1",
                 "creature_id": "cid-r",
@@ -353,9 +386,9 @@ class TestRename:
         svc = LocalTerrariumService(t)
         try:
             gid = t.get_creature("alice").graph_id
-            lifecycle._meta[gid] = {"name": "old"}
+            lifecycle.meta_for(svc)[gid] = {"name": "old"}
             lifecycle.rename_creature(svc, "alice", "new")
-            assert lifecycle._meta[gid]["name"] == "new"
+            assert lifecycle.meta_for(svc)[gid]["name"] == "new"
         finally:
             await t.shutdown()
 
@@ -370,7 +403,7 @@ class TestStopSession:
         try:
             gid = t.get_creature("alice").graph_id
             await lifecycle.stop_session(svc, gid)
-            assert gid not in lifecycle._meta
+            assert gid not in lifecycle.meta_for(svc)
         finally:
             await t.shutdown()
 
@@ -380,13 +413,13 @@ class TestStopSession:
         # Add a fake remote_creature method.
         svc.remove_creature = AsyncMock()
         try:
-            lifecycle._meta["sid-r"] = {
+            lifecycle.meta_for(svc)["sid-r"] = {
                 "on_node": "worker-1",
                 "creature_id": "cid-r",
             }
             await lifecycle.stop_session(svc, "sid-r")
             svc.remove_creature.assert_awaited_with("cid-r")
-            assert "sid-r" not in lifecycle._meta
+            assert "sid-r" not in lifecycle.meta_for(svc)
         finally:
             await t.shutdown()
 
@@ -432,7 +465,7 @@ class TestHotPlug:
         t = await TestTerrariumBuilder().build()
         svc = LocalTerrariumService(t)
         try:
-            lifecycle._meta["sid-r"] = {
+            lifecycle.meta_for(svc)["sid-r"] = {
                 "name": "n",
                 "on_node": "worker-1",
                 "creature_id": "cid-r",

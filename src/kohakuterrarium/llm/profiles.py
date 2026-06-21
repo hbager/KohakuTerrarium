@@ -223,6 +223,8 @@ _PROVIDER_DEFAULT_MODELS: list[tuple[str, str]] = [
     ("openai", "gpt-5.4"),
     ("gemini", "gemini-3.1-pro"),
     ("mimo", "mimo-v2-pro"),
+    ("kimi-code", "kimi-for-coding"),
+    ("glm-coding", "glm-5.1"),
 ]
 
 
@@ -599,9 +601,9 @@ def _legacy_model_provider_hint(controller_config: dict[str, Any]) -> str:
 
 def resolve_controller_llm(
     controller_config: dict[str, Any],
-    llm_override: str | None = None,
+    llm: str | None = None,
 ) -> LLMProfile | None:
-    name = llm_override or controller_config.get("llm")
+    name = llm or controller_config.get("llm")
     raw_model = controller_config.get("model", "")
     provider = controller_config.get("provider", "") or ""
 

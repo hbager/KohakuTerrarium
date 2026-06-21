@@ -78,7 +78,7 @@ kt config llm add                 # 互動式預設建立器
 kt model default <preset-name>
 ```
 
-**其他提供者**：`anthropic`、`openrouter`、`gemini` 等都是內建後端。詳情請見 `kt config provider list` 與[設定](configuration.md)。
+**其他提供者**：`anthropic`、`openrouter`、`gemini`、`kimi-code`、`glm-coding` 等都是內建後端。詳情請見 `kt config provider list` 與[設定](configuration.md)。
 
 ## 4. 執行一隻生物
 
@@ -90,9 +90,9 @@ kt run @kt-biome/creatures/swe --mode cli
 
 模式：
 
-- `cli` — Rich 行內介面（TTY 時預設）
-- `tui` — 全螢幕 Textual 應用程式
-- `plain` — 純 stdout/stdin，適合 pipe 或 CI
+- `cli`：Rich 行內介面（TTY 時預設）
+- `tui`：全螢幕 Textual 應用程式
+- `plain`：純 stdout/stdin，適合 pipe 或 CI
 
 覆寫單次執行的模型：
 

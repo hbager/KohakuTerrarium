@@ -16,8 +16,9 @@ HTTP / CLI orchestration.
 
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
+from kohakuterrarium.errors import SessionNotResumableError
 from kohakuterrarium.builtins.inputs.none import NoneInput
 from kohakuterrarium.session.resume import (
     _open_store_with_migration,
@@ -43,7 +44,7 @@ async def resume_into_engine(
     store: SessionStore | str | Path,
     *,
     pwd: str | None = None,
-    llm_override: str | None = None,
+    llm: Any = None,
 ) -> str:
     """Adopt a saved session into ``engine``.  Returns the graph_id.
 
@@ -53,19 +54,21 @@ async def resume_into_engine(
     and attaches the ``SessionStore`` at the graph level.
 
     ``store`` may be a path-like to a ``.kohakutr`` file or an
-    already-open :class:`SessionStore` instance (the path is then
-    pulled off ``store.path``).
+    already-open :class:`SessionStore` instance.  An instance is CLOSED
+    here first — the rebuild paths open the file themselves, and two
+    live handles on one session file kept independent event counters
+    (E8).
     """
     path = _resolve_store_path(store)
+    if isinstance(store, SessionStore):
+        store.close(update_status=False)
     session_type = detect_session_type(path)
 
     if session_type == "agent":
-        return await _resume_agent_into_engine(
-            engine, path, pwd=pwd, llm_override=llm_override
-        )
+        return await _resume_agent_into_engine(engine, path, pwd=pwd, llm=llm)
     if session_type == "terrarium":
-        return await _resume_terrarium_into_engine(engine, path, pwd=pwd)
-    raise ValueError(f"Unknown saved-session type: {session_type!r}")
+        return await _resume_terrarium_into_engine(engine, path, pwd=pwd, llm=llm)
+    raise SessionNotResumableError(f"Unknown saved-session type: {session_type!r}")
 
 
 def _resolve_store_path(store: SessionStore | str | Path) -> Path:
@@ -82,14 +85,14 @@ async def _resume_agent_into_engine(
     path: Path,
     *,
     pwd: str | None,
-    llm_override: str | None,
+    llm: Any,
 ) -> str:
     """Standalone-agent resume: rebuild Agent, wrap, adopt, attach.
 
     The rebuilt agent is adopted into a live engine and driven through
     the engine's wiring / attach WebSocket — never its config's own
     ``input: cli`` loop. ``input_module=NoneInput()`` suppresses that
-    loop exactly as ``engine.add_creature(suppress_io=True)`` does for
+    loop exactly as ``engine.add_creature(io="none")`` does for
     the Studio / Lab spawn path; without it a worker-side resume boots
     a stdin reader with no TTY and wedges the worker.
     """
@@ -98,7 +101,7 @@ async def _resume_agent_into_engine(
     agents = list(meta.get("agents") or [])
     if len(agents) > 1:
         return await _resume_runtime_group_into_engine(
-            engine, store, meta, pwd=pwd, llm_override=llm_override
+            engine, store, meta, pwd=pwd, llm=llm
         )
     store.close()
 
@@ -109,7 +112,7 @@ async def _resume_agent_into_engine(
         path,
         pwd_override=pwd,
         io_mode=None,
-        llm_override=llm_override,
+        llm=llm,
         input_module=NoneInput(),
     )
     creature_obj = Creature(
@@ -118,7 +121,9 @@ async def _resume_agent_into_engine(
         agent=agent,
         config=agent.config,
     )
-    creature = await engine.add_creature(creature_obj, start=True)
+    # ``session=False``: the SAVED store attaches below — autosession
+    # minting a fresh sibling file here would orphan it on disk.
+    creature = await engine.add_creature(creature_obj, start=True, session=False)
 
     # Attach at graph level. ``Agent.attach_session_store`` is
     # idempotent for the same store, so this updates graph bookkeeping
@@ -140,7 +145,7 @@ async def _resume_runtime_group_into_engine(
     meta: dict,
     *,
     pwd: str | None,
-    llm_override: str | None,
+    llm: Any,
 ) -> str:
     config_path = meta.get("config_path", "")
     config_snapshot = meta.get("config_snapshot") or {}
@@ -149,16 +154,17 @@ async def _resume_runtime_group_into_engine(
         raise ValueError("Session has no config_path or config_snapshot in metadata")
 
     effective_pwd = pwd or meta.get("pwd", ".")
-    if effective_pwd and os.path.isdir(effective_pwd):
-        os.chdir(effective_pwd)
+    if not (effective_pwd and os.path.isdir(effective_pwd)):
+        effective_pwd = None
 
     sid: str | None = None
     for agent_name in list(meta.get("agents") or []):
         agent = _rebuild_agent(
             config_path=config_path,
             config_snapshot=config_snapshot,
-            llm_override=llm_override,
+            llm=llm,
             io_kwargs={"input_module": NoneInput()},
+            pwd=effective_pwd,
         )
         inject_saved_state(agent, store, agent_name)
         creature_obj = Creature(
@@ -171,7 +177,6 @@ async def _resume_runtime_group_into_engine(
             creature_obj,
             graph=sid,
             start=True,
-            suppress_io=True,
         )
         sid = creature.graph_id
 
@@ -196,17 +201,20 @@ async def _resume_terrarium_into_engine(
     path: Path,
     *,
     pwd: str | None,
+    llm: Any = None,
 ) -> str:
     """Multi-creature recipe resume: rebuild graph, inject per-creature."""
     store = _open_store_with_migration(path)
     meta = store.load_meta()
     config_path = meta.get("config_path", "")
     if not config_path:
-        raise ValueError("Saved terrarium has no config_path in metadata")
+        raise SessionNotResumableError("Saved terrarium has no config_path in metadata")
 
+    # ``pwd`` flows into ``apply_recipe`` (per-creature workspaces) —
+    # no process-wide ``os.chdir`` (E8).
     pwd = pwd or meta.get("pwd", ".")
-    if pwd and os.path.isdir(pwd):
-        os.chdir(pwd)
+    if not (pwd and os.path.isdir(pwd)):
+        pwd = None
 
     config = load_terrarium_config(config_path)
 
@@ -215,7 +223,15 @@ async def _resume_terrarium_into_engine(
     # begins with an empty conversation; we inject the saved state
     # below.  Since input hasn't started flowing yet, injection lands
     # before any new turn begins.
-    graph = await engine.apply_recipe(config, pwd=pwd)
+    #
+    # ``session=False``: the SAVED store attaches below.  Under
+    # autosession (``Terrarium(session_dir=...)`` — every API-server
+    # engine) ``apply_recipe`` would otherwise mint a fresh
+    # ``<new_gid>.kohakutr`` that the saved-store attach immediately
+    # orphans: an empty ghost file stuck at ``status="running"`` in
+    # the saved-session list, plus a leaked open handle.  Mirrors the
+    # ``session=False`` in ``_resume_agent_into_engine``.
+    graph = await engine.apply_recipe(config, pwd=pwd, llm=llm, session=False)
     sid = graph.graph_id
 
     # Per-creature state injection.

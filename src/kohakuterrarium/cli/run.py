@@ -11,11 +11,14 @@ for a focused single-creature stream.
 """
 
 import asyncio
+import sys
 from pathlib import Path
 from uuid import uuid4
 
 import kohakuterrarium.terrarium.channels as _channels
 import kohakuterrarium.terrarium.topology as _topo
+from kohakuterrarium.cli.picker import pick_runnable
+from kohakuterrarium.packages.resolve import resolve_any_path
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.persistence import session_index
 from kohakuterrarium.terrarium.config import load_terrarium_config
@@ -39,7 +42,7 @@ def run_agent_cli(
     log_level: str,
     session: str | None = None,
     io_mode: str | None = None,
-    llm_override: str | None = None,
+    llm: str | None = None,
     log_stderr: str = "auto",
     extra_creatures: list[str] | None = None,
     extra_channels: list[str] | None = None,
@@ -88,7 +91,11 @@ def run_agent_cli(
         )
         io_mode = None
 
-    path = Path(agent_path)
+    try:
+        path = resolve_any_path(agent_path)
+    except (FileNotFoundError, ValueError) as exc:
+        print(f"Error: {exc}")
+        return 1
     if not path.exists():
         print(f"Error: path not found: {agent_path}")
         return 1
@@ -98,7 +105,7 @@ def run_agent_cli(
             _run(
                 str(path),
                 session=session,
-                llm_override=llm_override,
+                llm=llm,
                 io_mode=io_mode,
                 extra_creatures=extra_creatures or [],
                 extra_channels=extra_channels or [],
@@ -113,11 +120,55 @@ def run_agent_cli(
         return 1
 
 
+def resolve_then_run(
+    agent_path: str | None,
+    *,
+    io_mode: str,
+    log_level: str = "INFO",
+    session: str | None = "__auto__",
+    llm: str | None = None,
+    log_stderr: str = "auto",
+    extra_creatures: list[str] | None = None,
+    extra_channels: list[str] | None = None,
+) -> int:
+    """Resolve a creature/recipe (or run the startup picker) then run it.
+
+    The shared core behind the ``kt-cli`` / ``kt-tui`` front doors and the
+    ``kt cli`` / ``kt tui`` subcommand aliases.  ``io_mode`` is forced by
+    the caller to ``"cli"`` or ``"tui"``.  When ``agent_path`` is ``None``
+    the startup picker runs — which requires an interactive terminal; in a
+    non-TTY context we print guidance and return non-zero instead of
+    hanging on a picker nobody can drive.
+    """
+    if agent_path is None:
+        if not (sys.stdin.isatty() and sys.stdout.isatty()):
+            print(
+                "kt-cli / kt-tui need an interactive terminal to pick an agent.\n"
+                "Pass a creature or recipe explicitly "
+                "(e.g. `kt-cli @kt-biome/creatures/general`),\n"
+                "or run a configured creature headless with `kt run <path>`."
+            )
+            return 2
+        agent_path = pick_runnable(io_mode)
+        if not agent_path:
+            return 0
+    return run_agent_cli(
+        agent_path,
+        log_level,
+        session=session,
+        io_mode=io_mode,
+        llm=llm,
+        log_stderr=log_stderr,
+        extra_creatures=extra_creatures or [],
+        extra_channels=extra_channels or [],
+    )
+
+
 async def _run(
     agent_path: str,
     *,
     session: str | None,
-    llm_override: str | None,
+    llm: str | None,
     io_mode: str | None,
     extra_creatures: list[str],
     extra_channels: list[str],
@@ -131,7 +182,10 @@ async def _run(
 
         if is_recipe:
             cfg = load_terrarium_config(agent_path)
-            graph = await engine.apply_recipe(cfg, pwd=pwd, llm_override=llm_override)
+            # ``strict=False``: the interactive run keeps the
+            # degrade-and-continue behavior — a missing model key
+            # defers and the user rebinds via ``/model``.
+            graph = await engine.apply_recipe(cfg, pwd=pwd, llm=llm, strict=False)
             focus_creature_id = _pick_focus_creature(engine, graph.graph_id)
             graph_id = graph.graph_id
             if session is not None:
@@ -145,9 +199,12 @@ async def _run(
         else:
             creature = await engine.add_creature(
                 agent_path,
-                llm_override=llm_override,
+                llm=llm,
                 pwd=pwd,
                 is_privileged=True,
+                # Interactive run: degrade-and-continue (user can fix
+                # the model binding at runtime via ``/model``).
+                strict=False,
                 # ``--mode cli`` AND ``--mode tui`` both mount their own
                 # terminal-owning surface (prompt_toolkit Application for
                 # cli, Textual App for tui). If the configured input is
@@ -177,7 +234,7 @@ async def _run(
             engine,
             graph_id=graph_id,
             pwd=pwd,
-            llm_override=llm_override,
+            llm=llm,
             extra_creatures=extra_creatures,
             extra_channels=extra_channels,
         )
@@ -230,7 +287,7 @@ async def _apply_cli_topology(
     *,
     graph_id: str,
     pwd: str,
-    llm_override: str | None,
+    llm: str | None,
     extra_creatures: list[str],
     extra_channels: list[str],
 ) -> None:
@@ -251,8 +308,9 @@ async def _apply_cli_topology(
                 cfg_path,
                 graph=graph_id,
                 pwd=pwd,
-                llm_override=llm_override,
+                llm=llm,
                 is_privileged=False,
+                strict=False,
             )
         except Exception as exc:
             logger.warning(
@@ -355,8 +413,11 @@ async def _attach_session_store(
 ) -> SessionStore:
     """Attach a session store to ``graph_id`` and return it.
 
-    Awaits the engine's :meth:`attach_session` so a failure surfaces
-    here (rather than disappearing into a fire-and-forget task).
+    Dogfoods the engine's mint-mode ``attach_session`` (E2) — the old
+    hand-rolled ``SessionStore`` + ``init_meta`` ceremony lives in the
+    engine now.  ``config_type`` is folded into the minted meta after
+    attach (the engine types by graph shape; a 1-creature recipe still
+    needs ``"terrarium"`` for topology resume).
     """
     if session == "__auto__":
         _SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -364,14 +425,12 @@ async def _attach_session_store(
     else:
         session_file = Path(session)
 
-    store = SessionStore(session_file)
-    store.init_meta(
-        session_id=uuid4().hex,
-        config_type=config_type,
-        config_path=config_path,
-        pwd=str(Path.cwd()),
-        agents=[c.name for c in engine.list_creatures() if c.graph_id == graph_id],
-    )
+    await engine.attach_session(graph_id, session_file)
+    store = engine._session_stores[graph_id]
+    if config_path and not store.meta.get("config_path"):
+        store.meta["config_path"] = config_path
+    if config_type in ("agent", "terrarium"):
+        store.meta["config_type"] = config_type
     try:
         session_index.upsert_session_meta(
             session_file,
@@ -384,7 +443,6 @@ async def _attach_session_store(
             error=str(e),
             exc_info=True,
         )
-    await engine.attach_session(graph_id, store)
     return store
 
 
@@ -475,7 +533,9 @@ def _resolve_session(query: str | None, last: bool = False) -> Path | None:
 def _session_preview(path: Path) -> str:
     """Get a short preview of session metadata."""
     try:
-        store = SessionStore(path)
+        # Read-only: a plain open+close here used to bump last_active,
+        # corrupting the recency ordering the resume picker sorts by.
+        store = SessionStore.open_readonly(path)
         meta = store.load_meta()
         store.close()
         config_type = meta.get("config_type", "?")

@@ -20,12 +20,12 @@ Mechanics:
 """
 
 import asyncio
-from typing import Any, Iterable
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.studio.sessions.lifecycle import list_session_stores
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -37,16 +37,30 @@ _QUEUE_MAX = 1000
 
 
 def _find_live_store(
-    session_name: str, stores: Iterable[SessionStore] | None = None
+    session_name: str,
+    stores: "Mapping[str, SessionStore] | Iterable[SessionStore] | None" = None,
 ) -> SessionStore | None:
     """Locate the live ``SessionStore`` for ``session_name``.
 
-    Iterates the studio's live store registry and matches on the file
-    stem so callers can pass the canonical name (no ``.kohakutr``
-    extension, no version suffix). Returns ``None`` if no live
-    creature / session owns this name.
+    ``stores`` may be the registry MAPPING (``graph_id -> store``) or a
+    plain iterable of stores. A mapping is matched on its key first —
+    the live-session URL passes the graph id, which is unrelated to the
+    store's file name. Falls back to matching the file stem so saved
+    session names (no ``.kohakutr`` extension, no version suffix) also
+    resolve. Returns ``None`` if no live creature / session owns this
+    name.  Session stores are instance-scoped
+    (``studio.sessions.registry``) so the caller — who knows which
+    runtime it serves — supplies the registry.
     """
-    candidates = stores if stores is not None else list_session_stores()
+    if stores is None:
+        return None
+    if isinstance(stores, Mapping):
+        direct = stores.get(session_name)
+        if direct is not None:
+            return direct
+        candidates: Iterable[SessionStore] = stores.values()
+    else:
+        candidates = stores
     for store in candidates:
         if store is None:
             continue
@@ -79,7 +93,7 @@ async def run_trace_attach(
     websocket: WebSocket,
     session_name: str,
     agent: str | None,
-    stores: Iterable[SessionStore] | None = None,
+    stores: "Mapping[str, SessionStore] | Iterable[SessionStore] | None" = None,
 ) -> None:
     """Live event stream for a running session.
 
@@ -88,8 +102,9 @@ async def run_trace_attach(
     whose status is ``"paused"`` so this close path is the exception,
     not the common case.
 
-    ``stores`` lets callers pin a specific iterable; when ``None`` the
-    studio's live registry is consulted directly.
+    ``stores`` is the runtime's live store registry (the WS shell passes
+    ``registry.stores_for(service)`` mapping); ``None`` means no live
+    stores and rejects every session as not-live.
     """
     await websocket.accept()
     store = _find_live_store(session_name, stores)

@@ -78,7 +78,9 @@ kt config llm add                 # interactive preset builder
 kt model default <preset-name>
 ```
 
-**Other providers**: `anthropic`, `openrouter`, `gemini`, etc. are built-in backends. See `kt config provider list` and [Configuration](configuration.md) for details.
+**Other providers**: `anthropic`, `openrouter`, `gemini`, `kimi-code`,
+`glm-coding`, etc. are built-in backends. See `kt config provider list` and
+[Configuration](configuration.md) for details.
 
 ## 4. Run a creature
 
@@ -90,9 +92,9 @@ You land in an interactive prompt with the SWE agent. Type a request; it uses sh
 
 Modes:
 
-- `cli` — Rich inline (default on TTY)
-- `tui` — Full-screen Textual app
-- `plain` — Bare stdout/stdin, for piping or CI
+- `cli`: Rich inline (default on TTY)
+- `tui`: Full-screen Textual app
+- `plain`: Bare stdout/stdin, for piping or CI
 
 Override the model for one run:
 

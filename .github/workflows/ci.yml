@@ -145,3 +145,6 @@ jobs:
           pip install dist/*.whl
           kt --help
           kt app --help
+          kt-cli --help
+          kt-tui --help
+          kt shims status

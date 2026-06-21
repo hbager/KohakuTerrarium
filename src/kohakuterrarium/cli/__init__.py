@@ -20,6 +20,7 @@ from kohakuterrarium.cli._aliases import (
 from kohakuterrarium.cli.admin import add_admin_subparser, admin_cli
 from kohakuterrarium.cli.auth import login_cli
 from kohakuterrarium.cli.config import add_config_subparser, config_cli
+from kohakuterrarium.cli.doctor import add_doctor_subparser, dispatch_doctor
 from kohakuterrarium.cli.extension import extension_info_cli, extension_list_cli
 from kohakuterrarium.cli.identity_mcp import list_for_agent_cli as mcp_list_cli
 from kohakuterrarium.cli.lab_client import add_lab_client_subparser, lab_client_cli
@@ -35,12 +36,13 @@ from kohakuterrarium.cli.packages import (
     update_cli,
 )
 from kohakuterrarium.cli.resume import resume_cli
-from kohakuterrarium.cli.run import run_agent_cli
+from kohakuterrarium.cli.run import resolve_then_run, run_agent_cli
+from kohakuterrarium.cli.select_args import add_run_like_args
 from kohakuterrarium.cli.self_update import add_self_update_subparser, self_update_cli
+from kohakuterrarium.cli.shims import add_shims_subparser, shims_cli
 from kohakuterrarium.cli.serve import add_serve_subparser, serve_cli
 from kohakuterrarium.cli.service import add_service_subparser, service_cli
 from kohakuterrarium.cli.version import format_version_report
-from kohakuterrarium.packages.resolve import resolve_package_path
 from kohakuterrarium.serving.web import run_desktop_app, run_web_server
 
 
@@ -144,6 +146,23 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # cli / tui — subcommand aliases for the standalone ``kt-cli`` /
+    # ``kt-tui`` front doors. Optional creature argument; omit it to pick
+    # one from the startup picker.
+    cli_parser = subparsers.add_parser(
+        "cli",
+        help="Interactive rich CLI (optional creature; picker when omitted)",
+    )
+    add_run_like_args(cli_parser)
+    tui_parser = subparsers.add_parser(
+        "tui",
+        help="Full-screen Textual TUI (optional creature; picker when omitted)",
+    )
+    add_run_like_args(tui_parser)
+
+    # shims — expose kt / kt-cli / kt-tui on the terminal PATH.
+    add_shims_subparser(subparsers)
+
     # List command
     list_parser = subparsers.add_parser("list", help="List available agents")
     list_parser.add_argument(
@@ -205,6 +224,9 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    # Doctor command
+    add_doctor_subparser(subparsers)
+
     # Login command
     login_parser = subparsers.add_parser("login", help="Authenticate with a provider")
     login_parser.add_argument(
@@ -230,6 +252,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Install as editable (symlink, like pip -e)",
     )
     install_parser.add_argument("--name", default=None, help="Override package name")
+    install_parser.add_argument(
+        "--no-deps",
+        action="store_true",
+        help="Skip installing the package's declared Python dependencies",
+    )
 
     # Uninstall command
     uninstall_parser = subparsers.add_parser(
@@ -463,25 +490,50 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _dispatch_run(args: argparse.Namespace) -> int:
-    """Handle the 'run' command."""
+    """Handle the 'run' command.
+
+    ``@pkg/...`` agent paths pass through verbatim — the config-loading
+    chokepoint (``load_agent_config`` / ``load_terrarium_config``)
+    resolves package references for every entry point.
+    """
     agent_path = args.agent_path
-    if agent_path.startswith("@"):
-        agent_path = str(resolve_package_path(agent_path))
     session = None if args.no_session else args.session
-    extra_creatures = [
-        str(resolve_package_path(p)) if p.startswith("@") else p
-        for p in (getattr(args, "add_creatures", None) or [])
-    ]
+    extra_creatures = list(getattr(args, "add_creatures", None) or [])
     return run_agent_cli(
         agent_path,
         args.log_level,
         session=session,
         io_mode=args.mode,
-        llm_override=args.llm,
+        llm=args.llm,
         log_stderr=args.log_stderr,
         extra_creatures=extra_creatures,
         extra_channels=list(getattr(args, "add_channels", None) or []),
     )
+
+
+def _resolve_then_run_from_args(args: argparse.Namespace, io_mode: str) -> int:
+    """Shared dispatch for the ``kt cli`` / ``kt tui`` subcommand aliases."""
+    session = None if args.no_session else args.session
+    return resolve_then_run(
+        args.agent_path,
+        io_mode=io_mode,
+        log_level=args.log_level,
+        session=session,
+        llm=args.llm,
+        log_stderr=args.log_stderr,
+        extra_creatures=list(getattr(args, "add_creatures", None) or []),
+        extra_channels=list(getattr(args, "add_channels", None) or []),
+    )
+
+
+def _dispatch_cli_mode(args: argparse.Namespace) -> int:
+    """Handle the 'cli' subcommand alias (rich inline mode)."""
+    return _resolve_then_run_from_args(args, "cli")
+
+
+def _dispatch_tui_mode(args: argparse.Namespace) -> int:
+    """Handle the 'tui' subcommand alias (full-screen mode)."""
+    return _resolve_then_run_from_args(args, "tui")
 
 
 def _dispatch_resume(args: argparse.Namespace) -> int:
@@ -492,7 +544,7 @@ def _dispatch_resume(args: argparse.Namespace) -> int:
         args.log_level,
         last=args.last,
         io_mode=args.mode,
-        llm_override=args.llm,
+        llm=args.llm,
         log_stderr=args.log_stderr,
     )
 
@@ -552,11 +604,17 @@ def _dispatch_mcp(args: argparse.Namespace) -> int:
 # Command dispatch table: command name -> handler function
 COMMANDS: dict[str, callable] = {
     "run": _dispatch_run,
+    "cli": _dispatch_cli_mode,
+    "tui": _dispatch_tui_mode,
+    "shims": shims_cli,
     "resume": _dispatch_resume,
+    "doctor": dispatch_doctor,
     "list": lambda args: list_cli(args.path),
     "info": lambda args: show_agent_info_cli(args.agent_path),
     "login": lambda args: login_cli(args.provider),
-    "install": lambda args: install_cli(args.source, args.editable, args.name),
+    "install": lambda args: install_cli(
+        args.source, args.editable, args.name, args.no_deps
+    ),
     "uninstall": lambda args: uninstall_cli(args.name),
     "update": lambda args: update_cli(args.target, args.all),
     "edit": lambda args: edit_cli(args.target),
