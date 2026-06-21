@@ -311,13 +311,16 @@ class AgentMessagesMixin:
         branch_view: dict[int, int] | None = None,
     ) -> int | None:
         """Resolve an edit target to an in-memory user-message index."""
-        if turn_index is not None:
+        # ``user_position`` is the precise clicked bubble. Keep it
+        # authoritative because mid-turn injected user bubbles share the
+        # same turn_index as the turn-starter.
+        if turn_index is not None and user_position is None:
             pos = self._user_position_for_turn_index(
                 turn_index, branch_view=branch_view
             )
             if pos is not None:
                 user_position = pos
-            elif user_position is None:
+            else:
                 return None
         if user_position is not None:
             if user_position < 0:

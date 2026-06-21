@@ -1924,6 +1924,57 @@ describe("chat store — optimistic branch promotion", () => {
     expect(chat.viewingRunningBranch).toBe(true)
   })
 
+  it("editMessage keeps optimistic streaming branch when the API times out after rerun started", async () => {
+    const chat = useChatStore()
+    chat._instanceId = "agent_1"
+    chat._instanceGraphId = "agent_1"
+    chat.activeTab = "main"
+    const originalEvents = [
+      { type: "user_input", content: "hi", event_id: 1, turn_index: 1, branch_id: 1 },
+      { type: "user_message", content: "hi", event_id: 2, turn_index: 1, branch_id: 1 },
+      { type: "processing_start", event_id: 3, turn_index: 1, branch_id: 1 },
+      { type: "text_chunk", content: "old reply", event_id: 4, turn_index: 1, branch_id: 1 },
+      { type: "processing_end", event_id: 5, turn_index: 1, branch_id: 1 },
+    ]
+    chat.messagesByTab = {
+      main: [
+        {
+          id: "u1",
+          role: "user",
+          content: "hi",
+          turnIndex: 1,
+          latestBranch: 1,
+          userPosition: 0,
+        },
+        { id: "a1", role: "assistant", parts: [{ type: "text", content: "old reply" }] },
+      ],
+    }
+    chat.eventsByTab = { main: [...originalEvents] }
+    const scheduleSpy = vi.spyOn(chat, "_scheduleBranchResync").mockImplementation(() => {})
+
+    const importActual = await vi.importActual("@/utils/api")
+    const timeout = new Error("timeout of 30000ms exceeded")
+    timeout.code = "ECONNABORTED"
+    const editSpy = vi.spyOn(importActual.agentAPI, "editMessage").mockRejectedValue(timeout)
+
+    const ok = await chat.editMessage(0, "edited", {
+      turnIndex: 1,
+      userPosition: 0,
+      latestBranch: 1,
+    })
+
+    expect(ok).toBe(true)
+    expect(chat.messagesByTab.main.some((m) => m.role === "user" && m.content === "edited")).toBe(true)
+    expect(JSON.stringify(chat.messagesByTab.main)).not.toContain("old reply")
+    expect(chat.branchViewByTab.main[1]).toBe(2)
+    expect(chat._streamingBranchByTab.main).toEqual({ turnIndex: 1, branchId: 2 })
+    expect(chat.processingByTab.main).toBe(true)
+    expect(scheduleSpy).toHaveBeenCalledWith("main")
+
+    editSpy.mockRestore()
+    scheduleSpy.mockRestore()
+  })
+
   it("editMessage rolls back the optimistic events when the API throws", async () => {
     // Regression: pre-fix the optimistic branch was injected but the
     // catch block left ``processingByTab[tab] = true`` plus the

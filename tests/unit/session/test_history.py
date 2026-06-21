@@ -159,6 +159,20 @@ class TestReplayConversation:
             {"role": "assistant", "content": "[compacted summary]"},
             {"role": "user", "content": "msg1"},
         ]
+    def test_mid_turn_injected_user_is_replayed_as_user_message(self):
+        events = [
+            {"type": "user_message", "content": "u1", "event_id": 1},
+            {"type": "text_chunk", "content": "a1", "event_id": 2},
+            {"type": "user_input_injected", "content": "u1b", "event_id": 3},
+            {"type": "text_chunk", "content": "a1b", "event_id": 4},
+        ]
+        out = replay_conversation(events)
+        assert out == [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u1b"},
+            {"role": "assistant", "content": "a1b"},
+        ]
 
 
 class TestReplayBranching:

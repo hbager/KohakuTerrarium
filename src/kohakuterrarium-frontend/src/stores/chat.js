@@ -377,6 +377,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
 
   const result = []
   let cur = null
+  let currentEventTurnIndex = null
   let _n = 0
   // Dedupe user-role renders across user_input + user_message duplicates
   // for the same (turn, branch).
@@ -391,6 +392,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
         id: "h_" + result.length,
         role: "assistant",
         parts: [],
+        turnIndex: currentEventTurnIndex,
         timestamp: "",
       }
       result.push(cur)
@@ -635,6 +637,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
 
   for (const evt of events) {
     const t = evt.type
+    currentEventTurnIndex = typeof evt?.turn_index === "number" ? evt.turn_index : null
 
     // Skip events on a non-selected branch of their turn (siblings of
     // regen / edit+rerun stay on disk for the <1/N> navigator but
@@ -672,6 +675,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
         role: "user",
         content: normalized.content,
         contentParts: normalized.contentParts,
+        turnIndex: evt.turn_index,
         timestamp: "",
       })
     } else if (t === "user_input_injected") {
@@ -699,6 +703,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
         content: normalized.content,
         contentParts: normalized.contentParts,
         injectedMidTurn: true,
+        turnIndex: evt.turn_index,
         timestamp: "",
       })
     } else if (t === "processing_start") {
@@ -706,6 +711,7 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
         id: "h_" + result.length,
         role: "assistant",
         parts: [],
+        turnIndex: evt.turn_index,
         timestamp: "",
       }
       result.push(cur)
@@ -1136,16 +1142,20 @@ export function _replayEvents(messages, events, branchView = null, liveRunningJo
       // regenerate falls through to the conversation tail and
       // retries on a non-tail message silently target the last
       // message instead of the clicked one.
-      if (typeof ti === "number") {
+      if (typeof ti === "number" && typeof msg.turnIndex !== "number") {
         msg.turnIndex = ti
         _attachUserNav(msg, ti)
+      } else if (typeof msg.turnIndex === "number") {
+        _attachUserNav(msg, msg.turnIndex)
       }
     } else if (msg.role === "assistant") {
       const ti = assistantTurnsForResult[assistantMsgIdx]
       assistantMsgIdx += 1
-      if (typeof ti === "number") {
+      if (typeof ti === "number" && typeof msg.turnIndex !== "number") {
         msg.turnIndex = ti
         _attachAssistantNav(msg, ti)
+      } else if (typeof msg.turnIndex === "number") {
+        _attachAssistantNav(msg, msg.turnIndex)
       }
     }
   }
@@ -3104,6 +3114,13 @@ const _chatStoreOptions = {
         const resynced = await this._resyncHistory(tab)
         return resynced !== false
       } catch (e) {
+        const timedOut =
+          e?.code === "ECONNABORTED" || /timeout/i.test(String(e?.message || ""))
+        if (timedOut && optimisticApplied && tab) {
+          this._scheduleBranchResync(tab)
+          console.warn("Edit message request timed out; keeping optimistic rerun state:", e)
+          return true
+        }
         delete this._branchResyncPendingByTab[tab]
         if (previousMessages && tab) this.messagesByTab[tab] = previousMessages
         if (optimisticApplied && tab) {

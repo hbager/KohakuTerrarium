@@ -345,6 +345,9 @@ def replay_conversation(
 
     - ``user_message``: role/content pair. ``content`` may be a plain
       str or a list of multimodal content parts.
+    - ``user_input_injected``: mid-turn user message folded into the
+      current turn. Replayed as its own ``role=user`` entry so edit /
+      rerun sees the same visible conversation as the UI.
     - ``text_chunk``: accumulator. ``content`` is concatenated with
       subsequent ``text_chunk`` events until a non-chunk event arrives,
       then the buffer is flushed as one assistant message.
@@ -426,7 +429,7 @@ def replay_conversation(
         # Any non-chunk structural event flushes the buffer first.
         _flush_text()
 
-        if etype == "user_message":
+        if etype in ("user_message", "user_input_injected"):
             messages.append({"role": "user", "content": evt.get("content", "")})
         elif etype == "assistant_tool_calls":
             tool_calls = evt.get("tool_calls") or []

@@ -277,6 +277,16 @@ class TestResolveEditMessageIndex:
         idx = agent._resolve_edit_message_index(msgs, -1, turn_index=2)
         # Should resolve to the second user message.
         assert msgs[idx].content == "u2"
+    def test_turn_index_does_not_override_explicit_user_position(self, agent):
+        msgs = self._make_msgs(agent)
+        # Mid-turn injected user input shares turn 1 but is a distinct
+        # visible/editable user bubble in the frontend.
+        agent.controller.conversation.append("user", "u1b")
+        injected = agent.controller.conversation._messages.pop()
+        agent.controller.conversation._messages.insert(2, injected)
+        msgs = agent.controller.conversation.get_messages()
+        idx = agent._resolve_edit_message_index(msgs, -1, turn_index=1, user_position=1)
+        assert msgs[idx].content == "u1b"
 
 
 # ── _previous_branch_user_content ────────────────────────────────
