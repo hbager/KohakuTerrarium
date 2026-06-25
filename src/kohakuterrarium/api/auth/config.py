@@ -24,7 +24,10 @@ without setting any new config.
 """
 
 import os
-import tomllib
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - Python <3.11 fallback
+    import tomli as tomllib  # type: ignore
 from dataclasses import dataclass
 from pathlib import Path
 
