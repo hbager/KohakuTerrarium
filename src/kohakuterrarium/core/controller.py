@@ -850,7 +850,14 @@ class Controller:
 
         user_content, combined_text = self._build_turn_context(events)
         # Skip user append: native-mode tool round-trips, and pure regen.
-        skip_empty = (self._is_native_mode and not combined_text.strip()) or any(
+        # A pure-image/file input has empty combined_text but still
+        # carries meaningful multimodal payload — don't skip it.
+        has_multimodal = isinstance(user_content, list) and any(
+            isinstance(p, (ImagePart, FilePart)) for p in user_content
+        )
+        skip_empty = (
+            self._is_native_mode and not combined_text.strip() and not has_multimodal
+        ) or any(
             e.type == "user_input"
             and e.context.get("rerun")
             and not e.context.get("edited")
