@@ -30,6 +30,7 @@ that need this:
 
 from fastapi import HTTPException
 
+from kohakuterrarium.terrarium.multi_node_cluster import cluster_groups
 from kohakuterrarium.terrarium.service import TerrariumService
 
 
@@ -62,6 +63,10 @@ async def resolve_creature_id(
     with (or the frontend kept a stale handle); 404 is the right
     answer in both cases.
 
+    When ``session_id`` belongs to a multi-node cluster, every linked
+    member graph is part of the same session scope. This permits the
+    cluster-primary URL used by the UI without reopening global search.
+
     ``session_id=None`` retains the global-search semantics for
     legacy callers + tests that pre-date the v2 session-scoped
     routes; new code paths SHOULD pass the session_id.
@@ -76,7 +81,12 @@ async def resolve_creature_id(
         raise HTTPException(503, f"service unavailable: {exc}") from exc
 
     if session_id:
-        creatures = tuple(c for c in creatures if c.graph_id == session_id)
+        scoped_graph_ids = {session_id}
+        for member_graph_ids in cluster_groups(service).values():
+            if session_id in member_graph_ids:
+                scoped_graph_ids.update(member_graph_ids)
+                break
+        creatures = tuple(c for c in creatures if c.graph_id in scoped_graph_ids)
 
     # Exact id match wins.
     for info in creatures:

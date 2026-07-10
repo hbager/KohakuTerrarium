@@ -14,6 +14,7 @@ import pytest
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
 from kohakuterrarium.builtins.inputs.none import NoneInput
+from kohakuterrarium.errors import SessionLockedError
 from kohakuterrarium.terrarium import resume as resume_mod
 from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder, _FakeAgent
@@ -96,6 +97,107 @@ class TestResumeIntoEngine:
         finally:
             await t.shutdown()
 
+    async def test_agent_metadata_failure_closes_writer_store(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(resume_mod, "detect_session_type", lambda p: "agent")
+        closed = False
+
+        def close_store():
+            nonlocal closed
+            closed = True
+
+        fake_store = SimpleNamespace(
+            load_meta=lambda: (_ for _ in ()).throw(RuntimeError("meta failed")),
+            close=close_store,
+        )
+        monkeypatch.setattr(
+            resume_mod, "_open_store_with_migration", lambda p, **kwargs: fake_store
+        )
+
+        t = await TestTerrariumBuilder().build()
+        try:
+            with pytest.raises(RuntimeError, match="meta failed"):
+                await resume_mod.resume_into_engine(t, tmp_path / "saved.kohakutr")
+            assert closed is True
+        finally:
+            await t.shutdown()
+
+    async def test_agent_attach_failure_stops_graph_and_closes_store(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(resume_mod, "detect_session_type", lambda p: "agent")
+        fake_agent = _FakeAgent(name="alice")
+        fake_agent.config = SimpleNamespace(name="alice")
+        closed = False
+
+        def close_store():
+            nonlocal closed
+            closed = True
+
+        fake_store = SimpleNamespace(close=close_store)
+        monkeypatch.setattr(
+            resume_mod, "resume_agent", lambda *args, **kwargs: (fake_agent, fake_store)
+        )
+
+        t = await TestTerrariumBuilder().build()
+        real_stop_graph = t.stop_graph
+        t.stop_graph = AsyncMock(wraps=real_stop_graph)
+        t.attach_session = AsyncMock(side_effect=RuntimeError("attach failed"))
+        try:
+            with pytest.raises(RuntimeError, match="attach failed"):
+                await resume_mod.resume_into_engine(t, tmp_path / "saved.kohakutr")
+            t.stop_graph.assert_awaited_once()
+            assert closed is True
+        finally:
+            await t.shutdown()
+
+    async def test_runtime_group_partial_failure_stops_graph_and_closes_store(
+        self, monkeypatch
+    ):
+        closed = False
+
+        def close_store():
+            nonlocal closed
+            closed = True
+
+        fake_store = SimpleNamespace(close=close_store)
+        meta = {
+            "config_path": "/tmp/creature",
+            "config_snapshot": {"name": "generic"},
+            "pwd": ".",
+            "agents": ["alice", "bob"],
+        }
+        fake_agent = _FakeAgent(name="generic")
+        fake_agent.config = SimpleNamespace(name="generic")
+        monkeypatch.setattr(resume_mod, "_rebuild_agent", lambda **kwargs: fake_agent)
+        monkeypatch.setattr(resume_mod, "inject_saved_state", lambda *args: None)
+
+        t = await TestTerrariumBuilder().build()
+        real_add_creature = t.add_creature
+        calls = 0
+
+        async def fail_second_add(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            assert kwargs.get("session") is False
+            if calls == 2:
+                raise RuntimeError("second add failed")
+            return await real_add_creature(*args, **kwargs)
+
+        real_stop_graph = t.stop_graph
+        t.add_creature = fail_second_add
+        t.stop_graph = AsyncMock(wraps=real_stop_graph)
+        try:
+            with pytest.raises(RuntimeError, match="second add failed"):
+                await resume_mod._resume_runtime_group_into_engine(
+                    t, fake_store, meta, pwd=None, llm=None
+                )
+            t.stop_graph.assert_awaited_once()
+            assert closed is True
+        finally:
+            await t.shutdown()
+
     async def test_terrarium_path_dispatches(self, monkeypatch, tmp_path):
         monkeypatch.setattr(resume_mod, "detect_session_type", lambda p: "terrarium")
 
@@ -109,7 +211,7 @@ class TestResumeIntoEngine:
         )
 
         monkeypatch.setattr(
-            resume_mod, "_open_store_with_migration", lambda p: fake_store
+            resume_mod, "_open_store_with_migration", lambda p, **_kw: fake_store
         )
 
         from kohakuterrarium.terrarium.config import TerrariumConfig
@@ -136,18 +238,125 @@ class TestResumeIntoEngine:
     async def test_terrarium_resume_missing_config_path(self, monkeypatch, tmp_path):
         monkeypatch.setattr(resume_mod, "detect_session_type", lambda p: "terrarium")
 
+        closed = False
+
+        def close_store():
+            nonlocal closed
+            closed = True
+
         fake_store = SimpleNamespace(
             load_meta=lambda: {"config_path": ""},
             update_status=lambda s: None,
+            close=close_store,
         )
         monkeypatch.setattr(
-            resume_mod, "_open_store_with_migration", lambda p: fake_store
+            resume_mod, "_open_store_with_migration", lambda p, **_kw: fake_store
         )
 
         t = await TestTerrariumBuilder().build()
         try:
             with pytest.raises(ValueError, match="no config_path"):
                 await resume_mod.resume_into_engine(t, tmp_path / "saved.kohakutr")
+            assert closed is True
+        finally:
+            await t.shutdown()
+
+    async def test_terrarium_apply_failure_stops_partial_graph(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(resume_mod, "detect_session_type", lambda p: "terrarium")
+        closed = False
+
+        def close_store():
+            nonlocal closed
+            closed = True
+
+        fake_store = SimpleNamespace(
+            load_meta=lambda: {
+                "config_path": "/tmp/recipe.yaml",
+                "pwd": ".",
+                "agents": ["alice"],
+            },
+            close=close_store,
+        )
+        monkeypatch.setattr(
+            resume_mod, "_open_store_with_migration", lambda p, **kwargs: fake_store
+        )
+        monkeypatch.setattr(resume_mod, "load_terrarium_config", lambda p: object())
+
+        t = await TestTerrariumBuilder().build()
+        real_add_creature = t.add_creature
+        existing_agent = _FakeAgent(name="existing")
+        existing_agent.config = SimpleNamespace(name="existing")
+        existing_creature = Creature(
+            creature_id="existing",
+            name="existing",
+            agent=existing_agent,
+            config=existing_agent.config,
+        )
+        await real_add_creature(existing_creature, start=False, session=False)
+        existing_graph_id = existing_creature.graph_id
+        partial_graph_id = None
+
+        async def fail_after_graph_created(*args, **kwargs):
+            nonlocal partial_graph_id
+            agent = _FakeAgent(name="partial")
+            agent.config = SimpleNamespace(name="partial")
+            creature = Creature(
+                creature_id="partial",
+                name="partial",
+                agent=agent,
+                config=agent.config,
+            )
+            await real_add_creature(creature, start=False, session=False)
+            partial_graph_id = creature.graph_id
+            kwargs["_on_graph_created"](partial_graph_id)
+            raise RuntimeError("recipe build failed")
+
+        real_stop_graph = t.stop_graph
+        t.apply_recipe = fail_after_graph_created
+        t.stop_graph = AsyncMock(wraps=real_stop_graph)
+        try:
+            with pytest.raises(RuntimeError, match="recipe build failed"):
+                await resume_mod.resume_into_engine(t, tmp_path / "saved.kohakutr")
+            t.stop_graph.assert_awaited_once_with(partial_graph_id)
+            assert existing_graph_id in {graph.graph_id for graph in t.list_graphs()}
+            assert closed is True
+        finally:
+            await t.shutdown()
+
+    async def test_terrarium_failure_after_build_stops_new_graph(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(resume_mod, "detect_session_type", lambda p: "terrarium")
+        fake_store = SimpleNamespace(
+            load_meta=lambda: {
+                "config_path": "/tmp/recipe.yaml",
+                "pwd": ".",
+                "agents": ["alice"],
+            },
+            update_status=lambda status: None,
+            close=lambda: None,
+        )
+        monkeypatch.setattr(
+            resume_mod, "_open_store_with_migration", lambda p, **kw: fake_store
+        )
+        monkeypatch.setattr(resume_mod, "load_terrarium_config", lambda p: object())
+
+        t = await TestTerrariumBuilder().build()
+        graph = SimpleNamespace(graph_id="new", creature_ids=[])
+        t.apply_recipe = AsyncMock(return_value=graph)
+        t.stop_graph = AsyncMock()
+        monkeypatch.setattr(
+            resume_mod,
+            "_topo_snap",
+            SimpleNamespace(replay=AsyncMock(side_effect=RuntimeError("replay failed"))),
+        )
+        t.attach_session = AsyncMock()
+        try:
+            with pytest.raises(RuntimeError, match="replay failed"):
+                await resume_mod.resume_into_engine(t, tmp_path / "saved.kohakutr")
+            t.stop_graph.assert_awaited_once_with("new")
         finally:
             await t.shutdown()
 
@@ -166,7 +375,7 @@ class TestResumeIntoEngine:
             update_status=lambda s: None,
         )
         monkeypatch.setattr(
-            resume_mod, "_open_store_with_migration", lambda p: fake_store
+            resume_mod, "_open_store_with_migration", lambda p, **_kw: fake_store
         )
 
         from kohakuterrarium.terrarium.config import (
@@ -273,8 +482,12 @@ class TestResumeIntoEngine:
                 "bob",
             }
             t.attach_session.assert_awaited_once()
+            with pytest.raises(SessionLockedError):
+                SessionStore(store_path, writer_lock=True)
         finally:
             await t.shutdown()
+        reopened = SessionStore(store_path, writer_lock=True)
+        reopened.close(update_status=False)
 
     async def test_terrarium_resume_no_autosession_ghost(self, monkeypatch, tmp_path):
         # REGRESSION PIN: resuming a terrarium into an engine that has
@@ -292,9 +505,10 @@ class TestResumeIntoEngine:
                 "agents": [],
             },
             update_status=lambda s: None,
+            close=lambda: None,
         )
         monkeypatch.setattr(
-            resume_mod, "_open_store_with_migration", lambda p: fake_store
+            resume_mod, "_open_store_with_migration", lambda p, **_kw: fake_store
         )
 
         from kohakuterrarium.terrarium.config import TerrariumConfig
@@ -313,10 +527,12 @@ class TestResumeIntoEngine:
             # SimpleNamespace store does not have to behave like a
             # SessionStore.
             t.attach_session = AsyncMock()
-            await resume_mod.resume_into_engine(t, tmp_path / "saved.kohakutr")
-            # No ghost store file was minted next to the saved session,
-            # and the engine claims ownership of nothing.
+            gid = await resume_mod.resume_into_engine(
+                t, tmp_path / "saved.kohakutr"
+            )
+            # No ghost store file was minted next to the saved session;
+            # ownership tracks only the resumed graph so shutdown closes it.
             assert list(session_dir.glob("*.kohakutr")) == []
-            assert t._owned_sessions == set()
+            assert t._owned_sessions == {gid}
         finally:
             await t.shutdown()

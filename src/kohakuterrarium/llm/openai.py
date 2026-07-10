@@ -313,6 +313,8 @@ class OpenAIProvider(BaseLLMProvider):
         Step 2: for Anthropic endpoints (and unless the user opts out
         via ``disable_prompt_caching``), tag system + the last three
         non-tool messages with cache_control markers.
+        Local artifact URLs are resolved at the Controller boundary before
+        plugin-transformed messages reach any provider.
         """
         messages = strip_kt_extras(messages)
         messages = normalize_stateful_assistant_fields(messages)

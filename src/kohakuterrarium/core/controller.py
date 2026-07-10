@@ -40,6 +40,7 @@ from kohakuterrarium.core.executor import Executor
 from kohakuterrarium.core.job import JobResult, JobStatus, JobStore
 from kohakuterrarium.core.registry import Registry
 from kohakuterrarium.core.tool_output import materialize_image_part, render_content_text
+from kohakuterrarium.llm.artifact_resolve import resolve_message_image_urls
 from kohakuterrarium.llm.base import LLMProvider
 from kohakuterrarium.llm.message import ContentPart, FilePart, ImagePart, TextPart
 from kohakuterrarium.llm.tools import build_provider_native_tools, build_tool_schemas
@@ -896,6 +897,7 @@ class Controller:
                 model=getattr(self.llm, "model", ""),
                 tools=self._get_native_tool_schemas() if self._is_native_mode else None,
             )
+        messages = resolve_message_image_urls(messages, self.session_store)
 
         logger.info("Generating response...")
 
@@ -983,14 +985,7 @@ class Controller:
         on_tool: Any | None = None,
         on_subagent: Any | None = None,
     ) -> None:
-        """
-        Run continuous controller loop.
-
-        Args:
-            on_text: Callback for text events
-            on_tool: Callback for tool call events
-            on_subagent: Callback for sub-agent call events
-        """
+        """Run the controller loop and dispatch optional event callbacks."""
         while True:
             async for event in self.run_once():
                 if isinstance(event, TextEvent) and on_text:

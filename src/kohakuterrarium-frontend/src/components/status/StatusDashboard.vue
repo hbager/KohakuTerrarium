@@ -112,7 +112,7 @@
           <div v-if="maxContext > 0" class="mt-1">
             <div class="flex items-center justify-between mb-1">
               <span class="text-warm-400">{{ t("common.context") }}</span>
-              <span class="font-mono text-[10px]" :class="contextPct >= 80 ? 'text-coral' : contextPct >= 60 ? 'text-amber' : 'text-warm-500'">{{ formatTokens(totalUsage.lastPrompt) }} / {{ formatTokens(maxContext) }} ({{ contextPct }}%)</span>
+              <span class="font-mono text-[10px]" :class="contextPct >= 80 ? 'text-coral' : contextPct >= 60 ? 'text-amber' : 'text-warm-500'">{{ formatTokens(chat.activeTokenUsage.lastPrompt) }} / {{ formatTokens(maxContext) }} ({{ contextPct }}%)</span>
             </div>
             <div class="relative w-full h-1.5 rounded-full bg-warm-100 dark:bg-warm-800 overflow-hidden">
               <div class="h-full rounded-full transition-all duration-300" :class="contextPct >= 80 ? 'bg-coral' : contextPct >= 60 ? 'bg-amber' : 'bg-aquamarine'" :style="{ width: Math.min(contextPct, 100) + '%' }" />
@@ -188,24 +188,22 @@ const totalUsage = computed(() => {
   let prompt = 0
   let completion = 0
   let cached = 0
-  let lastPrompt = 0
   for (const usage of Object.values(chat.tokenUsage)) {
     prompt += usage.prompt || 0
     completion += usage.completion || 0
     cached += usage.cached || 0
-    if ((usage.lastPrompt || 0) > lastPrompt) lastPrompt = usage.lastPrompt || 0
   }
-  return { prompt, completion, cached, lastPrompt }
+  return { prompt, completion, cached }
 })
 
-const maxContext = computed(() => chat.sessionInfo.maxContext || props.instance?.max_context || 0)
+const maxContext = computed(() => chat.activeModelInfo.maxContext || props.instance?.max_context || 0)
 
 const contextPct = computed(() => {
-  if (!maxContext.value || !totalUsage.value.lastPrompt) return 0
-  return Math.round((totalUsage.value.lastPrompt / maxContext.value) * 100)
+  if (!maxContext.value || !chat.activeTokenUsage.lastPrompt) return 0
+  return Math.round((chat.activeTokenUsage.lastPrompt / maxContext.value) * 100)
 })
 
-const compactThreshold = computed(() => chat.sessionInfo.compactThreshold || props.instance?.compact_threshold || 0)
+const compactThreshold = computed(() => chat.activeModelInfo.compactThreshold || props.instance?.compact_threshold || 0)
 
 const compactThresholdPct = computed(() => {
   if (!maxContext.value || !compactThreshold.value) return 0
@@ -266,7 +264,7 @@ const currentModelProfile = computed(() => {
   const provider = slash >= 0 ? base.slice(0, slash) : ""
   const name = slash >= 0 ? base.slice(slash + 1) : base
   const entries = availableModels.value || []
-  return entries.find((m) => m.name === name && (!provider || (m.provider || m.login_provider) === provider)) || entries.find((m) => m.name === name) || null
+  return provider ? entries.find((m) => m.name === name && (m.provider || m.login_provider) === provider) || null : entries.find((m) => m.name === name) || null
 })
 
 watch(

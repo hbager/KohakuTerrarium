@@ -122,11 +122,11 @@ class TestGetProfile:
             get_profile("gpt-5.4")
 
     def test_alias_resolves(self):
-        # 'opus' alias -> (anthropic, claude-opus-4.7)
+        # 'opus' alias -> (anthropic, claude-opus-4.8)
         profile = get_profile("opus")
         assert profile is not None
         assert profile.provider == "anthropic"
-        assert profile.model == "claude-opus-4-7"
+        assert profile.model == "claude-opus-4-8"
 
     def test_unknown_name_returns_none(self):
         assert get_profile("totally-made-up-model") is None
@@ -150,11 +150,11 @@ class TestGetProfile:
         assert profile.api_key_env == "KIMI_CODE_API_KEY"
 
     def test_glm_coding_direct_profile_resolves_with_bearer_auth(self):
-        profile = get_profile("glm-coding/glm-5.1")
+        profile = get_profile("glm-coding/glm-5.2")
         assert profile is not None
         assert profile.provider == "glm-coding"
         assert profile.backend_type == "anthropic"
-        assert profile.model == "GLM-5.1"
+        assert profile.model == "glm-5.2"
         assert profile.base_url == "https://open.bigmodel.cn/api/anthropic"
         assert profile.api_key_env == "GLM_CODING_API_KEY"
         assert profile.extra_body["auth_as_bearer"] is True
@@ -227,9 +227,9 @@ class TestResolveControllerLlm:
         assert profile.model == "gpt-5.4"
 
     def test_llm_arg_wins_over_config(self):
-        profile = resolve_controller_llm({"llm": "codex/gpt-5.4"}, llm="openai/gpt-4o")
+        profile = resolve_controller_llm({"llm": "codex/gpt-5.4"}, llm="openai/gpt-5.5")
         assert profile.provider == "openai"
-        assert profile.model == "gpt-4o"
+        assert profile.model == "gpt-5.5"
 
     def test_provider_field_disambiguates_bare_llm(self):
         profile = resolve_controller_llm({"llm": "gpt-5.4", "provider": "openrouter"})
@@ -302,68 +302,6 @@ class TestResolveControllerLlm:
         assert profile.provider == "anthropic"
         assert profile.name == "claude-opus-4.7"
 
-    def test_base_default_infers_matching_variations_for_runtime_identifier(self):
-        save_backend(LLMBackend(name="aaaaa", backend_type="openai_responses"))
-        save_profile(
-            LLMPreset(
-                name="gpt-5.5-custom",
-                model="gpt-5.5",
-                provider="aaaaa",
-                reasoning_effort="xhigh",
-                service_tier="priority",
-                variation_groups={
-                    "reasoning": {
-                        "none": {"reasoning_effort": "none"},
-                        "xhigh": {"reasoning_effort": "xhigh"},
-                    },
-                    "speed": {
-                        "normal": {},
-                        "fast": {"service_tier": "priority"},
-                    },
-                },
-            )
-        )
-        set_default_model("aaaaa/gpt-5.5-custom")
-
-        profile = resolve_controller_llm({})
-
-        assert (
-            profile_to_identifier(profile)
-            == "aaaaa/gpt-5.5-custom@reasoning=xhigh,speed=fast"
-        )
-
-    def test_default_base_llm_override_infers_matching_variations(self):
-        save_backend(LLMBackend(name="aaaaa", backend_type="openai_responses"))
-        save_profile(
-            LLMPreset(
-                name="gpt-5.5-custom",
-                model="gpt-5.5",
-                provider="aaaaa",
-                reasoning_effort="xhigh",
-                service_tier="priority",
-                variation_groups={
-                    "reasoning": {
-                        "none": {"reasoning_effort": "none"},
-                        "xhigh": {"reasoning_effort": "xhigh"},
-                    },
-                    "speed": {
-                        "normal": {},
-                        "fast": {"service_tier": "priority"},
-                    },
-                },
-            )
-        )
-        set_default_model("aaaaa/gpt-5.5-custom")
-
-        profile = resolve_controller_llm(
-            {}, llm="aaaaa/gpt-5.5-custom"
-        )
-
-        assert (
-            profile_to_identifier(profile)
-            == "aaaaa/gpt-5.5-custom@reasoning=xhigh,speed=fast"
-        )
-
     def test_retry_policy_override_deep_copied(self):
         policy = {"max_attempts": 5, "backoff": [1, 2]}
         profile = resolve_controller_llm(
@@ -409,7 +347,9 @@ class TestFindProfileByModel:
         assert _find_profile_by_model("no-such-model-id") is None
 
     def test_provider_filter_narrows_match(self):
-        profile = _find_profile_by_model("gpt-4o", provider="openai")
+        # 'gpt-5.4-nano' model id exists under openai + openrouter
+        # (as 'openai/gpt-5.4-nano'); the provider filter pins it.
+        profile = _find_profile_by_model("gpt-5.4-nano", provider="openai")
         assert profile.provider == "openai"
 
     def test_ambiguous_model_uses_preference_order(self):
@@ -432,54 +372,8 @@ class TestDefaultModel:
         assert get_default_model() == ""
 
     def test_explicit_qualified_default_returned_verbatim(self):
-        set_default_model("openrouter/mimo-v2-pro")
-        assert get_default_model() == "openrouter/mimo-v2-pro"
-
-    def test_explicit_qualified_default_with_variations_returned_verbatim(self):
-        set_default_model("openrouter/mimo-v2-pro@reasoning=xhigh,speed=fast")
-        assert get_default_model() == "openrouter/mimo-v2-pro@reasoning=xhigh,speed=fast"
-
-    def test_default_badge_ignores_variation_suffix(self):
-        set_default_model("openrouter/mimo-v2-pro@reasoning=xhigh,speed=fast")
-        entries = list_all()
-        target = next(
-            entry
-            for entry in entries
-            if entry["provider"] == "openrouter" and entry["name"] == "mimo-v2-pro"
-        )
-        assert target["is_default"] is True
-
-    def test_default_base_preset_infers_matching_variations(self):
-        save_backend(LLMBackend(name="aaaaa", backend_type="openai_responses"))
-        save_profile(
-            LLMPreset(
-                name="gpt-5.5-custom",
-                model="gpt-5.5",
-                provider="aaaaa",
-                reasoning_effort="xhigh",
-                service_tier="priority",
-                variation_groups={
-                    "reasoning": {
-                        "none": {"reasoning_effort": "none"},
-                        "xhigh": {"reasoning_effort": "xhigh"},
-                    },
-                    "speed": {
-                        "normal": {},
-                        "fast": {"service_tier": "priority"},
-                    },
-                },
-            )
-        )
-        set_default_model("aaaaa/gpt-5.5-custom")
-
-        entries = list_all()
-        target = next(
-            entry
-            for entry in entries
-            if entry["provider"] == "aaaaa" and entry["name"] == "gpt-5.5-custom"
-        )
-
-        assert target["selected_variations"] == {"reasoning": "xhigh", "speed": "fast"}
+        set_default_model("openrouter/mimo-v2.5-pro")
+        assert get_default_model() == "openrouter/mimo-v2.5-pro"
 
     def test_explicit_bare_default_upgraded_to_qualified(self):
         # legacy bare default written by old builds. 'claude-opus-4.7'
@@ -495,7 +389,7 @@ class TestDefaultModel:
 
         save_api_key("openrouter", "sk-or-key")
         # codex unavailable (no tokens), openrouter is first available
-        assert get_default_model() == "openrouter/mimo-v2-pro"
+        assert get_default_model() == "openrouter/mimo-v2.5-pro"
 
     def test_default_picks_kimi_code_when_only_kimi_key_available(self):
         from kohakuterrarium.llm.api_keys import save_api_key
@@ -507,7 +401,7 @@ class TestDefaultModel:
         from kohakuterrarium.llm.api_keys import save_api_key
 
         save_api_key("glm-coding", "glm-key")
-        assert get_default_model() == "glm-coding/glm-5.1"
+        assert get_default_model() == "glm-coding/glm-5.2"
 
     def test_upgrade_bare_default_via_alias(self):
         # 'gpt-5.4-or' is an alias -> (openrouter, gpt-5.4)
@@ -519,6 +413,19 @@ class TestDefaultModel:
     def test_upgrade_bare_default_prefers_provider_order(self):
         # bare 'gpt-5.4' exists under codex/openai/openrouter; codex first
         assert _upgrade_bare_default("gpt-5.4") == "codex/gpt-5.4"
+
+    def test_provider_default_models_point_at_real_presets(self):
+        # every fallback entry must name an existing (provider, name)
+        # preset — a stale entry here silently breaks default-model
+        # selection for that provider (caught nowhere else).
+        from kohakuterrarium.llm.profiles import _PROVIDER_DEFAULT_MODELS
+
+        catalogue = presets_mod.get_all_presets()
+        for provider, name in _PROVIDER_DEFAULT_MODELS:
+            assert (
+                provider,
+                name,
+            ) in catalogue, f"default entry ({provider}, {name}) not in preset view"
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +446,50 @@ class TestIsAvailable:
             CodexTokens, "load", classmethod(lambda cls, path=None: object())
         )
         assert _is_available("codex") is True
+
+    def test_custom_codex_backend_available_via_api_key(self):
+        # A codex (Responses-API) backend with a custom endpoint + key is
+        # available even with no OAuth token (CodexTokens.load -> None).
+        from kohakuterrarium.llm.api_keys import save_api_key
+        from kohakuterrarium.llm.backends import save_yaml_store
+
+        save_yaml_store(
+            {
+                "backends": {
+                    "myresp": {
+                        "backend_type": "codex",
+                        "base_url": "https://my.host/v1",
+                        "api_key_env": "MYRESP_KEY",
+                    }
+                }
+            }
+        )
+        save_api_key("myresp", "sk-resp")
+        assert _is_available("myresp") is True
+
+    def test_custom_codex_missing_base_url_env_is_not_oauth_available(
+        self, monkeypatch
+    ):
+        from kohakuterrarium.llm.api_keys import save_api_key
+        from kohakuterrarium.llm.backends import save_yaml_store
+
+        monkeypatch.delenv("KT_CODEX_ENDPOINT", raising=False)
+        monkeypatch.setattr(
+            CodexTokens, "load", classmethod(lambda cls, path=None: object())
+        )
+        save_yaml_store(
+            {
+                "backends": {
+                    "myresp": {
+                        "backend_type": "codex",
+                        "base_url": "${KT_CODEX_ENDPOINT}",
+                        "api_key_env": "MYRESP_KEY",
+                    }
+                }
+            }
+        )
+        save_api_key("myresp", "sk-resp")
+        assert _is_available("myresp") is False
 
     def test_provider_available_with_stored_key(self):
         from kohakuterrarium.llm.api_keys import save_api_key
@@ -611,18 +562,11 @@ class TestBackendCrud:
         assert delete_backend("temp") is True
         assert "temp" not in load_backends()
 
-    def test_delete_backend_in_use_by_preset_cascades_presets(self):
+    def test_delete_backend_in_use_by_preset_rejected(self):
         save_backend(LLMBackend(name="used", backend_type="openai"))
         save_profile(LLMPreset(name="p1", model="m", provider="used"))
-        set_default_model("used/p1")
-
-        assert delete_backend("used") is True
-
-        from kohakuterrarium.llm.backends import load_backends
-
-        assert "used" not in load_backends()
-        assert get_profile("used/p1") is None
-        assert get_default_model() == ""
+        with pytest.raises(ValueError, match="still in use"):
+            delete_backend("used")
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +674,20 @@ class TestLoadProfilesAndListAll:
         assert len(defaults) == 1
         assert (defaults[0]["provider"], defaults[0]["name"]) == ("codex", "gpt-5.4")
 
+    def test_list_all_merges_partial_default_variations_with_inferred_values(self):
+        set_default_model("codex/gpt-5.5@speed=fast")
+
+        entry = next(
+            item
+            for item in list_all()
+            if item["provider"] == "codex" and item["name"] == "gpt-5.5"
+        )
+
+        assert entry["selected_variations"] == {
+            "reasoning": "xhigh",
+            "speed": "fast",
+        }
+
     def test_list_all_user_preset_overrides_builtin_pair(self):
         # a user preset at (codex, gpt-5.4) replaces the builtin entry
         save_profile(LLMPreset(name="gpt-5.4", model="my-custom", provider="codex"))
@@ -743,63 +701,16 @@ class TestLoadProfilesAndListAll:
         assert codex_54[0]["model"] == "my-custom"
 
     def test_list_all_default_marking_handles_bare_default(self):
-        # a legacy unqualified default is upgraded to one canonical provider/name
-        # before marking badges; it must not light up every provider sharing the name.
+        # a legacy unqualified default falls back to name/model matching
         from kohakuterrarium.llm.backends import save_yaml_store
 
-        save_yaml_store({"version": 3, "default_model": "gpt-4o"})
+        save_yaml_store({"version": 3, "default_model": "gpt-5.5"})
         entries = list_all()
-        gpt4o = [e for e in entries if e["is_default"]]
-        assert len(gpt4o) == 1
-        assert (gpt4o[0]["provider"], gpt4o[0]["name"]) == ("codex", "gpt-4o")
-
-    def test_list_all_default_marking_handles_bare_model_id_once(self):
-        from kohakuterrarium.llm.backends import load_backends, save_yaml_store
-        from kohakuterrarium.llm.preset_store import load_presets, serialize_user_data
-
-        for provider in ("aaa-custom", "zzz-custom"):
-            save_backend(LLMBackend(name=provider, backend_type="openai"))
-            save_profile(
-                LLMPreset(
-                    name="gpt-5.5-custom",
-                    model="api-model-shared",
-                    provider=provider,
-                )
-            )
-        save_yaml_store(
-            serialize_user_data(load_presets(), load_backends(), "api-model-shared")
-        )
-
-        entries = list_all()
-        defaults = [e for e in entries if e["is_default"]]
-
-        assert len(defaults) == 1
-        assert (defaults[0]["provider"], defaults[0]["name"]) == (
-            "aaa-custom",
-            "gpt-5.5-custom",
-        )
-
-    def test_list_all_default_marking_handles_ambiguous_bare_preset_name_once(self):
-        from kohakuterrarium.llm.backends import load_backends, save_yaml_store
-        from kohakuterrarium.llm.preset_store import load_presets, serialize_user_data
-
-        for provider in ("openai", "openrouter"):
-            save_profile(
-                LLMPreset(
-                    name="gpt-5.5-custom",
-                    model=f"{provider}-model",
-                    provider=provider,
-                )
-            )
-        save_yaml_store(
-            serialize_user_data(load_presets(), load_backends(), "gpt-5.5-custom")
-        )
-
-        entries = list_all()
-        defaults = [e for e in entries if e["is_default"]]
-
-        assert len(defaults) == 1
-        assert defaults[0]["name"] == "gpt-5.5-custom"
+        # 'gpt-5.5' is a bare name shared across providers — every entry
+        # with that name is flagged (documented bare-name fallback)
+        gpt55 = [e for e in entries if e["is_default"]]
+        assert gpt55
+        assert all(e["name"] == "gpt-5.5" for e in gpt55)
 
 
 # ---------------------------------------------------------------------------

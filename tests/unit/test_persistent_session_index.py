@@ -1,8 +1,17 @@
-from __future__ import annotations
-
 from pathlib import Path
 
 import pytest
+
+from kohakuterrarium.studio.persistence.session_index import (
+    SessionIndex,
+    aggregate_stats,
+    close_session_index,
+    get_session_index_default,
+    sidecar_path_for,
+)
+from kohakuterrarium.studio.persistence.session_index import (
+    reconcile as reconcile_module,
+)
 
 
 def _make_session(
@@ -47,14 +56,27 @@ def _make_session(
 def session_dir(tmp_path, monkeypatch):
     from kohakuterrarium.studio.persistence import store as persistence_store
 
+    close_session_index()
+    monkeypatch.delenv("KT_SESSION_DIR", raising=False)
     monkeypatch.setattr(persistence_store, "_SESSION_DIR", tmp_path)
-    return tmp_path
+    try:
+        yield tmp_path
+    finally:
+        close_session_index()
 
 
-def test_persistent_index_queries_page_without_legacy_full_index(session_dir, monkeypatch):
-    from kohakuterrarium.studio.persistence import store as persistence_store
-    from kohakuterrarium.studio.persistence import session_index
+@pytest.fixture
+def index(session_dir):
+    instance = SessionIndex(sidecar_path_for(session_dir))
+    try:
+        yield instance
+    finally:
+        instance.close()
 
+
+def test_full_reconcile_lists_sidecar_with_pagination_and_sorting(
+    session_dir, index, monkeypatch
+):
     _make_session(
         session_dir / "older.kohakutr",
         name="older",
@@ -65,27 +87,22 @@ def test_persistent_index_queries_page_without_legacy_full_index(session_dir, mo
         name="newer",
         last_active="2024-01-02T00:00:00+00:00",
     )
-
-    session_index.refresh_index(session_dir)
+    reconcile_module.reconcile(index, session_dir, full=True, workers=1)
 
     def explode(*_args, **_kwargs):
-        raise AssertionError("list_sessions_page must query sessions_index.sqlite, not rebuild the legacy in-memory index")
+        raise AssertionError("SessionIndex.list must only read the sidecar")
 
-    monkeypatch.setattr(persistence_store, "build_session_index", explode)
-    monkeypatch.setattr(persistence_store, "get_session_index", explode)
-    monkeypatch.setattr(persistence_store, "_read_session_entry", explode)
-
-    page = persistence_store.list_sessions_page(limit=1, offset=0)
+    monkeypatch.setattr(reconcile_module, "read_entry_from_disk", explode)
+    page = index.list(limit=1, offset=0).to_dict()
 
     assert page["total"] == 2
+    assert page["offset"] == 0
+    assert page["limit"] == 1
     assert [row["name"] for row in page["sessions"]] == ["newer"]
-    assert (session_dir / "sessions_index.sqlite").exists()
+    assert sidecar_path_for(session_dir).exists()
 
 
-def test_persistent_index_stats_do_not_rebuild_legacy_index(session_dir, monkeypatch):
-    from kohakuterrarium.studio.persistence import store as persistence_store
-    from kohakuterrarium.studio.persistence import session_index
-
+def test_aggregate_stats_only_scans_sidecar(session_dir, index, monkeypatch):
     _make_session(
         session_dir / "a.kohakutr",
         name="a",
@@ -98,15 +115,13 @@ def test_persistent_index_stats_do_not_rebuild_legacy_index(session_dir, monkeyp
         last_active="2024-01-03T00:00:00+00:00",
         status="running",
     )
-    session_index.refresh_index(session_dir)
+    reconcile_module.reconcile(index, session_dir, full=True, workers=1)
 
     def explode(*_args, **_kwargs):
-        raise AssertionError("session_stats must aggregate sessions_index.sqlite, not rebuild legacy index")
+        raise AssertionError("aggregate_stats must not read session files")
 
-    monkeypatch.setattr(persistence_store, "get_session_index", explode)
-    monkeypatch.setattr(persistence_store, "build_session_index", explode)
-
-    stats = persistence_store.session_stats()
+    monkeypatch.setattr(reconcile_module, "read_entry_from_disk", explode)
+    stats = aggregate_stats(index)
 
     assert stats["count"] == 2
     assert stats["by_status"] == {"paused": 1, "running": 1}
@@ -114,36 +129,39 @@ def test_persistent_index_stats_do_not_rebuild_legacy_index(session_dir, monkeyp
     assert stats["agents_top"] == [["a", 1], ["b", 1]]
 
 
-def test_persistent_index_incrementally_upserts_single_session(session_dir, monkeypatch):
-    from kohakuterrarium.studio.persistence import session_index
-
+def test_incremental_reconcile_reads_only_new_session(session_dir, index, monkeypatch):
     _make_session(
         session_dir / "a.kohakutr",
         name="a",
         last_active="2024-01-01T00:00:00+00:00",
     )
-    session_index.refresh_index(session_dir)
+    reconcile_module.reconcile(index, session_dir, full=True, workers=1)
 
+    new_path = session_dir / "b.kohakutr"
     _make_session(
-        session_dir / "b.kohakutr",
+        new_path,
         name="b",
         last_active="2024-01-03T00:00:00+00:00",
     )
 
-    def explode(*_args, **_kwargs):
-        raise AssertionError("upsert_session_path should only read the requested session")
+    calls: list[Path] = []
+    real_read = reconcile_module.read_entry_from_disk
 
-    monkeypatch.setattr(session_index, "refresh_index", explode)
+    def spy(path):
+        calls.append(path)
+        return real_read(path)
 
-    session_index.upsert_session_path(session_dir / "b.kohakutr", session_dir=session_dir)
-    page = session_index.query_sessions(session_dir, limit=10, offset=0)
+    monkeypatch.setattr(reconcile_module, "read_entry_from_disk", spy)
+    report = reconcile_module.reconcile(index, session_dir, full=False, workers=1)
+    page = index.list(limit=10, offset=0).to_dict()
 
+    assert report.read == 1
+    assert calls == [new_path]
     assert page["total"] == 2
     assert [row["name"] for row in page["sessions"]] == ["b", "a"]
 
 
-def test_persistent_index_delete_removes_row(session_dir):
-    from kohakuterrarium.studio.persistence import session_index
+def test_delete_session_files_removes_singleton_sidecar_row(session_dir):
     from kohakuterrarium.studio.persistence.store import delete_session_files
 
     _make_session(
@@ -151,19 +169,18 @@ def test_persistent_index_delete_removes_row(session_dir):
         name="gone",
         last_active="2024-01-01T00:00:00+00:00",
     )
-    session_index.refresh_index(session_dir)
+    index = get_session_index_default(session_dir)
+    assert index.list(limit=10, offset=0).total == 1
 
     deleted = delete_session_files("gone")
-    page = session_index.query_sessions(session_dir, limit=10, offset=0)
+    page = index.list(limit=10, offset=0).to_dict()
 
     assert [path.name for path in deleted] == ["gone.kohakutr"]
     assert page["total"] == 0
     assert page["sessions"] == []
 
 
-def test_persistent_index_refresh_backfills_first_user_preview(session_dir):
-    from kohakuterrarium.studio.persistence import session_index
-
+def test_full_reconcile_backfills_first_user_preview(session_dir, index):
     _make_session(
         session_dir / "task.kohakutr",
         name="task",
@@ -172,18 +189,16 @@ def test_persistent_index_refresh_backfills_first_user_preview(session_dir):
         legacy_preview=True,
     )
 
-    session_index.refresh_index(session_dir)
-    page = session_index.query_sessions(session_dir, limit=10, offset=0)
+    reconcile_module.reconcile(index, session_dir, full=True, workers=1)
+    page = index.list(limit=10, offset=0).to_dict()
 
     assert page["total"] == 1
     assert page["sessions"][0]["preview"] == "請幫我檢查 workspace 前端為什麼很卡"
 
 
-def test_persistent_index_query_lazily_fills_legacy_empty_page_preview(
-    session_dir, monkeypatch
+def test_unchanged_incremental_reconcile_preserves_preview_without_disk_read(
+    session_dir, index, monkeypatch
 ):
-    from kohakuterrarium.studio.persistence import session_index
-
     path = session_dir / "legacy.kohakutr"
     _make_session(
         path,
@@ -192,77 +207,55 @@ def test_persistent_index_query_lazily_fills_legacy_empty_page_preview(
         user_input="這是一個舊索引沒有保存的任務摘要",
         legacy_preview=True,
     )
+    reconcile_module.reconcile(index, session_dir, full=True, workers=1)
 
-    # Simulate the previous fast index implementation: row exists, preview is
-    # empty, and it has never been event-scanned for preview.
-    session_index.upsert_session_meta(
-        path,
-        {
-            "session_id": "legacy",
-            "config_type": "agent",
-            "config_path": "configs/legacy.yaml",
-            "pwd": str(session_dir),
-            "agents": ["legacy"],
-            "created_at": "2024-01-01T00:00:00+00:00",
-            "last_active": "2024-01-01T00:00:00+00:00",
-            "status": "paused",
-            "preview": "",
-        },
-        session_dir=session_dir,
-    )
+    calls: list[Path] = []
 
-    calls: list[tuple[list[Path], bool]] = []
-    real_read = session_index.read_session_index_entries
+    def spy(path):
+        calls.append(path)
+        raise AssertionError("unchanged sessions must not be read again")
 
-    def spy(paths, *, include_preview=True):
-        calls.append(([Path(p) for p in paths], include_preview))
-        return real_read(paths, include_preview=include_preview)
+    monkeypatch.setattr(reconcile_module, "read_entry_from_disk", spy)
+    report = reconcile_module.reconcile(index, session_dir, full=False, workers=1)
+    page = index.list(limit=1, offset=0).to_dict()
 
-    monkeypatch.setattr(session_index, "read_session_index_entries", spy)
-
-    page = session_index.query_sessions(session_dir, limit=1, offset=0)
-
-    assert calls == [([path], True)]
+    assert report.read == 0
+    assert calls == []
     assert page["sessions"][0]["preview"] == "這是一個舊索引沒有保存的任務摘要"
 
 
-def test_first_list_backfills_metadata_only_then_lazily_fills_visible_preview(
+def test_default_index_bootstraps_once_and_paginates_without_legacy_scan(
     session_dir, monkeypatch
 ):
-    from kohakuterrarium.studio.persistence import session_index
+    from kohakuterrarium.studio.persistence import store as persistence_store
 
-    older = session_dir / "older.kohakutr"
-    newer = session_dir / "newer.kohakutr"
     _make_session(
-        older,
+        session_dir / "older.kohakutr",
         name="older",
         last_active="2024-01-01T00:00:00+00:00",
         user_input="older preview",
         legacy_preview=True,
     )
     _make_session(
-        newer,
+        session_dir / "newer.kohakutr",
         name="newer",
         last_active="2024-01-02T00:00:00+00:00",
         user_input="newer preview",
         legacy_preview=True,
     )
 
-    calls: list[tuple[list[Path], bool]] = []
-    real_read = session_index.read_session_index_entries
+    def explode(*_args, **_kwargs):
+        raise AssertionError("bootstrap must not use the legacy session scan")
 
-    def spy(paths, *, include_preview=True):
-        calls.append(([Path(p) for p in paths], include_preview))
-        return real_read(paths, include_preview=include_preview)
+    monkeypatch.setattr(persistence_store, "all_session_files_default", explode)
 
-    monkeypatch.setattr(session_index, "read_session_index_entries", spy)
+    first = get_session_index_default(session_dir)
+    first_page = first.list(limit=1, offset=0).to_dict()
+    second_page = first.list(limit=1, offset=1).to_dict()
+    second = get_session_index_default(session_dir)
 
-    page = session_index.query_sessions(session_dir, limit=1, offset=0)
-
-    assert len(calls) == 2
-    assert set(calls[0][0]) == {older, newer}
-    assert calls[0][1] is False
-    assert calls[1] == ([newer], True)
-    assert page["total"] == 2
-    assert [row["name"] for row in page["sessions"]] == ["newer"]
-    assert page["sessions"][0]["preview"] == "newer preview"
+    assert sidecar_path_for(session_dir).exists()
+    assert second is first
+    assert first_page["total"] == 2
+    assert [row["name"] for row in first_page["sessions"]] == ["newer"]
+    assert [row["name"] for row in second_page["sessions"]] == ["older"]

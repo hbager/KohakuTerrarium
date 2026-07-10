@@ -2,6 +2,7 @@
 
 import pytest
 
+from kohakuterrarium.llm.api_keys import KeyPool
 from kohakuterrarium.studio.identity import api_keys as mod
 from kohakuterrarium.studio.identity.api_keys import (
     get_existing_key,
@@ -34,7 +35,8 @@ def _mock_backend_layer(monkeypatch):
         return state["backends"]
 
     def get_api_key(provider):
-        return state["stored_keys"].get(provider, "")
+        value = state["stored_keys"].get(provider, "")
+        return KeyPool([value] if value else [])
 
     def save_api_key(provider, key):
         if key:

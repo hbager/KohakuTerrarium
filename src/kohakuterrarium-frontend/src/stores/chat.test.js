@@ -1,7 +1,7 @@
 import { createPinia, setActivePinia } from "pinia"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
-import { _replayEvents, useChatStore } from "./chat.js"
+import { _replayEvents, tokenUsageForTab, useChatStore } from "./chat.js"
 
 beforeEach(() => {
   setActivePinia(createPinia())
@@ -859,6 +859,177 @@ describe("chat store — resetForRouteSwitch", () => {
     chat.resetForRouteSwitch()
 
     expect(chat._instanceGeneration).toBeGreaterThan(before)
+  })
+})
+
+describe("chat store — per-creature model info", () => {
+  it("keys session_info model fields by source; primary fallback untouched", () => {
+    const chat = useChatStore()
+    chat.tabs = ["alice", "bob"]
+    chat.activeTab = "alice"
+    chat.sessionInfo.model = "seed-model"
+    chat.sessionInfo.llmName = "seed/model"
+
+    chat._handleActivity("bob", {
+      activity_type: "session_info",
+      model: "gpt-5",
+      llm_name: "openai/gpt-5",
+      max_context: 200000,
+      compact_threshold: 160000,
+    })
+
+    // bob's per-tab entry updated…
+    expect(chat.modelByTab.bob.llmName).toBe("openai/gpt-5")
+    // …the primary (tabs[0]) fallback untouched — this was the
+    // "whichever creature spoke last wins" stomping bug…
+    expect(chat.sessionInfo.llmName).toBe("seed/model")
+    // …and the ACTIVE tab (alice) still displays its own value.
+    expect(chat.modelDisplay).toBe("seed/model")
+
+    // Switching to bob's tab shows bob's model + limits.
+    chat.activeTab = "bob"
+    expect(chat.modelDisplay).toBe("openai/gpt-5")
+    expect(chat.activeModelInfo.compactThreshold).toBe(160000)
+    expect(chat.activeModelInfo.maxContext).toBe(200000)
+  })
+
+  it("session_info from the primary creature updates the global fallback", () => {
+    const chat = useChatStore()
+    chat.tabs = ["alice", "bob"]
+    chat.activeTab = "alice"
+
+    chat._handleActivity("alice", {
+      activity_type: "session_info",
+      llm_name: "anthropic/claude-fable-5",
+      session_id: "s-42",
+    })
+
+    expect(chat.modelByTab.alice.llmName).toBe("anthropic/claude-fable-5")
+    expect(chat.sessionInfo.llmName).toBe("anthropic/claude-fable-5")
+    expect(chat.sessionInfo.sessionId).toBe("s-42")
+    expect(chat.modelDisplay).toBe("anthropic/claude-fable-5")
+  })
+
+  it("mirrors the root tab alias when the source is the root creature", () => {
+    const chat = useChatStore()
+    chat.tabs = ["root", "coordinator", "bob"]
+    chat.activeTab = "root"
+    chat._rootSourceName = "coordinator"
+
+    chat._handleActivity("coordinator", {
+      activity_type: "session_info",
+      llm_name: "anthropic/claude-fable-5",
+    })
+
+    expect(chat.modelByTab.coordinator.llmName).toBe("anthropic/claude-fable-5")
+    expect(chat.modelByTab.root.llmName).toBe("anthropic/claude-fable-5")
+    // The root creature IS the primary — the session fallback follows.
+    expect(chat.sessionInfo.llmName).toBe("anthropic/claude-fable-5")
+    expect(chat.modelDisplay).toBe("anthropic/claude-fable-5")
+  })
+
+  it("initForInstance seeds modelByTab from the instance roster", () => {
+    // ``initForInstance`` touches localStorage via _restoreTabs —
+    // stub it like layout.test.js does (jsdom's is non-functional).
+    const storage = new Map()
+    vi.stubGlobal("localStorage", {
+      getItem: (key) => (storage.has(key) ? storage.get(key) : null),
+      setItem: (key, value) => storage.set(key, String(value)),
+      removeItem: (key) => storage.delete(key),
+      clear: () => storage.clear(),
+    })
+    try {
+      const chat = useChatStore()
+      chat._connectTerrarium = vi.fn()
+      chat.initForInstance({
+        id: "g1",
+        graph_id: "g1",
+        type: "terrarium",
+        session_id: "s1",
+        has_root: true,
+        creatures: [
+          {
+            name: "coordinator",
+            is_root: true,
+            llm_name: "openai/gpt-5",
+            model: "gpt-5",
+            max_context: 100000,
+            compact_threshold: 80000,
+          },
+          { name: "bob", llm_name: "anthropic/claude-fable-5", model: "claude-fable-5" },
+        ],
+      })
+
+      expect(chat.modelByTab.coordinator.llmName).toBe("openai/gpt-5")
+      expect(chat.modelByTab.coordinator.compactThreshold).toBe(80000)
+      expect(chat.modelByTab.bob.llmName).toBe("anthropic/claude-fable-5")
+      // The ``root`` alias mirrors the privileged creature's entry.
+      expect(chat.modelByTab.root.llmName).toBe("openai/gpt-5")
+      expect(chat._rootSourceName).toBe("coordinator")
+    } finally {
+      vi.unstubAllGlobals()
+    }
+  })
+
+  it("keeps the primary creature stable when UI tabs are reordered", () => {
+    const chat = useChatStore()
+    chat._primarySourceName = "alice"
+    chat.tabs = ["bob", "alice"]
+    chat.sessionInfo.llmName = "seed/model"
+
+    chat._handleActivity("alice", {
+      activity_type: "session_info",
+      llm_name: "openai/gpt-primary",
+    })
+    expect(chat.sessionInfo.llmName).toBe("openai/gpt-primary")
+
+    chat._handleActivity("bob", {
+      activity_type: "session_info",
+      llm_name: "anthropic/claude-secondary",
+    })
+    expect(chat.sessionInfo.llmName).toBe("openai/gpt-primary")
+  })
+
+  it("maps active token usage through the root source alias", () => {
+    const chat = useChatStore()
+    chat.activeTab = "root"
+    chat._rootSourceName = "alice"
+    chat.tokenUsage = {
+      alice: { prompt: 10, completion: 2, cached: 1, lastPrompt: 7 },
+      bob: { prompt: 100, completion: 20, cached: 0, lastPrompt: 90 },
+    }
+
+    expect(chat.activeTokenUsage).toEqual({
+      prompt: 10,
+      completion: 2,
+      cached: 1,
+      lastPrompt: 7,
+    })
+  })
+
+  it("resolves token usage for a panel tab independently of the focused tab", () => {
+    const chat = useChatStore()
+    chat.activeTab = "bob"
+    chat._rootSourceName = "alice"
+    chat.tokenUsage = {
+      alice: { prompt: 10, completion: 2, cached: 1, lastPrompt: 7 },
+      bob: { prompt: 100, completion: 20, cached: 0, lastPrompt: 90 },
+    }
+
+    expect(tokenUsageForTab(chat, "alice")).toBe(chat.tokenUsage.alice)
+    expect(tokenUsageForTab(chat, "root")).toBe(chat.tokenUsage.alice)
+    expect(chat.activeTokenUsage).toBe(chat.tokenUsage.bob)
+  })
+
+  it("resetForRouteSwitch clears the per-tab model map", () => {
+    const chat = useChatStore()
+    chat.modelByTab = { alice: { llmName: "x", model: "x" } }
+    chat._rootSourceName = "alice"
+
+    chat.resetForRouteSwitch()
+
+    expect(chat.modelByTab).toEqual({})
+    expect(chat._rootSourceName).toBeNull()
   })
 })
 
@@ -1964,7 +2135,9 @@ describe("chat store — optimistic branch promotion", () => {
     })
 
     expect(ok).toBe(true)
-    expect(chat.messagesByTab.main.some((m) => m.role === "user" && m.content === "edited")).toBe(true)
+    expect(chat.messagesByTab.main.some((m) => m.role === "user" && m.content === "edited")).toBe(
+      true,
+    )
     expect(JSON.stringify(chat.messagesByTab.main)).not.toContain("old reply")
     expect(chat.branchViewByTab.main[1]).toBe(2)
     expect(chat._streamingBranchByTab.main).toEqual({ turnIndex: 1, branchId: 2 })

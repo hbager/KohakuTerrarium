@@ -36,12 +36,12 @@
                   </div>
                   <div class="text-[11px] text-warm-400 font-mono truncate mt-1">
                     <span v-if="backend.env_var">{{ backend.env_var }}</span>
-                    <span v-if="backend.masked_key && backend.backend_type !== 'codex'"> · {{ backend.masked_key }}</span>
-                    <span v-if="backend.backend_type === 'codex'">{{ t("settings.keys.oauthHint") }}</span>
+                    <span v-if="backend.masked_key && !isOAuthCodex(backend)"> · {{ backend.masked_key }}</span>
+                    <span v-if="isOAuthCodex(backend)">{{ t("settings.keys.oauthHint") }}</span>
                   </div>
                 </div>
                 <div class="flex flex-wrap items-center justify-end gap-2 shrink-0">
-                  <template v-if="backend.backend_type !== 'codex'">
+                  <template v-if="!isOAuthCodex(backend)">
                     <el-input v-if="editingKey === backend.name" v-model="keyInput" size="small" type="password" show-password :placeholder="t('settings.keys.enterKey')" class="!w-60" @keyup.enter="saveKey(backend.name)" />
                     <el-button v-if="editingKey === backend.name" size="small" type="primary" @click="saveKey(backend.name)">
                       {{ t("common.save") }}
@@ -98,8 +98,8 @@
                   </div>
                   <div class="text-[11px] text-warm-400 font-mono truncate mt-1">
                     <span v-if="backend.env_var">{{ backend.env_var }}</span>
-                    <span v-if="backend.masked_key && backend.backend_type !== 'codex'"> · {{ backend.masked_key }}</span>
-                    <span v-if="backend.backend_type === 'codex'">{{ t("settings.keys.oauthHint") }}</span>
+                    <span v-if="backend.masked_key && !isOAuthCodex(backend)"> · {{ backend.masked_key }}</span>
+                    <span v-if="isOAuthCodex(backend)">{{ t("settings.keys.oauthHint") }}</span>
                   </div>
                   <div v-if="backend.provider_name || backend.provider_native_tools?.length" class="text-[10px] text-warm-400 mt-1 flex items-center gap-2 flex-wrap">
                     <span v-if="backend.provider_name" class="font-mono">identity: {{ backend.provider_name }}</span>
@@ -107,7 +107,7 @@
                   </div>
                 </div>
                 <div class="flex flex-wrap items-center justify-end gap-2 shrink-0">
-                  <template v-if="backend.backend_type !== 'codex'">
+                  <template v-if="!isOAuthCodex(backend)">
                     <el-input v-if="editingKey === backend.name" v-model="keyInput" size="small" type="password" show-password :placeholder="t('settings.keys.enterKey')" class="!w-60" @keyup.enter="saveKey(backend.name)" />
                     <el-button v-if="editingKey === backend.name" size="small" type="primary" @click="saveKey(backend.name)">
                       {{ t("common.save") }}
@@ -441,11 +441,12 @@ import { useAuthStore } from "@/stores/auth"
 import { useClusterStore } from "@/stores/cluster"
 import { LOCALE_DISPLAY_NAMES, SUPPORTED_LOCALES, useLocaleStore } from "@/stores/locale"
 import { DEFAULT_DESKTOP_ZOOM, DEFAULT_MOBILE_ZOOM, MAX_UI_ZOOM, MIN_UI_ZOOM, useThemeStore } from "@/stores/theme"
+import { configAPI, settingsAPI } from "@/utils/api"
 import { useI18n } from "@/utils/i18n"
+import { fireModelCatalogChanged } from "@/utils/layoutEvents"
 
 const cluster = useClusterStore()
 const auth = useAuthStore()
-import { configAPI, settingsAPI } from "@/utils/api"
 
 const theme = useThemeStore()
 const localeStore = useLocaleStore()
@@ -497,6 +498,7 @@ async function saveKey(provider) {
     await loadKeys()
     await loadBackends()
     await loadPresets()
+    fireModelCatalogChanged({ reason: "key-saved", provider })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || t("settings.keys.saveFailed"))
   }
@@ -509,6 +511,7 @@ async function deleteKey(provider) {
     await loadKeys()
     await loadBackends()
     await loadPresets()
+    fireModelCatalogChanged({ reason: "key-deleted", provider })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || t("settings.keys.deleteFailed"))
   }
@@ -517,6 +520,13 @@ async function deleteKey(provider) {
 const codexLoggingIn = ref(false)
 const codexModalOpen = ref(false)
 const codexModalNode = ref("_host")
+
+// A codex (Responses-API) backend uses ChatGPT OAuth login ONLY when it
+// has no custom endpoint. With a base_url it authenticates via an API key,
+// so we show the normal key-entry UI instead of the OAuth-only login.
+function isOAuthCodex(backend) {
+  return backend.backend_type === "codex" && !backend.base_url
+}
 
 function runCodexLogin() {
   // Worker-side login still uses the one-shot REST endpoint (the
@@ -542,6 +552,8 @@ async function runCodexLoginRemote(node) {
     ElMessage.success(`Codex login successful on ${node}`)
     await loadKeys()
     await loadBackends()
+    await loadPresets()
+    fireModelCatalogChanged({ reason: "codex-login", node })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || "Codex login failed")
   } finally {
@@ -553,6 +565,8 @@ async function onCodexLoginDone() {
   ElMessage.success("Codex login successful")
   await loadKeys()
   await loadBackends()
+  await loadPresets()
+  fireModelCatalogChanged({ reason: "codex-login", node: "_host" })
 }
 
 // Re-fetch keys whenever the user switches target node. Backends and
@@ -662,6 +676,8 @@ async function saveBackend() {
     closeBackendForm()
     await loadBackends()
     await loadKeys()
+    await loadPresets()
+    fireModelCatalogChanged({ reason: "backend-saved", provider: backendName })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || "Failed to save provider")
   }
@@ -674,6 +690,8 @@ async function deleteBackend(name) {
     if (editingBackendName.value === name) closeBackendForm()
     await loadBackends()
     await loadKeys()
+    await loadPresets()
+    fireModelCatalogChanged({ reason: "backend-deleted", provider: name })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || "Failed to delete provider")
   }
@@ -790,14 +808,24 @@ async function handleSavePreset(payload) {
     await loadPresets()
     const saved = allPresets.value.find((p) => presetKey(p) === selectedPresetKey.value)
     if (saved) selectPreset(saved)
+    fireModelCatalogChanged({ reason: "profile-saved", model: selectedPresetKey.value })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || err.message || t("settings.models.saveFailed"))
   }
 }
 
+function modelIdentifier(preset) {
+  const base = preset.provider ? `${preset.provider}/${preset.name}` : preset.name
+  const selections = Object.entries(preset.selected_variations || {})
+    .filter(([, value]) => value)
+    .sort(([a], [b]) => a.localeCompare(b))
+  if (!selections.length) return base
+  return `${base}@${selections.map(([group, option]) => `${group}=${option}`).join(",")}`
+}
+
 async function handleSetDefault(preset) {
   if (!preset || !preset.name) return
-  const identifier = preset.provider ? `${preset.provider}/${preset.name}` : preset.name
+  const identifier = modelIdentifier(preset)
   try {
     await settingsAPI.setDefaultModel(identifier)
     ElMessage.success(t("settings.models.defaultSet", { name: identifier }))
@@ -805,6 +833,7 @@ async function handleSetDefault(preset) {
     // Refresh the editor's bound preset so the badge flips.
     const refreshed = (allPresets.value || []).find((p) => p.name === preset.name && p.provider === preset.provider)
     if (refreshed) editorPreset.value = refreshed
+    fireModelCatalogChanged({ reason: "default-changed", model: identifier })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || t("settings.models.defaultSetFailed"))
   }
@@ -832,6 +861,7 @@ async function confirmDeletePreset(name) {
     ElMessage.success(t("settings.models.deleted", { name }))
     cancelEdit()
     await loadPresets()
+    fireModelCatalogChanged({ reason: "profile-deleted", model: `${preset.provider}/${name}` })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || t("settings.models.deleteFailed"))
   }

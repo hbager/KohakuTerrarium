@@ -90,20 +90,21 @@ describe("instances store", () => {
       config_path: "team.yaml",
       creatures: [
         {
-          name: "root",
-          creature_id: "root_abc",
-          model: "model",
-          llm_name: "provider/model",
-          is_root: true,
+          name: "worker",
+          creature_id: "worker_def",
+          model: "model2",
+          llm_name: "provider/model2",
+          is_privileged: false,
           running: true,
           listen_channels: [],
           send_channels: [],
         },
         {
-          name: "worker",
-          creature_id: "worker_def",
-          model: "model2",
-          llm_name: "provider/model2",
+          name: "coordinator",
+          creature_id: "root_abc",
+          model: "model",
+          llm_name: "provider/model",
+          is_privileged: true,
           running: true,
           listen_channels: [],
           send_channels: [],
@@ -118,8 +119,10 @@ describe("instances store", () => {
     expect(result.graph_id).toBe("graph_team")
     expect(result.type).toBe("terrarium") // 2+ creatures
     expect(result.creatures.length).toBe(2)
-    // Primary creature is the root flagged one — drives the model pill.
+    // A recipe root is identified by has_root + the backend's
+    // is_privileged flag, even when it is not first in the roster.
     expect(result.llm_name).toBe("provider/model")
+    expect(result.creatures[1].is_root).toBe(true)
     expect(store.current.id).toBe("graph_team")
   })
 

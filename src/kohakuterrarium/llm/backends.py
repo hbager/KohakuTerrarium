@@ -35,6 +35,7 @@ import yaml
 from kohakuterrarium.llm.api_keys import KT_DIR, PROVIDER_KEY_MAP
 from kohakuterrarium.llm.profile_types import LLMBackend
 from kohakuterrarium.utils.config_dir import config_dir
+from kohakuterrarium.utils.env_interp import interpolate_env_vars
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -88,6 +89,14 @@ def _normalize_backend_type(value: str) -> str:
     if value == "codex-oauth":
         return "codex"
     return value or "openai"
+
+
+def resolve_backend_base_url(value: str | None) -> str | None:
+    """Resolve a backend URL template against the live environment."""
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    return interpolate_env_vars(raw).strip() or None
 
 
 def load_yaml_store() -> dict[str, Any]:
@@ -251,7 +260,15 @@ def clear_remote_backends() -> None:
 
 
 def load_backends() -> dict[str, LLMBackend]:
-    """Return merged built-in + user-defined + remote-fetched providers."""
+    """Return merged built-in + user-defined + remote-fetched providers.
+
+    Values are returned RAW — any ``${VAR}`` / ``${VAR:default}`` markers
+    in ``base_url`` etc. are left literal here. Interpolation happens at
+    consume time (``bootstrap.llm`` when the provider is built), so the
+    on-disk YAML keeps its templates, CRUD round-trips never freeze a
+    resolved value, and the Settings UI shows the ``${VAR}`` the user
+    wrote rather than the resolved secret.
+    """
     data = load_yaml_store()
     backends = _built_in_providers()
 

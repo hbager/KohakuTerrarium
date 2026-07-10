@@ -87,26 +87,30 @@ def mint_store(
         path = Path(path).expanduser()
         path.parent.mkdir(parents=True, exist_ok=True)
 
-    store = SessionStore(path)
-    existing = store.load_meta()
-    if not existing.get("session_id"):
-        store.init_meta(
-            session_id=session_id or graph_id,
-            config_type=config_type,
-            config_path=config_path,
-            pwd=pwd or str(getattr(engine, "_pwd", None) or Path.cwd()),
-            agents=list(agents or []),
-            config_snapshot=config_snapshot,
+    store = SessionStore(path, writer_lock=True)
+    try:
+        existing = store.load_meta()
+        if not existing.get("session_id"):
+            store.init_meta(
+                session_id=session_id or graph_id,
+                config_type=config_type,
+                config_path=config_path,
+                pwd=pwd or str(getattr(engine, "_pwd", None) or Path.cwd()),
+                agents=list(agents or []),
+                config_snapshot=config_snapshot,
+            )
+        elif agents:
+            register_agents_in_meta(store, agents)
+        logger.info(
+            "Session store minted",
+            graph_id=graph_id,
+            path=str(path),
+            fresh=not existing.get("session_id"),
         )
-    elif agents:
-        register_agents_in_meta(store, agents)
-    logger.info(
-        "Session store minted",
-        graph_id=graph_id,
-        path=str(path),
-        fresh=not existing.get("session_id"),
-    )
-    return store
+        return store
+    except BaseException:
+        store.close()
+        raise
 
 
 def register_agents_in_meta(store: SessionStore, names: list[str]) -> None:
@@ -267,7 +271,7 @@ async def attach_for_recipe(
 
 
 def close_owned_stores(engine: "Terrarium") -> None:
-    """Close every store the engine minted.  Called from ``shutdown``."""
+    """Close every store owned by ``engine``. Called from ``shutdown``."""
     for gid in list(engine._owned_sessions):
         store = engine._session_stores.get(gid)
         if store is None:

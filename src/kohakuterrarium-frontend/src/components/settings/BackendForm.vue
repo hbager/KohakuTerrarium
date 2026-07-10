@@ -9,7 +9,7 @@
       <el-select :model-value="form.backend_type" size="small" class="w-full" @update:model-value="updateField('backend_type', $event)">
         <el-option value="openai" label="openai (/chat/completions)" />
         <el-option value="openai_responses" label="openai_responses (/responses)" />
-        <el-option value="codex" label="codex" />
+        <el-option value="codex" label="openai-responses (codex)" />
         <el-option value="anthropic" label="anthropic" />
       </el-select>
     </div>

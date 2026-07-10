@@ -12,8 +12,8 @@ from kohakuterrarium.llm.openai_helpers import (
 # =========================================================================
 
 
-def test_roocode_user_agent_constant():
-    assert ROOCODE_USER_AGENT == "RooCode/3.52.1"
+def test_openai_provider_uses_browser_like_user_agent():
+    assert ROOCODE_USER_AGENT.startswith("Mozilla/5.0 ")
 
 
 # =========================================================================

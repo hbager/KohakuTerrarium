@@ -155,10 +155,9 @@ class TestAttachMetaUpdates:
                 agents = store.meta["agents"]
                 assert "alice" in agents
                 assert "bob" in agents
-                # A runtime group can contain multiple agents while still
-                # being rebuilt from a creature config; do not misclassify it
-                # as a terrarium recipe.
-                assert store.meta["config_type"] == "agent"
+                # Two agents share one store, so resume must rebuild the
+                # multi-creature terrarium path.
+                assert store.meta["config_type"] == "terrarium"
             finally:
                 store.close()
         finally:

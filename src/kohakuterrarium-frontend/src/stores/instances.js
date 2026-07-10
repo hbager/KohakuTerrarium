@@ -166,7 +166,8 @@ function _mapSession(data) {
     compact_threshold: c.compact_threshold || 0,
     listen_channels: c.listen_channels || [],
     send_channels: c.send_channels || [],
-    is_root: !!c.is_root,
+    is_privileged: !!c.is_privileged,
+    is_root: !!data.has_root && !!(c.is_root || c.is_privileged),
     // Per-creature lab cluster site; fall back to session-level home.
     home_node: c.home_node || sessionHome,
   }))

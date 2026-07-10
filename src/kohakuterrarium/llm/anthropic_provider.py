@@ -206,12 +206,26 @@ class AnthropicProvider(BaseLLMProvider):
         lookup_key = getattr(self, "_credential_provider", "") or self.provider_name
         if not lookup_key:
             return False
-        new_key = get_api_key(lookup_key)
-        if not new_key or new_key == self._api_key:
+        new_key_pool = get_api_key(lookup_key)
+        if not new_key_pool:
+            return False
+        new_key = new_key_pool.first
+        current_pool = self._api_key_pool or KeyPool([self._api_key or ""])
+        if new_key_pool == current_pool:
             return False
         old = self._client
+        self._api_key_pool = new_key_pool if new_key_pool.is_pool else None
         self._api_key = new_key
-        default_headers = dict(self._extra_headers)
+        default_headers = {
+            "anthropic-version": "2023-06-01",
+            "Content-Type": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/147.0.0.0 Safari/537.36"
+            ),
+            **self._extra_headers,
+        }
         if self.auth_as_bearer:
             default_headers.setdefault("X-Api-Key", Omit())
         self._client = AsyncAnthropic(

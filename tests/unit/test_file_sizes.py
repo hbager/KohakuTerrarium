@@ -90,6 +90,10 @@ ALLOWLIST_600 = {
     # already extracted to agent_tools/agent_pre_dispatch/skill-hints;
     # the remaining code is a single cohesive lifecycle.
     "core/agent_handlers.py",
+    # Session memory facade: indexing/search/compaction/cleanup share the same
+    # three vault handles and embedder state; splitting would scatter lifecycle
+    # ownership for a module only marginally above the default limit.
+    "session/memory.py",
     # Session store facade — owns every KVault table + uniform per-table
     # getters/setters (meta, state, events, channels, subagents, jobs,
     # conversation, turn_rollup, fts). Heavy lifting for counters, fork,

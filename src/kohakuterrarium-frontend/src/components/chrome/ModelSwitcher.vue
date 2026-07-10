@@ -140,8 +140,22 @@ const targetOptions = computed(() => {
   if (inst?.type !== "terrarium") return []
   return [...(inst.has_root ? [{ value: "root", label: "root" }] : []), ...(inst.creatures || []).map((c) => ({ value: c.name, label: c.name }))]
 })
-const selectedTarget = computed(() => terrariumTarget.value || targetOptions.value[0]?.value || null)
+const selectedTarget = computed(() => {
+  const current = terrariumTarget.value
+  if (current && targetOptions.value.some((option) => option.value === current)) {
+    return current
+  }
+  return targetOptions.value[0]?.value || null
+})
 const canPickModel = computed(() => !!activeInstanceId.value && (!isTerrarium.value || !!selectedTarget.value))
+
+// Resolve a target key to its creature record. ``root`` is a tab
+// alias for the privileged creature in recipe terrariums.
+function creatureForTarget(inst, target) {
+  if (!inst || !target) return null
+  if (target === "root") return inst.creatures?.find((c) => c.is_root) || null
+  return inst.creatures?.find((c) => c.name === target) || null
+}
 
 const currentModel = computed(() => {
   const inst = currentInstance.value
@@ -150,18 +164,19 @@ const currentModel = computed(() => {
   // survive a page refresh with the full identifier intact.
   if (inst?.type === "terrarium") {
     const target = selectedTarget.value
-    if (target === "root") {
-      const fallback = inst.llm_name || inst.model || ""
-      return terrariumTarget.value === target ? chat.sessionInfo.llmName || chat.sessionInfo.model || fallback : fallback
-    }
-    if (target) {
-      const creature = inst.creatures?.find((c) => c.name === target)
-      const fallback = creature?.llm_name || creature?.model || ""
-      return terrariumTarget.value === target ? chat.sessionInfo.llmName || chat.sessionInfo.model || fallback : fallback
-    }
-    return ""
+    if (!target) return ""
+    // The pill must ALWAYS track the SELECTED creature: live per-tab
+    // info (WS session_info, keyed by source name) first, then the
+    // instance snapshot. The global chat.sessionInfo is deliberately
+    // NOT consulted here — it tracks the primary creature only, and
+    // preferring it made every target show the primary's model.
+    const creature = creatureForTarget(inst, target)
+    const live = chat.modelByTab[target] || (creature?.name && chat.modelByTab[creature.name]) || null
+    return live?.llmName || live?.model || creature?.llm_name || creature?.model || (target === "root" ? inst.llm_name || inst.model || "" : "")
   }
-  return chat.sessionInfo.llmName || chat.sessionInfo.model || inst?.llm_name || inst?.model || ""
+  const soloTab = inst?.creatures?.[0]?.name || chat.terrariumTarget
+  const live = (soloTab && chat.modelByTab[soloTab]) || null
+  return live?.llmName || live?.model || chat.sessionInfo.llmName || chat.sessionInfo.model || inst?.llm_name || inst?.model || ""
 })
 
 const currentParsed = computed(() => parseSelector(currentModel.value))
@@ -285,9 +300,9 @@ function resetDraftFromCurrent() {
   // When the selector carried a ``provider/name`` prefix, look up by the
   // full (provider, name) pair. Otherwise fall back to the bare name (for
   // pre-refactor session data that still stores bare ids).
-  const matched = (provider && models.value.find((m) => (m.provider || m.login_provider) === provider && m.name === name)) || models.value.find((m) => m.name === name) || models.value.find((m) => m.model === name) || models.value[0]
+  const matched = provider ? models.value.find((m) => (m.provider || m.login_provider) === provider && m.name === name) : models.value.find((m) => m.name === name) || models.value.find((m) => m.model === name)
   if (!matched) {
-    draftProvider.value = providerOptions.value[0]?.name || ""
+    draftProvider.value = provider || providerOptions.value[0]?.name || ""
     draftPreset.value = ""
     Object.keys(draftSelections).forEach((k) => delete draftSelections[k])
     return
@@ -361,14 +376,32 @@ async function applySelection() {
       ElMessage.error("Select a creature first")
       return
     }
-    const result = await terrariumAPI.switchCreatureModel(sid, target, modelName)
-    const resolvedModel = result?.model || modelName
+    const res = await terrariumAPI.switchCreatureModel(sid, target, modelName)
+    // The backend returns the canonical ``provider/name[@variations]``
+    // identifier — use it so the pill matches what /model would show.
+    const canonical = res?.model || modelName
     await instances.fetchOne(id)
-    if (chat.terrariumTarget === target || (inst?.creatures?.length || 0) <= 1) {
-      chat.sessionInfo.llmName = resolvedModel
-      chat.sessionInfo.model = resolvedModel
+    // Update the per-creature entry immediately; the creature's own
+    // ``session_info`` event confirms (and adds max_context) later.
+    const creature = creatureForTarget(inst, target)
+    const entry = { ...(chat.modelByTab[target] || {}), model: canonical, llmName: canonical }
+    chat.modelByTab[target] = entry
+    if (creature?.name && creature.name !== target) {
+      chat.modelByTab[creature.name] = { ...entry }
     }
-    ElMessage.success(`Switched to ${resolvedModel}`)
+    if (creature?.is_root && inst?.has_root) {
+      chat.modelByTab["root"] = { ...entry }
+    }
+    // Keep the session-level fallback in sync only when the primary
+    // creature (or a solo session's lone creature) was the target.
+    const primarySource = chat._primarySourceName || ((inst?.has_root && inst?.creatures?.find((candidate) => candidate.is_root)) || inst?.creatures?.[0])?.name
+    const isPrimary = (inst?.creatures?.length || 0) <= 1 || target === primarySource || (target === "root" && creature?.name === primarySource)
+    if (isPrimary) {
+      chat.sessionInfo.llmName = canonical
+      chat.sessionInfo.model = canonical
+    }
+    const label = isTerrarium.value ? `Switched ${target} to ${canonical}` : `Switched to ${canonical}`
+    ElMessage.success(label)
     popoverVisible.value = false
   } catch (err) {
     ElMessage.error(`Model switch failed: ${err?.message || err}`)

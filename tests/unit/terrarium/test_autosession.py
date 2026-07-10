@@ -10,6 +10,7 @@ import pytest
 
 from kohakuterrarium.session.resume import detect_session_type
 from kohakuterrarium.session.store import SessionStore
+from kohakuterrarium.terrarium import autosession as autosession_mod
 from kohakuterrarium.terrarium.creature_host import Creature
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
@@ -71,6 +72,30 @@ class TestAutosessionViaSessionDir:
             assert c.graph_id not in t._session_stores
         finally:
             await t.shutdown()
+
+
+class TestMintStoreFailures:
+    def test_load_meta_failure_closes_store(self, monkeypatch, tmp_path):
+        class FakeStore:
+            closed = False
+
+            def __init__(self, path, writer_lock=False):
+                pass
+
+            def load_meta(self):
+                raise RuntimeError("broken metadata")
+
+            def close(self):
+                self.closed = True
+
+        store = FakeStore(None)
+        monkeypatch.setattr(
+            autosession_mod, "SessionStore", lambda *args, **kwargs: store
+        )
+
+        with pytest.raises(RuntimeError, match="broken metadata"):
+            autosession_mod.mint_store(object(), "graph", path=tmp_path / "x.kohakutr")
+        assert store.closed is True
 
 
 class TestSessionArg:

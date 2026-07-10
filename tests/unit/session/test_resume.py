@@ -750,6 +750,29 @@ class TestResumeAgent:
             s.close()
         with pytest.raises(ValueError, match="no config_path"):
             resume_agent(path)
+        reopened = SessionStore(path, writer_lock=True)
+        reopened.close()
+
+    def test_failure_closes_opened_store(self, monkeypatch):
+        import kohakuterrarium.session.resume as resume_mod
+
+        class FakeStore:
+            closed = False
+
+            def load_meta(self):
+                return {"config_type": "agent"}
+
+            def close(self):
+                self.closed = True
+
+        store = FakeStore()
+        monkeypatch.setattr(
+            resume_mod, "_open_store_with_migration", lambda *args, **kwargs: store
+        )
+
+        with pytest.raises(ValueError, match="no config_path"):
+            resume_agent("unused.kohakutr")
+        assert store.closed is True
 
     def test_io_mode_override_builds_modules(self, tmp_path, patched_llm):
         # Passing io_mode="plain" makes resume build + wire the plain

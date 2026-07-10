@@ -369,7 +369,7 @@ class TerrariumService(Protocol):
         turn_index: int | None = None,
         user_position: int | None = None,
         branch_view: dict[int, int] | None = None,
-    ) -> bool:
+    ) -> bool | dict[str, Any]:
         """Edit the user message at ``msg_idx`` and re-run from there."""
         ...
 

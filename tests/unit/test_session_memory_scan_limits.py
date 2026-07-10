@@ -6,6 +6,9 @@ class _FakeFTS:
         self.keys_limit = None
         self.deleted = []
 
+    def enable_auto_pack(self):
+        pass
+
     def __len__(self):
         return 12345
 

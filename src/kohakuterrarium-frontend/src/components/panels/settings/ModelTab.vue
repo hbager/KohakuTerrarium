@@ -64,7 +64,7 @@ async function loadProfile() {
     const wantProvider = slash >= 0 ? base.slice(0, slash) : ""
     const wantName = slash >= 0 ? base.slice(slash + 1) : base
     const entries = Array.isArray(models) ? models : []
-    profile.value = entries.find((m) => m.name === wantName && (!wantProvider || (m.provider || m.login_provider) === wantProvider)) || entries.find((m) => m.name === wantName) || null
+    profile.value = wantProvider ? entries.find((m) => m.name === wantName && (m.provider || m.login_provider) === wantProvider) || null : entries.find((m) => m.name === wantName) || null
   } catch {
     profile.value = null
   }

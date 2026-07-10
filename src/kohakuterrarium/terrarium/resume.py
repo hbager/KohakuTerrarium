@@ -80,6 +80,32 @@ def _resolve_store_path(store: SessionStore | str | Path) -> Path:
     return Path(str(store))
 
 
+async def _cleanup_failed_resume(
+    engine: "Terrarium", store: SessionStore, graph_ids: set[str]
+) -> None:
+    for graph_id in graph_ids:
+        try:
+            await engine.stop_graph(graph_id)
+        except BaseException as exc:
+            logger.warning(
+                "Failed to stop partially resumed graph",
+                graph_id=graph_id,
+                error=str(exc),
+                exc_info=True,
+            )
+        engine._owned_sessions.discard(graph_id)
+        if engine._session_stores.get(graph_id) is store:
+            engine._session_stores.pop(graph_id, None)
+    try:
+        store.close()
+    except BaseException as exc:
+        logger.warning(
+            "Failed to close store after resume failure",
+            error=str(exc),
+            exc_info=True,
+        )
+
+
 async def _resume_agent_into_engine(
     engine: "Terrarium",
     path: Path,
@@ -96,8 +122,12 @@ async def _resume_agent_into_engine(
     the Studio / Lab spawn path; without it a worker-side resume boots
     a stdin reader with no TTY and wedges the worker.
     """
-    store = _open_store_with_migration(path)
-    meta = store.load_meta()
+    store = _open_store_with_migration(path, writer_lock=True)
+    try:
+        meta = store.load_meta()
+    except BaseException:
+        await _cleanup_failed_resume(engine, store, set())
+        raise
     agents = list(meta.get("agents") or [])
     if len(agents) > 1:
         return await _resume_runtime_group_into_engine(
@@ -121,14 +151,22 @@ async def _resume_agent_into_engine(
         agent=agent,
         config=agent.config,
     )
-    # ``session=False``: the SAVED store attaches below — autosession
-    # minting a fresh sibling file here would orphan it on disk.
-    creature = await engine.add_creature(creature_obj, start=True, session=False)
+    try:
+        # ``session=False``: the SAVED store attaches below — autosession
+        # minting a fresh sibling file here would orphan it on disk.
+        creature = await engine.add_creature(
+            creature_obj, start=True, session=False
+        )
 
-    # Attach at graph level. ``Agent.attach_session_store`` is
-    # idempotent for the same store, so this updates graph bookkeeping
-    # without adding a duplicate SessionOutput sink.
-    await engine.attach_session(creature.graph_id, store)
+        # Attach at graph level. ``Agent.attach_session_store`` is
+        # idempotent for the same store, so this updates graph bookkeeping
+        # without adding a duplicate SessionOutput sink.
+        await engine.attach_session(creature.graph_id, store)
+        engine._owned_sessions.add(creature.graph_id)
+    except BaseException:
+        graph_ids = {creature_obj.graph_id} if creature_obj.graph_id else set()
+        await _cleanup_failed_resume(engine, store, graph_ids)
+        raise
 
     logger.info(
         "Agent session resumed into engine",
@@ -147,45 +185,54 @@ async def _resume_runtime_group_into_engine(
     pwd: str | None,
     llm: Any,
 ) -> str:
-    config_path = meta.get("config_path", "")
-    config_snapshot = meta.get("config_snapshot") or {}
-    if not config_path and not config_snapshot:
-        store.close()
-        raise ValueError("Session has no config_path or config_snapshot in metadata")
+    created_graph_ids: set[str] = set()
+    try:
+        config_path = meta.get("config_path", "")
+        config_snapshot = meta.get("config_snapshot") or {}
+        if not config_path and not config_snapshot:
+            raise ValueError("Session has no config_path or config_snapshot in metadata")
 
-    effective_pwd = pwd or meta.get("pwd", ".")
-    if not (effective_pwd and os.path.isdir(effective_pwd)):
-        effective_pwd = None
+        effective_pwd = pwd or meta.get("pwd", ".")
+        if not (effective_pwd and os.path.isdir(effective_pwd)):
+            effective_pwd = None
 
-    sid: str | None = None
-    for agent_name in list(meta.get("agents") or []):
-        agent = _rebuild_agent(
-            config_path=config_path,
-            config_snapshot=config_snapshot,
-            llm=llm,
-            io_kwargs={"input_module": NoneInput()},
-            pwd=effective_pwd,
-        )
-        inject_saved_state(agent, store, agent_name)
-        creature_obj = Creature(
-            creature_id=_safe_creature_id(agent.config.name),
-            name=agent.config.name,
-            agent=agent,
-            config=agent.config,
-        )
-        creature = await engine.add_creature(
-            creature_obj,
-            graph=sid,
-            start=True,
-        )
-        sid = creature.graph_id
+        sid: str | None = None
+        for agent_name in list(meta.get("agents") or []):
+            agent = _rebuild_agent(
+                config_path=config_path,
+                config_snapshot=config_snapshot,
+                llm=llm,
+                io_kwargs={"input_module": NoneInput()},
+                pwd=effective_pwd,
+            )
+            inject_saved_state(agent, store, agent_name)
+            creature_obj = Creature(
+                creature_id=_safe_creature_id(agent.config.name),
+                name=agent.config.name,
+                agent=agent,
+                config=agent.config,
+            )
+            try:
+                creature = await engine.add_creature(
+                    creature_obj,
+                    graph=sid,
+                    start=True,
+                    session=False,
+                )
+            finally:
+                if creature_obj.graph_id:
+                    created_graph_ids.add(creature_obj.graph_id)
+            sid = creature.graph_id
 
-    if sid is None:
-        store.close()
-        raise ValueError("Session has no agents in metadata")
-    await engine.attach_session(sid, store)
-    store.update_status("running")
-    await _topo_snap.replay(engine, sid)
+        if sid is None:
+            raise ValueError("Session has no agents in metadata")
+        await engine.attach_session(sid, store)
+        engine._owned_sessions.add(sid)
+        store.update_status("running")
+        await _topo_snap.replay(engine, sid)
+    except BaseException:
+        await _cleanup_failed_resume(engine, store, created_graph_ids)
+        raise
 
     logger.info(
         "Runtime group session resumed into engine",
@@ -204,7 +251,32 @@ async def _resume_terrarium_into_engine(
     llm: Any = None,
 ) -> str:
     """Multi-creature recipe resume: rebuild graph, inject per-creature."""
-    store = _open_store_with_migration(path)
+    store = _open_store_with_migration(path, writer_lock=True)
+    created_graph_ids: set[str] = set()
+    try:
+        graph_id = await _resume_terrarium_from_store(
+            engine,
+            store,
+            path=path,
+            pwd=pwd,
+            llm=llm,
+            created_graph_ids=created_graph_ids,
+        )
+        return graph_id
+    except BaseException:
+        await _cleanup_failed_resume(engine, store, created_graph_ids)
+        raise
+
+
+async def _resume_terrarium_from_store(
+    engine: "Terrarium",
+    store: SessionStore,
+    *,
+    path: Path,
+    pwd: str | None,
+    llm: Any,
+    created_graph_ids: set[str],
+) -> str:
     meta = store.load_meta()
     config_path = meta.get("config_path", "")
     if not config_path:
@@ -231,8 +303,15 @@ async def _resume_terrarium_into_engine(
     # orphans: an empty ghost file stuck at ``status="running"`` in
     # the saved-session list, plus a leaked open handle.  Mirrors the
     # ``session=False`` in ``_resume_agent_into_engine``.
-    graph = await engine.apply_recipe(config, pwd=pwd, llm=llm, session=False)
+    graph = await engine.apply_recipe(
+        config,
+        pwd=pwd,
+        llm=llm,
+        session=False,
+        _on_graph_created=created_graph_ids.add,
+    )
     sid = graph.graph_id
+    created_graph_ids.add(sid)
 
     # Per-creature state injection.
     #
@@ -281,6 +360,7 @@ async def _resume_terrarium_into_engine(
     # above, but ``Agent.attach_session_store`` is idempotent for the
     # same store so this preserves graph/session bookkeeping safely.
     await engine.attach_session(sid, store)
+    engine._owned_sessions.add(sid)
     store.update_status("running")
 
     # Replay runtime topology mutations on top of the recipe-rebuilt

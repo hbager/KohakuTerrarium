@@ -826,6 +826,59 @@ class TestRunLoopCallbacks:
         assert captured  # at least one chunk captured
 
 
+class _CaptureMessagesLLM(ScriptedLLM):
+    def __init__(self):
+        super().__init__(["ok"])
+        self.messages = None
+
+    async def chat(self, messages, **kwargs):
+        self.messages = messages
+        async for chunk in super().chat(messages, **kwargs):
+            yield chunk
+
+
+class TestSessionArtifactResolution:
+    async def test_only_current_session_artifact_is_inlined(self, tmp_path):
+        from kohakuterrarium.session.store import SessionStore
+
+        llm = _CaptureMessagesLLM()
+        env = TestAgentBuilder().with_llm(llm).build()
+        store = SessionStore(tmp_path / "current.kohakutr")
+        store.init_meta("current", "agent", "", str(tmp_path), ["agent"])
+        (store.artifacts_dir / "pic.png").write_bytes(b"PNGDATA")
+        env.controller.session_store = store
+        env.controller.conversation.append(
+            "user",
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": "/api/sessions/current/artifacts/pic.png"
+                    },
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "/api/sessions/other/artifacts/pic.png"},
+                },
+            ],
+        )
+        await env.controller.push_event(create_user_input_event("continue"))
+        try:
+            async for _ in env.controller.run_once():
+                pass
+        finally:
+            store.close(update_status=False)
+
+        previous = next(
+            message
+            for message in llm.messages
+            if isinstance(message.get("content"), list)
+        )
+        urls = [part["image_url"]["url"] for part in previous["content"]]
+        assert urls[0].startswith("data:image/png;base64,")
+        assert urls[1] == "/api/sessions/other/artifacts/pic.png"
+
+
 # ── native-mode completion ───────────────────────────────────────
 
 

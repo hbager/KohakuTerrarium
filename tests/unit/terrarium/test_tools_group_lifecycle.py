@@ -139,11 +139,11 @@ class TestGroupAddNode:
         gctx.engine.add_creature.assert_awaited_once_with(
             "./c",
             graph="g1",
-            llm_override=None,
+            llm=None,
             pwd="/wd",
             is_privileged=False,
             parent_creature_id="caller",
-            suppress_io=True,
+            io="none",
         )
         assert gctx.engine.emitted  # emit fired
 

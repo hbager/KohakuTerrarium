@@ -7,6 +7,7 @@ shape, which our fake satisfies.
 
 from pathlib import Path
 
+import pytest
 
 from kohakuterrarium.terrarium import recipe as recipe_mod
 from kohakuterrarium.terrarium.config import (
@@ -69,6 +70,27 @@ class TestApplyRecipe:
             )
             assert graph.graph_id  # got a graph id
             assert graph.creature_ids == set()
+        finally:
+            await engine.shutdown()
+
+    async def test_reports_new_graph_before_building_creatures(self):
+        engine = Terrarium()
+        reported = []
+
+        def fail_builder(*args, **kwargs):
+            assert reported
+            raise RuntimeError("build failed")
+
+        try:
+            r = _recipe(creatures=[_creature_cfg("alice")])
+            with pytest.raises(RuntimeError, match="build failed"):
+                await recipe_mod.apply_recipe(
+                    engine,
+                    r,
+                    creature_builder=fail_builder,
+                    _on_graph_created=reported.append,
+                )
+            assert reported == [next(iter(engine._topology.graphs))]
         finally:
             await engine.shutdown()
 

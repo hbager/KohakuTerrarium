@@ -1,74 +1,11 @@
 """Codex Responses API message-shape helpers."""
 
-import base64
 import json as _json
-import re
 from typing import Any
 
-from kohakuterrarium.studio.persistence.artifacts import (
-    resolve_artifact_file,
-    resolve_artifacts_dir,
-)
-from kohakuterrarium.studio.persistence.store import _session_dir
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
-
-
-# Tool images are materialized by the controller to ``/api/sessions/{sid}/
-# artifacts/{path}`` — a relative URL that points at our local FastAPI
-# server. Codex's URL validator rejects it ("Expected a valid URL"), so
-# we resolve it back to a ``data:`` URL at send time. ``data:`` URLs
-# *are* accepted by Codex in user-role ``input_image`` parts.
-_ARTIFACT_URL_RE = re.compile(r"^/api/sessions/(?P<sid>[^/]+)/artifacts/(?P<path>.+)$")
-
-_ARTIFACT_MIME_BY_EXT = {
-    ".png": "image/png",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-    ".bmp": "image/bmp",
-    ".tiff": "image/tiff",
-    ".tif": "image/tiff",
-    ".svg": "image/svg+xml",
-    ".heif": "image/heif",
-    ".heic": "image/heic",
-    ".avif": "image/avif",
-}
-
-
-def _resolve_artifact_url(url: str) -> str:
-    """Resolve a relative ``/api/sessions/.../artifacts/...`` URL to a data URL.
-
-    Returns the original URL when it can't be resolved (already a
-    ``data:`` URL, fully-qualified http(s), missing on disk, etc.).
-    Failures are logged at debug; the caller falls back to the
-    original string and lets the LLM provider surface any error.
-    """
-    if not isinstance(url, str) or not url.startswith("/api/sessions/"):
-        return url
-    match = _ARTIFACT_URL_RE.match(url)
-    if not match:
-        return url
-    sid = match.group("sid")
-    rel = match.group("path")
-    try:
-        artifacts = resolve_artifacts_dir(sid, _session_dir())
-        path = resolve_artifact_file(artifacts, rel)
-        data = path.read_bytes()
-    except Exception as exc:
-        logger.warning(
-            "Codex artifact URL resolve failed — sending as-is",
-            url=url,
-            error=str(exc),
-            exc_info=True,
-        )
-        return url
-    ext = path.suffix.lower()
-    mime = _ARTIFACT_MIME_BY_EXT.get(ext, "application/octet-stream")
-    b64 = base64.b64encode(data).decode("ascii")
-    return f"data:{mime};base64,{b64}"
 
 
 def to_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -169,9 +106,7 @@ def _user_item(content: Any) -> dict[str, Any] | None:
             url = _image_url_value(part.get("image_url"))
             if not url:
                 continue
-            input_content.append(
-                {"type": "input_image", "image_url": _resolve_artifact_url(url)}
-            )
+            input_content.append({"type": "input_image", "image_url": url})
     return {"role": "user", "content": input_content} if input_content else None
 
 
@@ -206,10 +141,8 @@ def _tool_item(content: Any, call_id: str) -> dict[str, Any]:
     alongside its tool call, keeping the string form for text-only
     results so the historical wire shape is preserved.
 
-    Image URLs may arrive as relative artifact paths
-    (``/api/sessions/{sid}/artifacts/...``) — those are not valid URLs
-    to Codex's validator. ``_resolve_artifact_url`` rewrites them to
-    ``data:`` URLs at send time.
+    Controller resolves current-session artifact URLs to ``data:`` URLs before
+    this format conversion runs.
     """
     parts = _tool_output_parts(content)
     if parts is not None:
@@ -230,8 +163,7 @@ def _tool_output_parts(content: Any) -> list[dict[str, Any]] | None:
 
     Returns ``None`` for plain string / text-only content so callers
     fall back to the simpler string ``output`` form. Otherwise returns
-    a list of ``{type: input_text|input_image, ...}`` parts with any
-    artifact URLs resolved to ``data:`` URLs.
+    a list of ``{type: input_text|input_image, ...}`` parts.
     """
     if not isinstance(content, list):
         return None
@@ -250,9 +182,7 @@ def _tool_output_parts(content: Any) -> list[dict[str, Any]] | None:
             url = _image_url_value(part.get("image_url"))
             if not url:
                 continue
-            parts.append(
-                {"type": "input_image", "image_url": _resolve_artifact_url(url)}
-            )
+            parts.append({"type": "input_image", "image_url": url})
     return parts or None
 
 

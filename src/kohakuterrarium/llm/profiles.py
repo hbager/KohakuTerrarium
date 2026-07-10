@@ -44,6 +44,7 @@ from kohakuterrarium.llm.backends import (
 )
 from kohakuterrarium.llm.backends import (
     load_backends,
+    resolve_backend_base_url,
 )
 from kohakuterrarium.llm.backends import load_yaml_store as _load_yaml
 from kohakuterrarium.llm.backends import save_yaml_store as _save_yaml
@@ -95,11 +96,12 @@ def save_backend(backend: LLMBackend) -> None:
 
 
 def delete_backend(name: str) -> bool:
-    """Delete a user-defined provider and cascade-delete its presets.
+    """Delete an unused user-defined provider.
 
-    Any user presets whose ``provider`` matches *name* are removed
-    together with the backend entry.  If the current ``default_model``
-    references one of the removed presets it is cleared as well.
+    Presets are user configuration and must never be removed implicitly. A
+    provider still referenced by any preset is therefore rejected. After a
+    successful deletion, clear only a provider-qualified default that points
+    at the deleted provider; legacy bare defaults cannot identify it safely.
     """
     if name in _BUILTIN_PROVIDER_NAMES:
         raise ValueError(f"Cannot delete built-in provider: {name}")
@@ -109,32 +111,19 @@ def delete_backend(name: str) -> bool:
         return False
 
     presets = load_presets()
-    removed_preset_names = {
-        preset_name for provider, preset_name in presets if provider == name
-    }
-    # Cascade: drop every preset that belongs to this provider
-    cleaned_presets = {
-        key: preset for key, preset in presets.items()
-        if key[0] != name
-    }
+    if any(provider == name for provider, _ in presets):
+        raise ValueError(f"Provider still in use by one or more presets: {name}")
 
     backends = load_backends()
     backends.pop(name, None)
 
-    # Clear default_model if it pointed to a preset under this provider.
-    # Newer configs store "provider/name"; older ones may still store
-    # the bare preset name, so clear that too when it belonged to the
-    # removed provider.
     default_model = data.get("default_model", "")
-    if default_model:
-        if "/" in default_model:
-            dm_provider, _ = default_model.split("/", 1)
-            if dm_provider == name:
-                default_model = ""
-        elif default_model in removed_preset_names:
+    if isinstance(default_model, str) and "/" in default_model:
+        default_provider, _ = default_model.split("/", 1)
+        if default_provider == name:
             default_model = ""
 
-    _save_yaml(_serialize_user_data(cleaned_presets, backends, default_model))
+    _save_yaml(_serialize_user_data(presets, backends, default_model))
     save_api_key(name, "")
     return True
 
@@ -217,14 +206,14 @@ def load_profiles() -> dict[tuple[str, str], LLMProfile]:
 # ``(provider_name, preferred_bare_preset_name)``; the bare name
 # reflects the new naming — no ``-api`` / ``-or`` suffixes.
 _PROVIDER_DEFAULT_MODELS: list[tuple[str, str]] = [
-    ("codex", "gpt-5.4"),
-    ("openrouter", "mimo-v2-pro"),
-    ("anthropic", "claude-opus-4.7"),
-    ("openai", "gpt-5.4"),
+    ("codex", "gpt-5.5"),
+    ("openrouter", "mimo-v2.5-pro"),
+    ("anthropic", "claude-opus-4.8"),
+    ("openai", "gpt-5.5"),
     ("gemini", "gemini-3.1-pro"),
-    ("mimo", "mimo-v2-pro"),
+    ("mimo", "mimo-v2.5-pro"),
     ("kimi-code", "kimi-for-coding"),
-    ("glm-coding", "glm-5.1"),
+    ("glm-coding", "glm-5.2"),
 ]
 
 
@@ -695,7 +684,16 @@ def _is_available(provider_name: str) -> bool:
     backends = load_backends()
     backend = backends.get(provider_name)
     if backend and backend.backend_type == "codex":
-        return CodexTokens.load() is not None
+        raw_base_url = (backend.base_url or "").strip()
+        if not raw_base_url:
+            # ChatGPT-subscription -> OAuth token.
+            return CodexTokens.load() is not None
+        if resolve_backend_base_url(raw_base_url) is None:
+            return False
+        # Custom Responses endpoint -> API-key auth.
+        if get_api_key(provider_name):
+            return True
+        return bool(backend.api_key_env and get_api_key(backend.api_key_env))
     if provider_name == "codex":
         return CodexTokens.load() is not None
     if backend:
@@ -782,7 +780,7 @@ def list_all() -> list[dict[str, Any]]:
         entry["is_default"] = is_default
         if is_default:
             preset = definitions.get((entry["provider"], entry["name"]))
-            entry["selected_variations"] = dict(
-                default_selections or _infer_matching_variations(preset)
-            )
+            selected = _infer_matching_variations(preset)
+            selected.update(default_selections)
+            entry["selected_variations"] = selected
     return result

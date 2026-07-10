@@ -64,6 +64,7 @@ async def apply_recipe(
     llm: Any = None,
     strict: bool = True,
     creature_builder: CreatureBuilder | None = None,
+    _on_graph_created: Callable[[str], None] | None = None,
 ) -> GraphTopology:
     """Load a terrarium recipe into ``engine`` and return the resulting
     :class:`GraphTopology`.
@@ -86,6 +87,8 @@ async def apply_recipe(
         graph_id = _topo.new_graph_id()
         engine._topology.graphs[graph_id] = _topo.GraphTopology(graph_id=graph_id)
         engine._environments[graph_id] = Environment(env_id=f"env_{graph_id}")
+        if _on_graph_created is not None:
+            _on_graph_created(graph_id)
     env = engine._environments[graph_id]
     _channels.register_engine_handle(env, engine)
 

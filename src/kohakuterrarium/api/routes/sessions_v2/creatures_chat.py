@@ -89,22 +89,42 @@ async def edit_creature_message(
         )
     except KeyError:
         raise HTTPException(404, f"creature {creature_id!r} not found")
-    if not edited:
+    if isinstance(edited, dict) and "edited" in edited:
+        edit_succeeded = bool(edited["edited"])
+    else:
+        edit_succeeded = bool(edited)
+    if not edit_succeeded:
         raise HTTPException(400, "Invalid edit target; expected a user message")
     # Newer service implementations return a dict carrying the just-
     # opened branch_id / turn_index so the frontend's navigator can
-    # promote immediately. Older ones still return ``True`` — fall
-    # back to echoing the request fields then.
-    if isinstance(edited, dict):
-        return {
-            "user_position": req.user_position,
-            **edited,
-        }
-    return {
+    # promote immediately. Older ones still return ``True`` — infer
+    # branch metadata from history when available.
+    result = {
         "status": "edited",
-        "turn_index": req.turn_index,
+        "turn_index": (
+            edited.get("turn_index", req.turn_index)
+            if isinstance(edited, dict)
+            else req.turn_index
+        ),
         "user_position": req.user_position,
     }
+    branch_id = edited.get("branch_id") if isinstance(edited, dict) else None
+    if branch_id is None and result["turn_index"] is not None:
+        try:
+            history = await service.chat_history(cid)
+        except Exception:
+            history = {}
+        branch_ids = [
+            event.get("branch_id")
+            for event in history.get("events", [])
+            if event.get("turn_index") == result["turn_index"]
+            and isinstance(event.get("branch_id"), int)
+        ]
+        if branch_ids:
+            branch_id = max(branch_ids)
+    if branch_id is not None:
+        result["branch_id"] = branch_id
+    return result
 
 
 @router.post("/{session_id}/creatures/{creature_id}/messages/{msg_idx}/rewind")

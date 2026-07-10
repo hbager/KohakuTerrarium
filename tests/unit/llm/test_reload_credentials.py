@@ -170,6 +170,20 @@ class TestAnthropicProviderReload:
         assert provider._api_key == "sk-ant-api03-NEWNEWNEW-yyyyyyy"
         assert provider._client is not old_client
 
+    def test_pool_rotation_rebuilds_with_first_key_and_preserves_pool(self, cfg_home):
+        _api_keys.save_api_key("anthropic", ["old-1", "old-2"])
+        provider = AnthropicProvider(
+            api_key=_api_keys.KeyPool(["old-1", "old-2"]),
+            model="claude-sonnet-4-5",
+        )
+        provider.provider_name = "anthropic"
+
+        _api_keys.save_api_key("anthropic", ["new-1", "new-2"])
+
+        assert provider.reload_credentials() is True
+        assert provider._api_key == "new-1"
+        assert provider._api_key_pool.keys == ("new-1", "new-2")
+
     def test_bearer_route_preserved_on_reload(self, cfg_home):
         # Routes like OpenRouter via the native Anthropic SDK go over
         # the Bearer path (auth_token=, not api_key=). The rebuilt

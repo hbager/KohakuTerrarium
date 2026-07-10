@@ -271,13 +271,13 @@
   },
   {
     "file": "src/kohakuterrarium/bootstrap/llm.py",
-    "line": 163,
+    "line": 209,
     "function": "_create_from_profile",
     "reason": "test-only fake_test backend; FakeLLMProvider imported lazily so production runtime never loads the testing package"
   },
   {
     "file": "src/kohakuterrarium/bootstrap/llm.py",
-    "line": 216,
+    "line": 284,
     "function": "_create_from_profile",
     "reason": "LiteLLM is an optional extra (`kohakuterrarium[litellm]`); LiteLLMProvider imported lazily on the litellm backend branch so a minimal install without that extra keeps `kt --help` and core imports working"
   },
@@ -326,6 +326,18 @@
   {
     "file": "src/kohakuterrarium/launcher/_lock.py",
     "line": 85,
+    "function": "_release",
+    "reason": "Win32-only msvcrt import inside the `if sys.platform == 'win32'` branch of the cross-platform flock wrapper"
+  },
+  {
+    "file": "src/kohakuterrarium/utils/file_lock.py",
+    "line": 136,
+    "function": "_acquire",
+    "reason": "Win32-only msvcrt import inside the `if sys.platform == 'win32'` branch of the cross-platform flock wrapper"
+  },
+  {
+    "file": "src/kohakuterrarium/utils/file_lock.py",
+    "line": 158,
     "function": "_release",
     "reason": "Win32-only msvcrt import inside the `if sys.platform == 'win32'` branch of the cross-platform flock wrapper"
   },

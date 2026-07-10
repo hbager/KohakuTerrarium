@@ -225,7 +225,11 @@ class TestApiStudioJourney:
             _catalog_packages_ops.install_package_op(str(biome_src), editable=True)
             resp = client.get("/api/studio/catalog/plugins")
             assert resp.status_code == 200
-            assert "checkpoint" in {p["name"] for p in resp.json()}
+            assert {
+                "cost_tracker",
+                "event_logger",
+                "multimodal_guard",
+            } <= {p["name"] for p in resp.json()}
             resp = client.get("/api/studio/catalog/inputs")
             assert resp.status_code == 200
             assert "discord_input" in {i["name"] for i in resp.json()}

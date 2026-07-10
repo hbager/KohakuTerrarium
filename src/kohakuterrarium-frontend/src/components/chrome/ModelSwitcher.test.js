@@ -78,7 +78,7 @@ describe("ModelSwitcher — workspace model catalog refresh", () => {
         stubs: {
           "el-select": { template: "<div><slot /></div>" },
           "el-option": { template: "<div />" },
-          "el-popover": { template: "<div><slot name='reference' /><slot /></div>" },
+          "el-drawer": { template: "<div><slot /></div>" },
           "el-input": { template: "<div />" },
           "el-button": { template: "<button><slot /></button>" },
           "el-icon": { template: "<span><slot /></span>" },
@@ -137,7 +137,7 @@ describe("ModelSwitcher — workspace model catalog refresh", () => {
         stubs: {
           "el-select": { template: "<div><slot /></div>" },
           "el-option": { template: "<div />" },
-          "el-popover": { template: "<div><slot name='reference' /><slot /></div>" },
+          "el-drawer": { template: "<div><slot /></div>" },
           "el-input": { template: "<div />" },
           "el-button": { template: "<button v-bind='$attrs'><slot /></button>" },
           "el-icon": { template: "<span><slot /></span>" },
@@ -162,6 +162,57 @@ describe("ModelSwitcher — workspace model catalog refresh", () => {
     expect(chat.sessionInfo.llmName).toBe("aaaaa/gpt-5.5-custom@reasoning=xhigh,speed=fast")
   })
 
+  it("falls back to a valid target when the chat store has a stale tab", async () => {
+    mockCurrentInstance.value = {
+      id: "terrarium-1",
+      graph_id: "graph-1",
+      type: "terrarium",
+      creatures: [{ name: "worker" }],
+    }
+    const chat = useChatStore()
+    chat.activeTab = "stale-creature"
+    configAPI.getModels.mockResolvedValueOnce([
+      { provider: "openai", name: "gpt", model: "gpt", available: true },
+    ])
+    terrariumAPI.switchCreatureModel.mockResolvedValueOnce({
+      status: "switched",
+      model: "openai/gpt",
+    })
+    sessionAPI.getActive.mockResolvedValueOnce({
+      session_id: "terrarium-1",
+      name: "team",
+      creatures: [{ name: "worker", running: true, llm_name: "openai/gpt" }],
+      channels: [],
+    })
+
+    const wrapper = mount(ModelSwitcher, {
+      props: { instanceId: "terrarium-1" },
+      global: {
+        stubs: {
+          "el-select": { template: "<div><slot /></div>" },
+          "el-option": { template: "<div />" },
+          "el-drawer": { template: "<div><slot /></div>" },
+          "el-input": { template: "<div />" },
+          "el-button": { template: "<button v-bind='$attrs'><slot /></button>" },
+          "el-icon": { template: "<span><slot /></span>" },
+        },
+      },
+    })
+    mountedWrappers.push(wrapper)
+    await flushPromises()
+
+    const modelButton = wrapper.findAll("button").find((button) => button.text().includes("gpt"))
+    await modelButton.trigger("click")
+
+    const switchButton = wrapper
+      .findAll("button")
+      .find((button) => button.text().trim() === "Switch")
+    await switchButton.trigger("click")
+    await flushPromises()
+
+    expect(terrariumAPI.switchCreatureModel).toHaveBeenCalledWith("graph-1", "worker", "openai/gpt")
+  })
+
   it("reloads models when settings changes the model catalog", async () => {
     configAPI.getModels
       .mockResolvedValueOnce([{ provider: "openai", name: "gpt", model: "gpt", available: true }])
@@ -175,7 +226,7 @@ describe("ModelSwitcher — workspace model catalog refresh", () => {
         stubs: {
           "el-select": { template: "<div><slot /></div>" },
           "el-option": { template: "<div />" },
-          "el-popover": { template: "<div><slot name='reference' /><slot /></div>" },
+          "el-drawer": { template: "<div><slot /></div>" },
           "el-input": { template: "<div />" },
           "el-button": { template: "<button><slot /></button>" },
           "el-icon": { template: "<span><slot /></span>" },

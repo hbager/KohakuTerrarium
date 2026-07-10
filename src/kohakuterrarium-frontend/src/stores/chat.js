@@ -11,8 +11,21 @@ import { useNotificationsStore } from "@/stores/notifications"
 import { useStatusStore } from "@/stores/status"
 import { translate } from "@/utils/i18n"
 import { useLocaleStore } from "@/stores/locale"
-import { getHybridPrefSync, removeHybridPref, setHybridPref } from "@/utils/uiPrefs"
+import { readLocalJsonPref, writeLocalJsonPref } from "@/utils/uiPrefs"
 import { wsUrl } from "@/utils/wsUrl"
+
+const EMPTY_TOKEN_USAGE = {
+  prompt: 0,
+  completion: 0,
+  total: 0,
+  cached: 0,
+  lastPrompt: 0,
+}
+
+export function tokenUsageForTab(state, tab) {
+  const source = tab === "root" ? state._rootSourceName : tab
+  return (source && state.tokenUsage[source]) || EMPTY_TOKEN_USAGE
+}
 
 const BRANCH_RESYNC_DELAY_MS = 350
 
@@ -1380,6 +1393,22 @@ const _chatStoreOptions = {
       // worker-id). Set from the session payload at attach time.
       homeNode: "_host",
     },
+    /**
+     * Per-creature model info, keyed by tab/source name (WS
+     * ``session_info`` events carry the emitting creature's name as
+     * ``source``). ``sessionInfo`` above only tracks the PRIMARY
+     * creature — before this map existed, every display surface read
+     * the global object, so switching to another creature's tab kept
+     * showing the primary's model.
+     * @type {Object<string, {model: string, llmName: string, maxContext: number, compactThreshold: number}>}
+     */
+    modelByTab: {},
+    /** Real creature name behind the ``root`` tab alias (recipe
+     *  terrariums), so source-keyed WS events also refresh the
+     *  ``root`` entry. @type {string | null} */
+    _rootSourceName: null,
+    /** Stable source name for the session-level primary fallback. @type {string | null} */
+    _primarySourceName: null,
     /** Reactive tick counter - incremented every second when jobs are running */
     _jobTick: 0,
     /** @type {number | null} */
@@ -1528,13 +1557,35 @@ const _chatStoreOptions = {
       return view[target.turnIndex] === target.branchId
     },
     /**
-     * Canonical display form of the active model, preferring the
+     * Model info for the ACTIVE tab's creature, falling back to the
+     * session-level (primary creature) values when the per-tab entry
+     * hasn't been populated yet. Numeric fields treat 0 as unknown.
+     */
+    activeModelInfo(state) {
+      const tab = state.activeTab
+      const info = (tab && state.modelByTab[tab]) || {}
+      return {
+        model: info.model || state.sessionInfo.model || "",
+        llmName: info.llmName || state.sessionInfo.llmName || "",
+        maxContext: info.maxContext || state.sessionInfo.maxContext || 0,
+        compactThreshold: info.compactThreshold || state.sessionInfo.compactThreshold || 0,
+      }
+    },
+    /** Token usage for the active creature, resolving the root tab alias. */
+    activeTokenUsage(state) {
+      return tokenUsageForTab(state, state.activeTab)
+    },
+    /**
+     * Canonical display form of the ACTIVE tab's model, preferring the
      * ``provider/name[@variations]`` identifier so every display surface
      * shows the same string the user types into ``/model``. Falls back
      * to the raw API model id when ``llm_name`` hasn't been populated
      * yet (very first moments before the session_info event arrives).
      */
-    modelDisplay: (state) => state.sessionInfo.llmName || state.sessionInfo.model || "",
+    modelDisplay() {
+      const info = this.activeModelInfo
+      return info.llmName || info.model || ""
+    },
     /** Active creature target for per-creature endpoints. Returns the
      *  active tab name when the user is on a creature tab (not a
      *  channel tab). Used by side panels (scratchpad, env, …) to
@@ -1645,6 +1696,36 @@ const _chatStoreOptions = {
         homeNode: instance.home_node || instance.creatures?.[0]?.home_node || "_host",
       }
 
+      // Seed per-creature model info from the instance payload so
+      // non-primary tabs show THEIR creature's model before any WS
+      // session_info event arrives. The ``root`` tab aliases the
+      // privileged creature; mirror its entry and remember the real
+      // name so source-keyed WS events refresh both.
+      this.modelByTab = {}
+      this._rootSourceName = null
+      const primaryCreature =
+        (instance.has_root &&
+          (instance.creatures || []).find(
+            (creature) => creature.is_root || creature.is_privileged,
+          )) ||
+        instance.creatures?.[0] ||
+        null
+      this._primarySourceName = primaryCreature?.name || null
+      for (const c of instance.creatures || []) {
+        if (!c?.name) continue
+        const info = {
+          model: c.model || "",
+          llmName: c.llm_name || c.model || "",
+          maxContext: c.max_context || 0,
+          compactThreshold: c.compact_threshold || 0,
+        }
+        this.modelByTab[c.name] = info
+        if (instance.has_root && (c.is_root || c.is_privileged)) {
+          this._rootSourceName = c.name
+          this.modelByTab["root"] = { ...info }
+        }
+      }
+
       // Reset status store too. Actions run detached from any Vue
       // setup context, so ``injectScope()`` would return null —
       // recover scope from this store's ``$id`` (registered as
@@ -1695,6 +1776,27 @@ const _chatStoreOptions = {
 
     openTab(tabKey) {
       this._addTab(tabKey)
+      // When groups are active, the chat view renders from the per-group
+      // active tab (``groups[gid].activeTab``); the legacy ``activeTab``
+      // is DERIVED from the focused group by ``_syncLegacyFromGroups``.
+      // ``_addTab`` only sets a group's activeTab when it was empty, so
+      // clicking an already-open creature (CreaturesPanel / StatusDashboard
+      // / AttachTab) wouldn't switch the visible chat. Drive the owning
+      // group's focus + active tab explicitly, mirroring
+      // ``ChatPanel.onTabClick``, so every "open tab" entry point switches.
+      if (this.groupTree) {
+        let targetId = this.focusedGroupId || _firstLeafGroupId(this.groupTree)
+        for (const [gid, g] of Object.entries(this.groups)) {
+          if (g.tabs.includes(tabKey)) {
+            targetId = gid
+            break
+          }
+        }
+        if (targetId && this.groups[targetId]?.tabs.includes(tabKey)) {
+          this.setFocusedGroup(targetId)
+          this.setGroupActiveTab(targetId, tabKey)
+        }
+      }
       this.activeTab = tabKey
       this._saveTabs()
       // Always load history — the unified session endpoint handles
@@ -2311,14 +2413,38 @@ const _chatStoreOptions = {
       statusStore.handleActivity(data)
 
       if (at === "session_info") {
-        // Merge — update fields present in the event, keep existing for absent ones
+        // Session id is global regardless of which creature emitted.
         if (data.session_id) this.sessionInfo.sessionId = data.session_id
-        if (data.model) this.sessionInfo.model = data.model
-        if (data.llm_name) this.sessionInfo.llmName = data.llm_name
-        if (data.agent_name) this.sessionInfo.agentName = data.agent_name
-        if (data.max_context != null) this.sessionInfo.maxContext = data.max_context
-        if (data.compact_threshold != null)
-          this.sessionInfo.compactThreshold = data.compact_threshold
+        // Model fields are PER CREATURE — key them by the emitting
+        // source. Writing them straight into the global object let
+        // whichever creature spoke last stomp the model shown for
+        // every tab.
+        const info = {}
+        if (data.model) info.model = data.model
+        if (data.llm_name) info.llmName = data.llm_name
+        if (data.max_context != null) info.maxContext = data.max_context
+        if (data.compact_threshold != null) info.compactThreshold = data.compact_threshold
+        const tab = source || data.agent_name || ""
+        if (tab && Object.keys(info).length) {
+          this.modelByTab[tab] = { ...(this.modelByTab[tab] || {}), ...info }
+          if (tab === this._rootSourceName && this.tabs.includes("root")) {
+            this.modelByTab["root"] = { ...(this.modelByTab["root"] || {}), ...info }
+          }
+        }
+        // The global sessionInfo keeps tracking the PRIMARY (bound)
+        // creature only — it is the fallback for tabs with no entry.
+        const isPrimary =
+          !tab ||
+          tab === this._primarySourceName ||
+          (!this._primarySourceName && (tab === this._rootSourceName || tab === this.tabs[0]))
+        if (isPrimary) {
+          if (data.model) this.sessionInfo.model = data.model
+          if (data.llm_name) this.sessionInfo.llmName = data.llm_name
+          if (data.agent_name) this.sessionInfo.agentName = data.agent_name
+          if (data.max_context != null) this.sessionInfo.maxContext = data.max_context
+          if (data.compact_threshold != null)
+            this.sessionInfo.compactThreshold = data.compact_threshold
+        }
         return
       }
 
@@ -3114,8 +3240,7 @@ const _chatStoreOptions = {
         const resynced = await this._resyncHistory(tab)
         return resynced !== false
       } catch (e) {
-        const timedOut =
-          e?.code === "ECONNABORTED" || /timeout/i.test(String(e?.message || ""))
+        const timedOut = e?.code === "ECONNABORTED" || /timeout/i.test(String(e?.message || ""))
         if (timedOut && optimisticApplied && tab) {
           this._scheduleBranchResync(tab)
           console.warn("Edit message request timed out; keeping optimistic rerun state:", e)
@@ -3684,6 +3809,9 @@ const _chatStoreOptions = {
         maxContext: 0,
         homeNode: "_host",
       }
+      this.modelByTab = {}
+      this._rootSourceName = null
+      this._primarySourceName = null
       const statusStore = useStatusStore(scopeOfStoreId(this.$id))
       statusStore.reset()
     },
@@ -3724,20 +3852,19 @@ const _chatStoreOptions = {
     _saveTabs() {
       if (!this._instanceId) return
       const key = `chat-tabs-${this._instanceId}`
-      setHybridPref(
-        key,
-        {
-          tabs: this.tabs,
-          activeTab: this.activeTab,
-        },
-        { json: true },
-      )
+      // Per-instance tab state is transient UI state, not a UI
+      // setting — keep it in localStorage only so tab churn never
+      // reaches the ui-prefs API.
+      writeLocalJsonPref(key, {
+        tabs: this.tabs,
+        activeTab: this.activeTab,
+      })
     },
 
     _restoreTabs() {
       if (!this._instanceId) return
       const key = `chat-tabs-${this._instanceId}`
-      const saved = getHybridPrefSync(key, null, { json: true })
+      const saved = readLocalJsonPref(key, null)
       if (saved?.tabs?.length) {
         for (const tab of saved.tabs) {
           this._addTab(tab)
@@ -3776,8 +3903,9 @@ const _chatStoreOptions = {
 
     /** Persist groups + groupTree + focusedGroupId to localStorage
      *  under ``kt.chat.groupTree.<scope>``. Schema version ``1`` so
-     *  future shape changes can migrate. Idempotent and synchronous —
-     *  ``setHybridPref`` debounces internally on the storage side. */
+     *  future shape changes can migrate. localStorage only — group
+     *  churn is transient UI state and must not hit the ui-prefs
+     *  API. */
     _persistGroupState() {
       const scope = this._instanceId || "default"
       const key = _groupStorageKey(scope)
@@ -3785,7 +3913,7 @@ const _chatStoreOptions = {
         // No groups active — clear any stale storage so the next
         // load doesn't resurrect a stale tree.
         try {
-          removeHybridPref(key)
+          writeLocalJsonPref(key, null)
         } catch {
           /* swallow */
         }
@@ -3799,7 +3927,7 @@ const _chatStoreOptions = {
         _groupCounter: this._groupCounter,
       }
       try {
-        setHybridPref(key, payload, { json: true })
+        writeLocalJsonPref(key, payload)
       } catch {
         /* swallow — storage may be unavailable */
       }
@@ -3812,7 +3940,7 @@ const _chatStoreOptions = {
       const key = _groupStorageKey(scope)
       let saved = null
       try {
-        saved = getHybridPrefSync(key, null, { json: true })
+        saved = readLocalJsonPref(key, null)
       } catch {
         return false
       }

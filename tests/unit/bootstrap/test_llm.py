@@ -19,6 +19,7 @@ from kohakuterrarium.bootstrap.llm import (
     create_llm_from_profile_name,
 )
 from kohakuterrarium.core.config_types import AgentConfig
+from kohakuterrarium.errors import LLMNotConfiguredError
 from kohakuterrarium.llm.anthropic_provider import AnthropicProvider
 from kohakuterrarium.llm.codex_provider import CodexOAuthProvider
 from kohakuterrarium.llm.openai import OpenAIProvider
@@ -104,6 +105,8 @@ class TestCreateLLMProviderProfilePath:
             max_context = 8000
             backend_provider_name = "openai"
             backend_native_tools = None
+            api_key_env = ""
+            base_url = ""
 
         def fake_resolve(data, override=None):
             captured["data"] = data
@@ -272,6 +275,20 @@ class TestCreateFromProfile:
         profile = LLMProfile(name="p", model="gpt-5", provider="", backend_type="codex")
         provider = _create_from_profile(profile)
         assert isinstance(provider, CodexOAuthProvider)
+
+    def test_codex_missing_base_url_env_does_not_fall_back_to_oauth(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("KT_CODEX_ENDPOINT", raising=False)
+        profile = LLMProfile(
+            name="custom",
+            model="gpt-5",
+            provider="custom",
+            backend_type="codex",
+            base_url="${KT_CODEX_ENDPOINT}",
+        )
+        with pytest.raises(LLMNotConfiguredError, match="base_url.*KT_CODEX_ENDPOINT"):
+            _create_from_profile(profile)
 
     def test_api_key_from_env_fallback(self, monkeypatch):
         # provider lookup misses, api_key_env hits.
@@ -544,3 +561,29 @@ class TestDeferredOnMissingKey:
         stub._init_llm()
         assert isinstance(stub.llm, DeferredLLMProvider)
         assert "defprofile" in stub.llm.reason
+
+
+class TestResolvedBaseUrl:
+    """Consume-time ``${VAR}`` interpolation of a profile's base_url."""
+
+    class _P:
+        def __init__(self, base_url, name="p"):
+            self.base_url = base_url
+            self.name = name
+
+    def test_interpolates_env_var(self, monkeypatch):
+        monkeypatch.setenv("KT_BU_HOST", "host.example")
+        assert (
+            llm_mod._resolved_base_url(self._P("${KT_BU_HOST}/v1")) == "host.example/v1"
+        )
+
+    def test_default_used_when_unset(self, monkeypatch):
+        monkeypatch.delenv("KT_BU_MISSING", raising=False)
+        assert (
+            llm_mod._resolved_base_url(self._P("${KT_BU_MISSING:https://fb/v1}"))
+            == "https://fb/v1"
+        )
+
+    def test_none_when_empty(self):
+        assert llm_mod._resolved_base_url(self._P("")) is None
+        assert llm_mod._resolved_base_url(self._P(None)) is None

@@ -69,7 +69,9 @@ vi.mock("@/components/settings/AboutPanel.vue", () => ({ default: { template: "<
 vi.mock("@/components/settings/AdvancedPanel.vue", () => ({ default: { template: "<div />" } }))
 vi.mock("@/components/settings/BackendForm.vue", () => ({ default: { template: "<div />" } }))
 vi.mock("@/components/settings/CodexLoginModal.vue", () => ({ default: { template: "<div />" } }))
-vi.mock("@/components/settings/modals/MCPServerEditModal.vue", () => ({ default: { template: "<div />" } }))
+vi.mock("@/components/settings/modals/MCPServerEditModal.vue", () => ({
+  default: { template: "<div />" },
+}))
 vi.mock("@/components/settings/SitesPane.vue", () => ({ default: { template: "<div />" } }))
 vi.mock("@/components/settings/UpdatesPanel.vue", () => ({ default: { template: "<div />" } }))
 vi.mock("@/components/cluster/SitePicker.vue", () => ({ default: { template: "<div />" } }))
@@ -77,7 +79,8 @@ vi.mock("@/components/settings/PresetEditor.vue", () => ({
   default: defineComponent({
     props: ["preset", "backends", "mode"],
     emits: ["set-default"],
-    template: "<button class='set-default' @click='$emit(\"set-default\", preset)'>settings.models.setAsDefault</button>",
+    template:
+      "<button class='set-default' @click='$emit(\"set-default\", preset)'>settings.models.setAsDefault</button>",
   }),
 }))
 
@@ -100,7 +103,9 @@ function mountSettingsPage() {
         "el-tabs": tabsStub,
         "el-tab-pane": tabPaneStub,
         "el-input": { template: "<div />" },
-        "el-button": { template: "<button v-bind='$attrs' @click='$emit(\"click\")'><slot /></button>" },
+        "el-button": {
+          template: "<button v-bind='$attrs' @click='$emit(\"click\")'><slot /></button>",
+        },
         "el-tag": { template: "<span><slot /></span>" },
         "el-select": { template: "<select><slot /></select>" },
         "el-option": { template: "<option />" },
@@ -117,7 +122,9 @@ describe("SettingsPage default model selection", () => {
   beforeEach(() => {
     vi.clearAllMocks()
     settingsAPI.getKeys.mockResolvedValue({ providers: [] })
-    settingsAPI.getBackends.mockResolvedValue({ backends: [{ name: "openrouter", built_in: true }] })
+    settingsAPI.getBackends.mockResolvedValue({
+      backends: [{ name: "openrouter", built_in: true }],
+    })
     settingsAPI.getNativeTools.mockResolvedValue({ tools: [] })
     settingsAPI.listMCP.mockResolvedValue({ servers: [] })
     configAPI.getModels.mockResolvedValue([
@@ -128,9 +135,13 @@ describe("SettingsPage default model selection", () => {
         source: "user",
         available: true,
         variation_groups: {},
+        selected_variations: { speed: "fast", reasoning: "xhigh" },
       },
     ])
-    settingsAPI.setDefaultModel.mockResolvedValue({ status: "set", default_model: "openrouter/gpt-5.5-custom" })
+    settingsAPI.setDefaultModel.mockResolvedValue({
+      status: "set",
+      default_model: "openrouter/gpt-5.5-custom",
+    })
   })
 
   it("sets the default model with provider/name instead of the ambiguous bare preset name", async () => {
@@ -138,17 +149,29 @@ describe("SettingsPage default model selection", () => {
     await flushPromises()
     await nextTick()
 
-    const presetRow = wrapper.findAll("button").find((button) => button.text().includes("gpt-5.5-custom"))
+    const presetRow = wrapper
+      .findAll("button")
+      .find((button) => button.text().includes("gpt-5.5-custom"))
     expect(presetRow).toBeTruthy()
     await presetRow.trigger("click")
     await nextTick()
 
-    const setDefaultButton = wrapper.findAll("button").find((button) => button.text().includes("settings.models.setAsDefault"))
+    const catalogEvents = []
+    window.addEventListener("model:catalog-changed", (event) => catalogEvents.push(event), {
+      once: true,
+    })
+
+    const setDefaultButton = wrapper
+      .findAll("button")
+      .find((button) => button.text().includes("settings.models.setAsDefault"))
     expect(setDefaultButton).toBeTruthy()
     await setDefaultButton.trigger("click")
     await flushPromises()
     await nextTick()
 
-    expect(settingsAPI.setDefaultModel).toHaveBeenCalledWith("openrouter/gpt-5.5-custom")
+    expect(settingsAPI.setDefaultModel).toHaveBeenCalledWith(
+      "openrouter/gpt-5.5-custom@reasoning=xhigh,speed=fast",
+    )
+    expect(catalogEvents).toHaveLength(1)
   })
 })

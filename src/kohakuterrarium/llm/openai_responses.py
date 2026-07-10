@@ -288,9 +288,6 @@ class OpenAIResponsesProvider(BaseLLMProvider):
             cache_key = hashlib.sha256(instructions.encode()).hexdigest()[:32]
         if cache_key:
             create_kwargs.setdefault("prompt_cache_key", cache_key)
-            headers = dict(create_kwargs.get("extra_headers") or {})
-            headers.setdefault("session_id", cache_key)
-            create_kwargs["extra_headers"] = headers
 
         self._apply_request_api_key(create_kwargs)
         logger.debug(

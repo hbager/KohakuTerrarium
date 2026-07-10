@@ -2,15 +2,10 @@
 
 Behavior-first: assert the exact Responses-API ``input`` items produced
 from Chat Completions messages, the function_call / function_call_output
-pairing repair, multimodal tool-output array form, and artifact-URL
-resolution to data URLs (with on-disk fixtures).
+pairing repair, and multimodal tool-output array form.
 """
 
-import base64
-
-from kohakuterrarium.llm import codex_format
 from kohakuterrarium.llm.codex_format import (
-    _resolve_artifact_url,
     fix_tool_call_pairing,
     maybe_capture_stream_rate_limit,
     to_responses_input,
@@ -169,45 +164,6 @@ class TestFixToolCallPairing:
             "output": "ok",
         }
         assert out[2]["role"] == "user"
-
-
-class TestResolveArtifactUrl:
-    def test_non_artifact_url_passed_through(self):
-        assert _resolve_artifact_url("https://example.com/x.png") == (
-            "https://example.com/x.png"
-        )
-        assert _resolve_artifact_url("data:image/png;base64,QUJD") == (
-            "data:image/png;base64,QUJD"
-        )
-
-    def test_non_string_input_passed_through(self):
-        assert _resolve_artifact_url(None) is None
-
-    def test_malformed_artifact_path_passed_through(self):
-        # starts with /api/sessions/ but doesn't match the full pattern
-        assert _resolve_artifact_url("/api/sessions/onlysid") == "/api/sessions/onlysid"
-
-    def test_artifact_resolved_to_data_url(self, tmp_path, monkeypatch):
-        # lay down a real artifact file the resolver can read.
-        # layout: <session_dir>/<session_name>.artifacts/<rel>
-        session_dir = tmp_path / "sessions"
-        artifacts = session_dir / "sid123.artifacts"
-        artifacts.mkdir(parents=True)
-        (artifacts / "pic.png").write_bytes(b"PNGDATA")
-        monkeypatch.setattr(codex_format, "_session_dir", lambda: session_dir)
-
-        out = _resolve_artifact_url("/api/sessions/sid123/artifacts/pic.png")
-        assert out.startswith("data:image/png;base64,")
-        # base64 of b"PNGDATA"
-        assert out == "data:image/png;base64," + base64.b64encode(b"PNGDATA").decode()
-
-    def test_missing_artifact_file_falls_back_to_original_url(
-        self, tmp_path, monkeypatch
-    ):
-        monkeypatch.setattr(codex_format, "_session_dir", lambda: tmp_path)
-        url = "/api/sessions/sid/artifacts/nope.png"
-        # file does not exist → resolver swallows the error and returns input
-        assert _resolve_artifact_url(url) == url
 
 
 class _Event:

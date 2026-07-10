@@ -104,6 +104,33 @@ class TestResolveCreatureId:
         # Same id WITH the right session resolves fine.
         assert await resolve_creature_id(svc, "cid-a", "graph_aaa") == "cid-a"
 
+    async def test_cluster_primary_scope_includes_linked_member_graphs(self):
+        svc = _FakeService(
+            [
+                _info("cid-a", "alice", graph_id="graph_aaa"),
+                _info("cid-b", "bob", graph_id="graph_bbb"),
+            ]
+        )
+        svc._cluster_links = {
+            frozenset({("worker-a", "graph_aaa"), ("worker-b", "graph_bbb")})
+        }
+
+        assert await resolve_creature_id(svc, "cid-b", "graph_aaa") == "cid-b"
+        assert await resolve_creature_id(svc, "bob", "graph_aaa") == "cid-b"
+
+    async def test_session_scope_does_not_include_unlinked_graphs(self):
+        svc = _FakeService(
+            [
+                _info("cid-a", "alice", graph_id="graph_aaa"),
+                _info("cid-b", "bob", graph_id="graph_bbb"),
+            ]
+        )
+        svc._cluster_links = set()
+
+        with pytest.raises(HTTPException) as exc:
+            await resolve_creature_id(svc, "cid-b", "graph_aaa")
+        assert exc.value.status_code == 404
+
     async def test_global_search_when_session_id_omitted(self):
         # Back-compat: callers that pre-date the v2 session-scoped
         # routes (tests + a few internal callers) pass ``session_id=None``

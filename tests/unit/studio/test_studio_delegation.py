@@ -483,7 +483,7 @@ class TestIdentityLlmDefaultForward:
             # Save a profile, set it as default, read the default back.
             s.identity.llm.save_profile("defprofile", "gpt-4o", "openai")
             s.identity.llm.set_default("defprofile")
-            assert s.identity.llm.get_default() == "defprofile"
+            assert s.identity.llm.get_default() == "openai/defprofile"
         finally:
             await s.shutdown()
 

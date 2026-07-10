@@ -116,18 +116,18 @@ class TestSessionIndexHook:
 
     def test_event_flush_debounced_by_time(self, idx, tmp_path, monkeypatch):
         # Use n=999 so count never fires; advance monotonic clock
-        # manually to trigger the time gate.
+        # manually to trigger the time gate deterministically.
+        now = 100.0
+        monkeypatch.setattr(
+            "kohakuterrarium.studio.persistence.session_index.hooks.time.monotonic",
+            lambda: now,
+        )
         s = _make_store(tmp_path, "alice")
         try:
             hook = SessionIndexHook(
                 s, idx, flush_every_n_events=999, flush_every_seconds=0.001
             )
-            # Default ``time.monotonic`` runs in real time; with our
-            # tiny ``flush_every_seconds``, the next ``append_event``
-            # almost certainly trips the gate.
-            import time as _time
-
-            _time.sleep(0.01)
+            now += 0.001
             s.append_event("alice", "user_input", {"content": "after gate"})
             hook.detach()
         finally:

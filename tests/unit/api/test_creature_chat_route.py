@@ -203,6 +203,24 @@ class TestEditMessage:
         assert resp.status_code == 200
         assert resp.json()["branch_id"] == 2
 
+    def test_success_without_branch_id_when_history_lookup_fails(self):
+        client = _client(
+            _FakeService(
+                edit_returns=True,
+                raise_on={"chat_history": RuntimeError("temporarily unavailable")},
+            )
+        )
+        resp = client.post(
+            "/sessions/g/creatures/alice/messages/0/edit",
+            json={"content": "new text", "turn_index": 1},
+        )
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "status": "edited",
+            "turn_index": 1,
+            "user_position": None,
+        }
+
     def test_with_content_list(self):
         client = _client(_FakeService(edit_returns=True))
         resp = client.post(
@@ -213,6 +231,14 @@ class TestEditMessage:
 
     def test_not_edited(self):
         client = _client(_FakeService(edit_returns=False))
+        resp = client.post(
+            "/sessions/g/creatures/alice/messages/0/edit",
+            json={"content": "x"},
+        )
+        assert resp.status_code == 400
+
+    def test_dict_result_with_explicit_false_is_not_edited(self):
+        client = _client(_FakeService(edit_returns={"edited": False, "branch_id": 3}))
         resp = client.post(
             "/sessions/g/creatures/alice/messages/0/edit",
             json={"content": "x"},

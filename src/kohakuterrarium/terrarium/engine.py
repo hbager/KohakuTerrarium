@@ -637,6 +637,7 @@ class Terrarium:
         strict: bool = True,
         session: "bool | str | Path | SessionStore | None" = None,
         creature_builder=None,
+        _on_graph_created=None,
     ) -> GraphTopology:
         """Apply a terrarium recipe into this engine.
 
@@ -651,6 +652,8 @@ class Terrarium:
             "strict": strict,
             "creature_builder": creature_builder,
         }
+        if _on_graph_created is not None:
+            kwargs["_on_graph_created"] = _on_graph_created
         if llm is not None:
             kwargs["llm"] = llm
         topo = await _recipe.apply_recipe(self, recipe, **kwargs)
@@ -700,7 +703,7 @@ class Terrarium:
                     await c.stop()
                 except Exception as e:  # pragma: no cover - defensive
                     _shutdown_log_warning(c.creature_id, str(e))
-        # Close every store this engine minted — without this, files
+        # Close every store owned by this engine — without this, files
         # stay status="running" forever (the HW4 case: 61 stuck files).
         _autosession.close_owned_stores(self)
         # Terminate live subscribers — ``async for ev in t.subscribe()``
@@ -788,6 +791,20 @@ class Terrarium:
         See ``terrarium.session_coord`` for merge/split details.
         """
         gid = self._resolve_graph_id(graph)
+        # Replacing a graph's store: close the previous one first so its
+        # native handles + writer lock are released before the new (or a
+        # freshly-minted) store opens the same file. Without this, an
+        # autosession-minted store that is then re-attached gets orphaned
+        # with its writer lock still held, which blocks a later resume.
+        previous = self._session_stores.get(gid)
+        if previous is not None and previous is not store:
+            try:
+                previous.close(update_status=False)
+            except Exception:  # pragma: no cover - defensive
+                _logger.warning(
+                    "attach_session: closing replaced store failed", exc_info=True
+                )
+            self._owned_sessions.discard(gid)
         if isinstance(store, (str, Path)):
             names = [c.name for c in self._creatures.values() if c.graph_id == gid]
             store = _autosession.mint_store(self, gid, path=store, agents=names)
