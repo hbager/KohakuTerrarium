@@ -12,7 +12,7 @@ the public API from `builtins.tool_catalog`.
 | `__init__.py`                           | Imports all tools (triggers registration), re-exports catalog API                                                 |
 | `registry.py`                           | Backward-compatible re-exports from `builtins.tool_catalog`                                                       |
 | `bash.py`                               | `bash`: shell commands (+ `bash_windows.py`, `subprocess/shell_utils.py`)                                          |
-| `python.py`                             | `python`: subprocess python execution                                                                              |
+| `python.py`                             | `run_python`: subprocess python execution                                                                              |
 | `read.py`                               | `read`: read file contents with optional line range                                                               |
 | `write.py`                              | `write`: create or overwrite files                                                                                |
 | `edit.py`                               | `edit`: single-diff edit with guard rails; exports `check_edit_guards` / `build_result_diff` used by `multi_edit` |
