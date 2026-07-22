@@ -204,6 +204,9 @@ async def attach_for_new_creature(
         )
 
     config_path, snapshot = describe_build_input(config)
+    working_dir = getattr(
+        getattr(creature.agent, "executor", None), "_working_dir", None
+    )
     if path is None:
         # Default file name carries the creature id (``alice_3f2a...``)
         # — the saved-session list shows the stem, and ``alice_...`` is
@@ -221,6 +224,7 @@ async def attach_for_new_creature(
         config_snapshot=snapshot,
         agents=[creature.name],
         session_id=creature.creature_id,
+        pwd=str(working_dir) if working_dir is not None else None,
     )
     engine._owned_sessions.add(gid)
     await engine.attach_session(gid, store)

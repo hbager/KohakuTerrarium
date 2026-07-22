@@ -56,6 +56,19 @@ class TestAutosessionViaSessionDir:
         finally:
             reopened.close(update_status=False)
 
+    async def test_explicit_creature_pwd_is_persisted_in_meta(self, tmp_path):
+        session_dir = tmp_path / "runs"
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        config = _write_cfg(tmp_path)
+        t = Terrarium(pwd=str(tmp_path), session_dir=str(session_dir))
+        try:
+            c = await t.add_creature(str(config), pwd=str(workspace), start=False)
+            meta = t._session_stores[c.graph_id].load_meta()
+            assert meta["pwd"] == str(workspace)
+        finally:
+            await t.shutdown()
+
     async def test_session_false_disables_autosession(self, tmp_path):
         t = Terrarium(session_dir=str(tmp_path / "runs"))
         try:
