@@ -34,6 +34,7 @@ class LLMBackend:
     api_key_env: str = ""
     provider_name: str = ""
     provider_native_tools: list[str] = field(default_factory=list)
+    auth_mode: str = "api_key"
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"backend_type": self.backend_type}
@@ -41,6 +42,8 @@ class LLMBackend:
             data["base_url"] = self.base_url
         if self.api_key_env:
             data["api_key_env"] = self.api_key_env
+        if self.auth_mode != "api_key":
+            data["auth_mode"] = self.auth_mode
         if self.provider_name:
             data["provider_name"] = self.provider_name
         if self.provider_native_tools:
@@ -57,6 +60,7 @@ class LLMBackend:
             backend_type=data.get("backend_type") or data.get("provider", "openai"),
             base_url=data.get("base_url", ""),
             api_key_env=data.get("api_key_env", ""),
+            auth_mode=data.get("auth_mode", "api_key") or "api_key",
             provider_name=data.get("provider_name", ""),
             provider_native_tools=[str(tool) for tool in native_tools if tool],
         )
@@ -146,6 +150,7 @@ class LLMProfile:
     selected_variations: dict[str, str] = field(default_factory=dict)
     backend_provider_name: str = ""
     backend_native_tools: list[str] = field(default_factory=list)
+    auth_mode: str = "api_key"
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> "LLMProfile":
@@ -166,6 +171,7 @@ class LLMProfile:
             max_output=data.get("max_output", 65536),
             base_url=data.get("base_url", ""),
             api_key_env=data.get("api_key_env", ""),
+            auth_mode=data.get("auth_mode", "api_key") or "api_key",
             temperature=data.get("temperature"),
             reasoning_effort=data.get("reasoning_effort", ""),
             service_tier=data.get("service_tier", ""),
@@ -190,6 +196,8 @@ class LLMProfile:
             data["base_url"] = self.base_url
         if self.api_key_env:
             data["api_key_env"] = self.api_key_env
+        if self.auth_mode != "api_key":
+            data["auth_mode"] = self.auth_mode
         if self.temperature is not None:
             data["temperature"] = self.temperature
         if self.reasoning_effort:

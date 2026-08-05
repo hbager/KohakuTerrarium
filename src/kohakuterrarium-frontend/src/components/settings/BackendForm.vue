@@ -14,6 +14,13 @@
       </el-select>
     </div>
     <div class="col-span-2">
+      <label class="text-[11px] text-warm-400 mb-1 block">{{ t("settings.backends.authentication") }}</label>
+      <el-select :model-value="form.auth_mode" size="small" class="w-full" @update:model-value="updateField('auth_mode', $event)">
+        <el-option value="api_key" :label="t('settings.backends.authApiKey')" />
+        <el-option value="none" :label="t('settings.backends.authNone')" :disabled="form.backend_type !== 'openai'" />
+      </el-select>
+    </div>
+    <div class="col-span-2">
       <label class="text-[11px] text-warm-400 mb-1 block">{{ t("settings.backends.baseUrl") }}</label>
       <el-input :model-value="form.base_url" size="small" placeholder="https://api.example.com/v1" @update:model-value="updateField('base_url', $event)" />
     </div>

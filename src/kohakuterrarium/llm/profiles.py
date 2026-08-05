@@ -88,6 +88,10 @@ def save_backend(backend: LLMBackend) -> None:
     working.
     """
     backend.backend_type = validate_backend_type(backend.backend_type)
+    if backend.auth_mode not in {"api_key", "none"}:
+        raise ValueError(f"Unsupported auth mode: {backend.auth_mode}")
+    if backend.auth_mode == "none" and backend.backend_type != "openai":
+        raise ValueError("auth_mode 'none' is only supported by openai backends")
     data = _load_yaml()
     backends = load_backends()
     presets = load_presets()
@@ -156,6 +160,7 @@ def _resolve_preset(
         max_output=resolved_preset.max_output,
         base_url=provider.base_url if provider else "",
         api_key_env=provider.api_key_env if provider else "",
+        auth_mode=provider.auth_mode if provider else "api_key",
         temperature=resolved_preset.temperature,
         reasoning_effort=resolved_preset.reasoning_effort,
         service_tier=resolved_preset.service_tier,
@@ -640,6 +645,7 @@ def resolve_controller_llm(
 
     for key in (
         "temperature",
+        "auth_mode",
         "reasoning_effort",
         "service_tier",
         "max_tokens",
@@ -654,7 +660,9 @@ def resolve_controller_llm(
             profile.max_output = value
         elif key == "retry_policy":
             profile.retry_policy = deepcopy(value)
-        else:
+        elif key == "auth_mode" and value in {"api_key", "none"}:
+            profile.auth_mode = value
+        elif key != "auth_mode":
             setattr(profile, key, value)
 
     extra_body = controller_config.get("extra_body") or {}
@@ -697,6 +705,8 @@ def _is_available(provider_name: str) -> bool:
     if provider_name == "codex":
         return CodexTokens.load() is not None
     if backend:
+        if backend.auth_mode == "none":
+            return True
         if get_api_key(provider_name):
             return True
         if backend.api_key_env and get_api_key(backend.api_key_env):
@@ -728,6 +738,7 @@ def list_all() -> list[dict[str, Any]]:
             "provider": profile.provider,
             "login_provider": profile.provider,
             "backend_type": profile.backend_type,
+            "auth_mode": profile.auth_mode,
             "available": _is_available(profile.provider),
             "source": source,
             "max_context": profile.max_context,

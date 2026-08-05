@@ -8,7 +8,7 @@ Uses AsyncOpenAI for all API calls (streaming + non-streaming).
 import asyncio
 from typing import Any, AsyncIterator
 
-from openai import AsyncOpenAI
+from openai import AsyncOpenAI, Omit
 
 from kohakuterrarium.llm.anthropic_cache import (
     apply_anthropic_cache_markers,
@@ -88,6 +88,7 @@ class OpenAIProvider(BaseLLMProvider):
         model: str = "",
         base_url: str = OPENAI_BASE_URL,
         *,
+        auth_mode: str = "api_key",
         temperature: float = 0.7,
         max_tokens: int | None = None,
         reasoning_effort: str = "",
@@ -105,6 +106,7 @@ class OpenAIProvider(BaseLLMProvider):
             api_key: API key for authentication
             model: Model identifier
             base_url: API base URL (change for OpenRouter, etc.)
+            auth_mode: ``api_key`` (default) or ``none`` for public endpoints
             temperature: Sampling temperature
             max_tokens: Maximum tokens to generate
             reasoning_effort: Optional top-level OpenAI reasoning effort.
@@ -137,12 +139,24 @@ class OpenAIProvider(BaseLLMProvider):
         self.service_tier = service_tier
         self.echo_reasoning = bool(echo_reasoning)
         self._retry_policy = RetryPolicy.from_value(retry_policy)
-        self._api_key_pool = api_key if isinstance(api_key, KeyPool) else None
-        api_key_for_client = api_key.first if isinstance(api_key, KeyPool) else api_key
+        self._api_key_pool = (
+            api_key if isinstance(api_key, KeyPool) and auth_mode != "none" else None
+        )
+        api_key_for_client = (
+            api_key.first if isinstance(api_key, KeyPool) else api_key
+        )
+        if auth_mode == "none":
+            api_key_for_client = None
         self._api_key = api_key_for_client
+        self.auth_mode = auth_mode
         self._base_url_input = base_url
         self._timeout = timeout
-        self._extra_headers = extra_headers or {}
+        clean_extra_headers = {
+            key: value
+            for key, value in (extra_headers or {}).items()
+            if auth_mode != "none" or key.lower() != "authorization"
+        }
+        self._extra_headers = clean_extra_headers
         self._max_retries = max_retries
         self._last_usage: dict[str, int] = {}
         self._last_assistant_extra_fields: dict[str, Any] = {}
@@ -152,18 +166,26 @@ class OpenAIProvider(BaseLLMProvider):
         # which is fine for ``"anthropic.com" in ...`` matching.
         self.base_url: str = base_url or ""
 
-        if not api_key_for_client:
+        if auth_mode not in {"api_key", "none"}:
+            raise ValueError(f"Unsupported auth mode: {auth_mode}")
+        if not api_key_for_client and auth_mode != "none":
             raise ValueError(
                 "API key is required. "
                 "Set OPENROUTER_API_KEY or OPENAI_API_KEY environment variable."
             )
 
+        default_headers: dict[str, Any] = {
+            "User-Agent": ROOCODE_USER_AGENT,
+            **clean_extra_headers,
+        }
+        if auth_mode == "none":
+            default_headers["Authorization"] = Omit()
         self._client = AsyncOpenAI(
-            api_key=api_key_for_client,
+            api_key=api_key_for_client or "not-used",
             base_url=base_url,
             timeout=timeout,
             max_retries=max_retries,
-            default_headers={"User-Agent": ROOCODE_USER_AGENT, **(extra_headers or {})},
+            default_headers=default_headers,
         )
 
         # Log whether auto-caching will be engaged for this provider. One
@@ -210,6 +232,7 @@ class OpenAIProvider(BaseLLMProvider):
         clone._retry_policy = self._retry_policy
         clone._api_key_pool = self._api_key_pool
         clone._api_key = self._api_key
+        clone.auth_mode = self.auth_mode
         clone._base_url_input = self._base_url_input
         clone._timeout = self._timeout
         clone._extra_headers = dict(self._extra_headers)
@@ -260,6 +283,8 @@ class OpenAIProvider(BaseLLMProvider):
         in-flight requests against it either complete naturally or
         surface the rotation as a one-shot 401 on the next attempt.
         """
+        if self.auth_mode == "none":
+            return False
         lookup_key = getattr(self, "_credential_provider", "") or self.provider_name
         if not lookup_key:
             return False
@@ -336,7 +361,7 @@ class OpenAIProvider(BaseLLMProvider):
 
     def _apply_request_api_key(self, create_kwargs: dict[str, Any]) -> None:
         """Attach per-request auth headers when a key pool is configured."""
-        if not self._api_key_pool:
+        if self.auth_mode == "none" or not self._api_key_pool:
             return
         key = self._api_key_pool.next()
         if not key:

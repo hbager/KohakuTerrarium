@@ -557,7 +557,7 @@ refresh failed), `404` (no login).
 
 #### `GET /api/settings/backends`
 
-`{"backends": [{"name", "backend_type", "base_url", "api_key_env", "provider_name", "provider_native_tools", "built_in", "has_token", "available"}]}`.
+`{"backends": [{"name", "backend_type", "base_url", "api_key_env", "auth_mode", "provider_name", "provider_native_tools", "built_in", "has_token", "available"}]}`.
 
 #### `GET /api/settings/native-tools`
 
@@ -567,7 +567,10 @@ Return metadata for every provider-native built-in tool:
 #### `POST /api/settings/backends`
 
 - Body: `BackendRequest` (`name`, `backend_type` default `"openai"`,
-  `base_url`, `api_key_env`, `provider_name`, `provider_native_tools`).
+  `base_url`, `api_key_env`, `auth_mode` default `"api_key"`, `provider_name`,
+  `provider_native_tools`). `auth_mode: "none"` is supported only for
+  OpenAI-compatible `/chat/completions` backends and omits the
+  `Authorization` header entirely.
 - Response: `{"status": "saved", "name"}`.
 
 #### `DELETE /api/settings/backends/{name}`
@@ -579,7 +582,7 @@ deleted (`400`).
 
 #### `GET /api/settings/profiles`
 
-`{"profiles": [...]}` with fields `name, model, provider, backend_type, base_url, api_key_env, max_context, max_output, temperature, reasoning_effort, service_tier, extra_body`.
+`{"profiles": [...]}` with fields `name, model, provider, backend_type, base_url, api_key_env, auth_mode, max_context, max_output, temperature, reasoning_effort, service_tier, extra_body`.
 
 #### `POST /api/settings/profiles`
 
@@ -960,6 +963,7 @@ At least one of `message` or `content` must be provided.
 | `backend_type` | str | no | `"openai"` |
 | `base_url` | str | no | `""` |
 | `api_key_env` | str | no | `""` |
+| `auth_mode` | `"api_key"` \| `"none"` | no | `"api_key"` |
 | `provider_name` | str | no | `""` |
 | `provider_native_tools` | list[str] | no | `[]` |
 

@@ -56,9 +56,14 @@ class TestLlmBackends:
         captured = []
         monkeypatch.setattr(backends_mod, "save_backend", lambda b: captured.append(b))
         out = backends_mod.save_backend_record(
-            "mine", "openai", base_url="https://x", api_key_env="K"
+            "mine",
+            "openai",
+            base_url="https://x",
+            api_key_env="K",
+            auth_mode="none",
         )
         assert out.name == "mine"
+        assert out.auth_mode == "none"
         assert captured
 
     def test_remove_backend(self, monkeypatch):
@@ -233,6 +238,7 @@ class TestLlmProfiles:
             backend_type="openai",
             base_url="https://x",
             api_key_env="K",
+            auth_mode="none",
             max_context=128000,
             max_output=4096,
             temperature=0.5,
@@ -257,6 +263,7 @@ class TestLlmProfiles:
                 "backend_type": "openai",
                 "base_url": "https://x",
                 "api_key_env": "K",
+                "auth_mode": "none",
                 "max_context": 128000,
                 "max_output": 4096,
                 "temperature": 0.5,

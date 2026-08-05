@@ -1,4 +1,7 @@
 export default {
+  "settings.backends.authentication": "認證方式",
+  "settings.backends.authApiKey": "API key（Bearer token）",
+  "settings.backends.authNone": "無認證（不送出 Authorization 標頭）",
   "common.activity": "活動",
   "common.add": "新增",
   "common.agent": "生物配置",

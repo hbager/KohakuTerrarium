@@ -240,7 +240,7 @@ class TerrariumRuntimeAdapter:
             if isinstance(profile, dict):
                 self._stash_remote_preset(profile_name, profile)
                 prov = profile.get("provider") or ""
-                if prov:
+                if prov and (profile.get("auth_mode") or "api_key") != "none":
                     await cache.prefetch_for_provider(prov)
                 # If the profile uses Codex OAuth, the api_key path
                 # isn't enough — the worker's CodexOAuthProvider
@@ -256,7 +256,7 @@ class TerrariumRuntimeAdapter:
             model = getattr(config, "model", "") or ""
             if "/" in model:
                 prov = model.split("/", 1)[0]
-        if prov:
+        if prov and getattr(config, "auth_mode", "") != "none":
             await cache.prefetch_for_provider(prov)
 
     async def _prewarm_profile_by_selector(self, selector: str) -> None:
@@ -280,7 +280,7 @@ class TerrariumRuntimeAdapter:
             return
         self._stash_remote_preset(selector, profile)
         prov = profile.get("provider") or ""
-        if prov:
+        if prov and (profile.get("auth_mode") or "api_key") != "none":
             await cache.prefetch_for_provider(prov)
         if (profile.get("backend_type") or "") == "codex":
             await cache.prefetch_for_codex_if_needed()
@@ -320,6 +320,7 @@ class TerrariumRuntimeAdapter:
                 backend_type=backend_type,
                 base_url=profile.get("base_url", "") or "",
                 api_key_env=profile.get("api_key_env", "") or "",
+                auth_mode=profile.get("auth_mode", "api_key") or "api_key",
             )
         )
         try:
@@ -402,7 +403,11 @@ class TerrariumRuntimeAdapter:
                 # ``engine.add_creature`` so the creature's LLM
                 # provider sees the key during its build.
                 if self._identity_cache is not None:
-                    await self._prewarm_identity(config)
+                    selector = msg.body.get("llm")
+                    if isinstance(selector, str) and selector:
+                        await self._prewarm_profile_by_selector(selector)
+                    else:
+                        await self._prewarm_identity(config)
                 creature = await self._engine.add_creature(
                     config,
                     graph=msg.body.get("graph_id"),

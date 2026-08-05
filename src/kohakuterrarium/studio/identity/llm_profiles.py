@@ -35,6 +35,7 @@ def list_profiles_payload() -> list[dict[str, Any]]:
             "backend_type": p.backend_type,
             "base_url": p.base_url or "",
             "api_key_env": p.api_key_env or "",
+            "auth_mode": getattr(p, "auth_mode", "api_key"),
             "max_context": p.max_context,
             "max_output": p.max_output,
             "temperature": p.temperature,

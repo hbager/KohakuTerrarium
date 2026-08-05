@@ -537,6 +537,19 @@ class TestPrewarmIdentity:
         finally:
             await engine.shutdown()
 
+    async def test_prewarm_skips_provider_for_no_auth_profile(self):
+        engine = await TestTerrariumBuilder().build()
+        cache = _RecordingIdentityCache(
+            profile={"provider": "opencode-zen", "auth_mode": "none"}
+        )
+        adapter = TerrariumRuntimeAdapter(engine, _FakeNode(), identity_cache=cache)
+        try:
+            config = SimpleNamespace(llm_profile="zen-free", provider="", model="")
+            await adapter._prewarm_identity(config)
+            assert cache.providers == []
+        finally:
+            await engine.shutdown()
+
     async def test_prewarm_falls_back_to_model_prefix(self):
         engine = await TestTerrariumBuilder().build()
         cache = _RecordingIdentityCache()
@@ -546,6 +559,22 @@ class TestPrewarmIdentity:
             config = SimpleNamespace(llm_profile="", provider="", model="openai/gpt-4o")
             await adapter._prewarm_identity(config)
             assert cache.providers == ["openai"]
+        finally:
+            await engine.shutdown()
+
+    async def test_prewarm_inline_no_auth_skips_provider(self):
+        engine = await TestTerrariumBuilder().build()
+        cache = _RecordingIdentityCache()
+        adapter = TerrariumRuntimeAdapter(engine, _FakeNode(), identity_cache=cache)
+        try:
+            config = SimpleNamespace(
+                llm_profile="",
+                provider="opencode-zen",
+                model="deepseek-v4-flash-free",
+                auth_mode="none",
+            )
+            await adapter._prewarm_identity(config)
+            assert cache.providers == []
         finally:
             await engine.shutdown()
 

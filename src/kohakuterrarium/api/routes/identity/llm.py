@@ -31,6 +31,7 @@ class BackendRequest(BaseModel):
     backend_type: str = "openai"
     base_url: str = ""
     api_key_env: str = ""
+    auth_mode: str = "api_key"
     provider_name: str = ""
     provider_native_tools: list[str] = Field(default_factory=list)
 
@@ -65,6 +66,7 @@ async def create_backend(req: BackendRequest):
             backend_type=req.backend_type,
             base_url=req.base_url,
             api_key_env=req.api_key_env,
+            auth_mode=req.auth_mode,
             provider_name=req.provider_name,
             provider_native_tools=list(req.provider_native_tools or []),
         )

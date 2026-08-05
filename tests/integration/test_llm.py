@@ -303,6 +303,7 @@ class TestLlmIntegration:
             base_url="https://acme.example/v1",
             api_key_env="ACME_API_KEY",
             provider_native_tools=["image_gen"],
+            auth_mode="none",
         )
         preset = LLMPreset(
             name="acme-fast",
@@ -326,6 +327,7 @@ class TestLlmIntegration:
         assert rb.backend_type == "openai"
         assert rb.base_url == "https://acme.example/v1"
         assert rb.api_key_env == "ACME_API_KEY"
+        assert rb.auth_mode == "none"
         # User backends default provider_name to their own name.
         assert rb.provider_name == "acme"
         assert rb.provider_native_tools == ["image_gen"]
@@ -339,6 +341,7 @@ class TestLlmIntegration:
         assert rp.backend_type == "openai"
         assert rp.base_url == "https://acme.example/v1"
         assert rp.api_key_env == "ACME_API_KEY"
+        assert rp.auth_mode == "none"
         assert rp.max_context == 128000
         assert rp.max_output == 8192
         assert rp.temperature == 0.3
@@ -462,6 +465,7 @@ class TestLlmIntegration:
             model="rt-model",
             provider="acme",
             backend_type="openai",
+            auth_mode="none",
             temperature=0.5,
             reasoning_effort="high",
             extra_body={"k": 1},

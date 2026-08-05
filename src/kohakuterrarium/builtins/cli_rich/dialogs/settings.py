@@ -156,6 +156,17 @@ class SettingsOverlay:
         backends = load_backends()
         rows: list[dict[str, Any]] = []
         for name, backend in sorted(backends.items()):
+            if backend.auth_mode == "none":
+                rows.append(
+                    {
+                        "provider": name,
+                        "masked": "(no authentication)",
+                        "has_key": False,
+                        "env": "",
+                        "readonly": True,
+                    }
+                )
+                continue
             if backend.backend_type == "codex":
                 # Codex uses OAuth, not an API key — surface that fact but
                 # don't treat it as editable here (``kt login codex`` owns
@@ -192,6 +203,7 @@ class SettingsOverlay:
                     "backend_type": backend.backend_type,
                     "base_url": backend.base_url or "",
                     "api_key_env": backend.api_key_env or "",
+                    "auth_mode": backend.auth_mode,
                     "built_in": name in _BUILTIN_PROVIDERS,
                 }
             )
@@ -479,6 +491,13 @@ class SettingsOverlay:
                     hint="e.g. https://api.example.com/v1",
                 ),
                 FormField(
+                    label="Authentication",
+                    key="auth_mode",
+                    value=(row.get("auth_mode", "api_key") if row else "api_key"),
+                    options=["api_key", "none"],
+                    hint="none: omit Authorization header",
+                ),
+                FormField(
                     label="API key env",
                     key="api_key_env",
                     value=(row.get("api_key_env", "") if row else ""),
@@ -631,6 +650,7 @@ class SettingsOverlay:
                     backend_type=values.get("backend_type", "openai"),
                     base_url=values.get("base_url", ""),
                     api_key_env=values.get("api_key_env", ""),
+                    auth_mode=values.get("auth_mode", "api_key"),
                 )
                 save_backend(backend)
                 self._flash = f"Provider saved: {name}"

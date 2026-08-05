@@ -6,6 +6,7 @@ covered by the 3rd-party-provider exception in the coverage policy
 since each requires live API keys.
 """
 
+import httpx
 import pytest
 
 from kohakuterrarium.bootstrap import llm as llm_mod
@@ -311,6 +312,78 @@ class TestCreateFromProfile:
         # Both the provider name and the env-var name were consulted.
         assert seen == ["openai", "MY_KEY_ENV"]
 
+    async def test_no_auth_openai_backend_omits_authorization(self, monkeypatch):
+        seen = []
+
+        async def handle(request):
+            seen.append(request)
+            return httpx.Response(
+                200,
+                json={
+                    "id": "test",
+                    "object": "chat.completion",
+                    "created": 0,
+                    "model": "deepseek-v4-flash-free",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "OK"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+
+        monkeypatch.setattr(
+            llm_mod,
+            "get_api_key",
+            lambda key: pytest.fail("no-auth backend must not resolve an API key"),
+        )
+        profile = LLMProfile(
+            name="zen-free",
+            model="deepseek-v4-flash-free",
+            provider="opencode-zen",
+            backend_type="openai",
+            base_url="https://opencode.ai/zen/v1",
+            auth_mode="none",
+        )
+        factory_provider = _create_from_profile(profile)
+        assert factory_provider.auth_mode == "none"
+        await factory_provider.close()
+        provider = OpenAIProvider(
+            model=profile.model,
+            base_url=profile.base_url,
+            auth_mode="none",
+            extra_headers={"authorization": "Bearer must-not-leak"},
+        )
+        provider._api_key_pool = llm_mod._api_keys.KeyPool(["must-not-leak"])
+        provider.auth_mode = "none"
+        await provider._client._client.aclose()
+        provider._client._client = httpx.AsyncClient(
+            transport=httpx.MockTransport(handle)
+        )
+        try:
+            response = await provider._raw_complete_chat(
+                [{"role": "user", "content": "Reply only OK"}]
+            )
+        finally:
+            await provider.close()
+
+        assert response.content == "OK"
+        assert "authorization" not in seen[0].headers
+        assert seen[0].url == "https://opencode.ai/zen/v1/chat/completions"
+
+    def test_no_auth_rejected_for_non_openai_backend(self):
+        profile = LLMProfile(
+            name="bad",
+            model="claude-x",
+            provider="public-anthropic",
+            backend_type="anthropic",
+            auth_mode="none",
+        )
+        with pytest.raises(ValueError, match="only supported by openai"):
+            _create_from_profile(profile)
+
     def test_missing_api_key_raises_with_login_hint(self, monkeypatch):
         monkeypatch.setattr(llm_mod, "get_api_key", lambda key: "")
         monkeypatch.setattr(llm_mod._api_keys, "_resolver", None)
@@ -359,6 +432,17 @@ class TestCreateFromInline:
         provider = _create_from_inline(cfg)
         assert isinstance(provider, OpenAIProvider)
         assert provider.config.model == "gpt-4"
+
+    def test_openai_inline_no_auth(self):
+        cfg = AgentConfig(
+            name="a",
+            model="deepseek-v4-flash-free",
+            auth_mode="none",
+            base_url="https://opencode.ai/zen/v1",
+        )
+        provider = _create_from_inline(cfg)
+        assert isinstance(provider, OpenAIProvider)
+        assert provider.auth_mode == "none"
 
 
 # ── _apply_backend_native_identity ──────────────────────────────

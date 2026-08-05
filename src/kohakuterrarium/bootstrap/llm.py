@@ -189,6 +189,10 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
         backend_type=profile.backend_type,
     )
 
+    auth_mode = getattr(profile, "auth_mode", "api_key")
+    if auth_mode == "none" and profile.backend_type != "openai":
+        raise ValueError("auth_mode 'none' is only supported by openai backends")
+
     if profile.backend_type == "fake_test":
         # Test-only backend — used by the multi-node test harness to
         # exercise the FULL profile resolution + api-key fetch chain
@@ -249,12 +253,15 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
         _apply_backend_native_identity(provider, profile)
         return provider
 
-    api_key = get_api_key(profile.provider) if profile.provider else ""
-    if not api_key and profile.api_key_env:
+    no_auth = auth_mode == "none"
+    api_key = (
+        get_api_key(profile.provider) if profile.provider and not no_auth else ""
+    )
+    if not api_key and profile.api_key_env and not no_auth:
         api_key = get_api_key(profile.api_key_env)
     # Resolve ``${VAR}`` if stored keys are templates without collapsing pools.
     api_key = _interpolate_key_pool(api_key)
-    if not api_key:
+    if not api_key and not no_auth:
         # Worker mode: ``llm.api_keys._resolver`` is set; the controller's
         # identity store is the only valid source.  Setting the env var
         # on the worker is explicitly NOT consulted (host-canonical
@@ -325,6 +332,7 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
             api_key=api_key,
             base_url=base_url,
             model=profile.model,
+            auth_mode=auth_mode,
             temperature=profile.temperature,
             max_tokens=profile.max_output or None,
             reasoning_effort=profile.reasoning_effort or "",
@@ -339,7 +347,7 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
     # the user updates a key via Settings → Providers — built-in
     # backends leave the native-tool ``provider_name`` empty, so the
     # native-tool field alone is not enough.
-    if profile.provider:
+    if profile.provider and auth_mode != "none":
         provider._credential_provider = profile.provider
     _apply_backend_native_identity(provider, profile)
     return provider
@@ -406,8 +414,9 @@ def _create_from_inline(config: AgentConfig) -> LLMProvider:
     # Standard API key auth (OpenAI, OpenRouter, etc.). Native Anthropic is
     # explicit here so legacy inline ``provider: anthropic`` OpenAI-compatible
     # configs keep using the OpenAI-compatible transport.
-    api_key = config.get_api_key()
-    if not api_key:
+    no_auth = config.auth_mode == "none"
+    api_key = "" if no_auth else config.get_api_key()
+    if not api_key and not no_auth:
         env_hint = (
             f"Set the {config.api_key_env} environment variable."
             if config.api_key_env
@@ -447,6 +456,7 @@ def _create_from_inline(config: AgentConfig) -> LLMProvider:
         api_key=api_key,
         base_url=config.base_url,
         model=config.model,
+        auth_mode="none" if no_auth else "api_key",
         temperature=config.temperature,
         max_tokens=config.max_tokens,
         reasoning_effort=config.reasoning_effort,

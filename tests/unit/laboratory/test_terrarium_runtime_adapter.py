@@ -5,12 +5,14 @@ populated via ``TestTerrariumBuilder``; the lab transport is replaced
 by a fake ``LabRegistrar`` so the test never touches a real socket.
 """
 
+from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.laboratory._internal.app import AppMessage
 from kohakuterrarium.laboratory.adapters.terrarium_runtime import (
     TerrariumRuntimeAdapter,
     _NotHostedHere,
 )
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder
+from kohakuterrarium.terrarium.wire import pack_creature_build_input
 
 
 class _FakeNode:
@@ -250,6 +252,41 @@ class TestTopologyReads:
 
 
 class TestLifecycleOps:
+    async def test_add_creature_prewarms_llm_override_before_build(self):
+        engine = await TestTerrariumBuilder().with_creature("spawned").build()
+        adapter = TerrariumRuntimeAdapter(
+            engine, _FakeNode(), identity_cache=object()
+        )
+        calls = []
+
+        async def prewarm(selector):
+            calls.append(("prewarm", selector))
+
+        async def add_creature(config, **kwargs):
+            calls.append(("add", kwargs["llm"]))
+            return engine.get_creature("spawned")
+
+        adapter._prewarm_profile_by_selector = prewarm
+        engine.add_creature = add_creature
+        try:
+            out = await adapter._dispatch(
+                _msg(
+                    "add_creature",
+                    {
+                        "config": pack_creature_build_input(AgentConfig(name="spawned")),
+                        "llm": "opencode-zen/zen-free",
+                        "start": False,
+                    },
+                )
+            )
+            assert "error" not in out
+            assert calls == [
+                ("prewarm", "opencode-zen/zen-free"),
+                ("add", "opencode-zen/zen-free"),
+            ]
+        finally:
+            await engine.shutdown()
+
     async def test_remove_creature(self):
         adapter = await _make_adapter()
         try:
