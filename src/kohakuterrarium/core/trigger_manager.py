@@ -49,6 +49,7 @@ class TriggerManager:
     ) -> None:
         self._triggers: dict[str, BaseTrigger] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        self._dispatching: set[asyncio.Task] = set()
         self._created_at: dict[str, datetime] = {}
         self._process_event = process_event
         # Optional callback: (trigger_id, event) -> None
@@ -99,19 +100,7 @@ class TriggerManager:
         # Persist resumable triggers to session store
         if getattr(trigger, "resumable", False) and self._session_store:
             try:
-                self._session_store.save_state(
-                    self._agent_name,
-                    triggers=[
-                        {
-                            "trigger_id": tid,
-                            "type": type(t).__name__,
-                            "module": type(t).__module__,
-                            "data": t.to_resume_dict(),
-                        }
-                        for tid, t in self._triggers.items()
-                        if getattr(t, "resumable", False)
-                    ],
-                )
+                self._persist_resumable_triggers()
             except Exception as e:
                 logger.warning(
                     "Failed to save trigger state", error=str(e), exc_info=True
@@ -131,26 +120,59 @@ class TriggerManager:
         Returns:
             True if removed, False if not found
         """
-        trigger = self._triggers.pop(trigger_id, None)
+        trigger = self._triggers.get(trigger_id)
         if trigger is None:
             return False
 
+        if getattr(trigger, "resumable", False) and self._session_store:
+            self._persist_resumable_triggers(exclude=trigger_id)
+
         task = self._tasks.pop(trigger_id, None)
-        if task and not task.done():
+        self._triggers.pop(trigger_id, None)
+        self._created_at.pop(trigger_id, None)
+        stop_error: BaseException | None = None
+        try:
+            await trigger.stop()
+        except BaseException as e:
+            stop_error = e
+
+        if (
+            task
+            and task is not asyncio.current_task()
+            and task not in self._dispatching
+            and not task.done()
+        ):
             task.cancel()
             try:
                 await task
-            except asyncio.CancelledError:
-                pass
+            except asyncio.CancelledError as e:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    stop_error = e
             except Exception as e:
                 logger.warning(
                     "Trigger task cleanup error", error=str(e), exc_info=True
                 )
 
-        await trigger.stop()
-        self._created_at.pop(trigger_id, None)
+        if stop_error is not None:
+            raise stop_error
         logger.info("Trigger removed", trigger_id=trigger_id)
         return True
+
+    def _persist_resumable_triggers(self, exclude: str | None = None) -> None:
+        self._session_store.save_state(
+            self._agent_name,
+            triggers=[
+                {
+                    "trigger_id": tid,
+                    "type": type(t).__name__,
+                    "module": type(t).__module__,
+                    "data": t.to_resume_dict(),
+                }
+                for tid, t in self._triggers.items()
+                if tid != exclude and getattr(t, "resumable", False)
+            ],
+        )
 
     def get(self, trigger_id: str) -> TriggerInfo | None:
         """Get info about a trigger."""
@@ -204,6 +226,7 @@ class TriggerManager:
         for trigger in self._triggers.values():
             await trigger.stop()
         self._tasks.clear()
+        self._dispatching.clear()
         self._triggers.clear()
         self._created_at.clear()
         logger.debug("All triggers stopped")
@@ -244,7 +267,14 @@ class TriggerManager:
                                 error=str(e),
                                 exc_info=True,
                             )
-                    await self._process_event(event)
+                    task = asyncio.current_task()
+                    if task is not None:
+                        self._dispatching.add(task)
+                    try:
+                        await self._process_event(event)
+                    finally:
+                        if task is not None:
+                            self._dispatching.discard(task)
             except asyncio.CancelledError:
                 break
             except Exception as e:

@@ -16,7 +16,7 @@ logger = get_logger(__name__)
 
 @register_builtin("stop_task")
 class StopTaskTool(BaseTool):
-    """Cancel a running background tool or sub-agent by job ID."""
+    """Cancel a running background tool, sub-agent, or trigger by ID."""
 
     needs_context = True
 
@@ -26,7 +26,7 @@ class StopTaskTool(BaseTool):
 
     @property
     def description(self) -> str:
-        return "Cancel a running background task (tool or sub-agent) by job ID"
+        return "Cancel a running background task or trigger by ID"
 
     @property
     def execution_mode(self) -> ExecutionMode:
@@ -38,7 +38,9 @@ class StopTaskTool(BaseTool):
             "properties": {
                 "job_id": {
                     "type": "string",
-                    "description": "Job ID to cancel. Use [/jobs] to list running jobs.",
+                    "description": (
+                        "Job or trigger ID to cancel. Use [/jobs] to list running jobs."
+                    ),
                 },
             },
             "required": ["job_id"],
@@ -73,6 +75,15 @@ class StopTaskTool(BaseTool):
             if cancelled:
                 logger.info("Sub-agent cancelled", job_id=job_id)
                 return ToolResult(output=f"Cancelled sub-agent: {job_id}", exit_code=0)
+
+        # Runtime-installed triggers live outside the executor and sub-agent manager.
+        remove_trigger = getattr(agent, "remove_trigger", None)
+        if callable(remove_trigger) and await remove_trigger(job_id):
+            logger.info("Trigger cancelled", trigger_id=job_id)
+            return ToolResult(
+                output=f"Cancelled trigger: {job_id}",
+                exit_code=0,
+            )
 
         # Check if it exists but is already done
         status = agent.executor.get_status(job_id)

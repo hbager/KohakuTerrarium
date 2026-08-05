@@ -13,6 +13,7 @@ from kohakuterrarium.core.trigger_manager import (
     TriggerManager,
 )
 from kohakuterrarium.modules.trigger.base import BaseTrigger
+from kohakuterrarium.modules.trigger.timer import TimerTrigger
 
 # ── stub triggers ─────────────────────────────────────────────────
 
@@ -112,6 +113,64 @@ class TestAddRemoveList:
 
     async def test_remove_unknown_returns_false(self, mgr):
         assert await mgr.remove("nope") is False
+
+    async def test_trigger_can_remove_itself_from_child_task(self):
+        fires = 0
+        removed = asyncio.Event()
+        mgr = None
+
+        async def process(_event):
+            nonlocal fires
+            fires += 1
+            assert mgr is not None
+            remove_task = asyncio.create_task(mgr.remove("self-removing"))
+            assert await asyncio.wait_for(remove_task, timeout=1) is True
+            removed.set()
+
+        mgr = TriggerManager(process)
+        await mgr.add(TimerTrigger(interval=0.01), trigger_id="self-removing")
+        await asyncio.wait_for(removed.wait(), timeout=1)
+        await asyncio.sleep(0.03)
+
+        assert mgr.get("self-removing") is None
+        assert fires == 1
+
+    async def test_reused_id_keeps_new_trigger_dispatch_tracking(self):
+        mgr = None
+        new_started = asyncio.Event()
+        old_released = asyncio.Event()
+        new_removed = asyncio.Event()
+        fires: list[str] = []
+
+        async def process(event):
+            fires.append(event.content)
+            assert mgr is not None
+            if event.content == "old":
+                assert await asyncio.create_task(mgr.remove("same-id")) is True
+                await mgr.add(
+                    TimerTrigger(interval=0.01, prompt="new"),
+                    trigger_id="same-id",
+                )
+                await new_started.wait()
+                old_released.set()
+                return
+
+            new_started.set()
+            await old_released.wait()
+            assert await asyncio.wait_for(
+                asyncio.create_task(mgr.remove("same-id")), timeout=1
+            ) is True
+            new_removed.set()
+
+        mgr = TriggerManager(process)
+        await mgr.add(
+            TimerTrigger(interval=0.01, prompt="old"), trigger_id="same-id"
+        )
+        await asyncio.wait_for(new_removed.wait(), timeout=1)
+        await asyncio.sleep(0.03)
+
+        assert mgr.get("same-id") is None
+        assert fires == ["old", "new"]
 
     async def test_get_info_shape(self, mgr):
         tid = await mgr.add(_StubTrigger(), trigger_id="x")
@@ -276,6 +335,7 @@ class TestResumablePersistence:
         assert trig_entries[0]["type"] == "_ResumableTrigger"
         assert trig_entries[0]["data"] == {"saved": True}
         await mgr.remove("r1")
+        assert store.state_calls[-1]["triggers"] == []
 
     async def test_non_resumable_not_persisted(self, mgr):
         store = _StubStore()
@@ -385,6 +445,10 @@ class TestResumablePersistFailure:
         await mgr.add(_ResumableTrigger(), trigger_id="r1")
         # Trigger still registered.
         assert "r1" in mgr._triggers
+        with pytest.raises(RuntimeError, match="disk"):
+            await mgr.remove("r1")
+        assert mgr.get("r1") is not None
+        store.save_state = lambda *a, **kw: None
         await mgr.remove("r1")
 
 
@@ -417,6 +481,32 @@ class TestRemoveCancellationError:
         # which hits the ``except Exception`` log arm (143-144).
         ok = await mgr.remove(tid)
         assert ok is True
+
+    async def test_remove_propagates_caller_cancellation_during_cleanup(self, mgr):
+        trigger = _StubTrigger()
+        tid = await mgr.add(trigger)
+        original_task = mgr._tasks[tid]
+        original_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await original_task
+
+        cleanup_started = asyncio.Event()
+
+        async def _slow_cancel():
+            try:
+                await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await asyncio.sleep(10)
+
+        wrapped = asyncio.create_task(_slow_cancel())
+        mgr._tasks[tid] = wrapped
+        remove_task = asyncio.create_task(mgr.remove(tid))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        remove_task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await remove_task
 
 
 class TestRunLoopGenericException:

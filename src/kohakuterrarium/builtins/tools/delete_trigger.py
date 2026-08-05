@@ -2,9 +2,8 @@
 
 Counterpart to the ``add_timer`` / ``add_schedule`` / ``watch_channel``
 creation tools. Triggers live exclusively in
-``agent.trigger_manager._triggers`` — ``stop_task`` does not see them
-(it only knows the executor / sub-agent manager / direct-job tracker),
-so a dedicated tool is the cleanest mirror of the creation API.
+``agent.trigger_manager._triggers``; this dedicated tool mirrors the
+creation API while ``stop_task`` also accepts trigger ids.
 """
 
 from typing import Any
