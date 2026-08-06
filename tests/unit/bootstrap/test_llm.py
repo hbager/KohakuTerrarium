@@ -312,7 +312,7 @@ class TestCreateFromProfile:
         # Both the provider name and the env-var name were consulted.
         assert seen == ["openai", "MY_KEY_ENV"]
 
-    async def test_no_auth_openai_backend_omits_authorization(self, monkeypatch):
+    async def test_no_auth_openai_backend_sends_empty_authorization(self, monkeypatch):
         seen = []
 
         async def handle(request):
@@ -370,7 +370,7 @@ class TestCreateFromProfile:
             await provider.close()
 
         assert response.content == "OK"
-        assert "authorization" not in seen[0].headers
+        assert seen[0].headers["authorization"] == ""
         assert seen[0].url == "https://opencode.ai/zen/v1/chat/completions"
 
     def test_no_auth_rejected_for_non_openai_backend(self):

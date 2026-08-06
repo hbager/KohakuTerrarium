@@ -316,7 +316,7 @@ export default {
   "settings.backends.backendType": "Backend type",
   "settings.backends.authentication": "Authentication",
   "settings.backends.authApiKey": "API key (Bearer token)",
-  "settings.backends.authNone": "None (do not send Authorization header)",
+  "settings.backends.authNone": "None (send empty Authorization header)",
   "settings.backends.baseUrl": "Base URL",
   "settings.backends.save": "Save provider",
   "settings.backends.deleteConfirm": "Delete this provider?",

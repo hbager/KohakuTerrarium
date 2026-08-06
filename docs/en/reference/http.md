@@ -569,8 +569,8 @@ Return metadata for every provider-native built-in tool:
 - Body: `BackendRequest` (`name`, `backend_type` default `"openai"`,
   `base_url`, `api_key_env`, `auth_mode` default `"api_key"`, `provider_name`,
   `provider_native_tools`). `auth_mode: "none"` is supported only for
-  OpenAI-compatible `/chat/completions` backends and omits the
-  `Authorization` header entirely.
+  OpenAI-compatible `/chat/completions` backends and sends an empty
+  `Authorization` header without a bearer token.
 - Response: `{"status": "saved", "name"}`.
 
 #### `DELETE /api/settings/backends/{name}`

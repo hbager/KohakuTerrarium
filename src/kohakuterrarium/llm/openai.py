@@ -8,7 +8,7 @@ Uses AsyncOpenAI for all API calls (streaming + non-streaming).
 import asyncio
 from typing import Any, AsyncIterator
 
-from openai import AsyncOpenAI, Omit
+from openai import AsyncOpenAI
 
 from kohakuterrarium.llm.anthropic_cache import (
     apply_anthropic_cache_markers,
@@ -179,7 +179,7 @@ class OpenAIProvider(BaseLLMProvider):
             **clean_extra_headers,
         }
         if auth_mode == "none":
-            default_headers["Authorization"] = Omit()
+            default_headers["Authorization"] = ""
         self._client = AsyncOpenAI(
             api_key=api_key_for_client or "not-used",
             base_url=base_url,

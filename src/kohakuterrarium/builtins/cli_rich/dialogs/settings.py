@@ -495,7 +495,7 @@ class SettingsOverlay:
                     key="auth_mode",
                     value=(row.get("auth_mode", "api_key") if row else "api_key"),
                     options=["api_key", "none"],
-                    hint="none: omit Authorization header",
+                    hint="none: send an empty Authorization header",
                 ),
                 FormField(
                     label="API key env",
