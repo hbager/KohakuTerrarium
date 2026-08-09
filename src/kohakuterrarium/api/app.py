@@ -30,6 +30,10 @@ from kohakuterrarium.laboratory.adapters import (
 )
 from kohakuterrarium.serving.process_metrics import get_aggregator
 from kohakuterrarium.session.sync import SessionMirrorWriter
+from kohakuterrarium.studio.persistence.session_index import (
+    get_session_index_default,
+    push_index_update,
+)
 from kohakuterrarium.studio.sessions.lifecycle import get_session_meta
 from kohakuterrarium.terrarium import MultiNodeTerrariumService, Terrarium
 from kohakuterrarium.utils.logging import get_logger
@@ -231,8 +235,15 @@ async def lifespan(app: FastAPI):
         # Session mirror — workers tee their session events here so
         # Studio's persistence reads stay local-fast.  Mirror dir is
         # under the controller's configured session dir.
-        mirror_dir = Path(_session_dir()) / "mirror"
-        mirror_writer = SessionMirrorWriter(host_engine, mirror_dir)
+        session_dir = Path(_session_dir())
+        mirror_dir = session_dir / "mirror"
+        mirror_writer = SessionMirrorWriter(
+            host_engine,
+            mirror_dir,
+            on_meta_updated=partial(
+                push_index_update, index=get_session_index_default(session_dir)
+            ),
+        )
         # Membership watcher: keep the multi-node service's remote
         # registry in sync with the host's connected clients.
         membership_task = asyncio.create_task(

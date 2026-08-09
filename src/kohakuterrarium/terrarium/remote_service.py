@@ -234,6 +234,9 @@ class RemoteTerrariumService:
     async def remove_creature(self, creature_id: str) -> None:
         _maybe_raise(await self._req("remove_creature", {"creature_id": creature_id}))
 
+    async def remove_graph(self, graph_id: str) -> None:
+        _maybe_raise(await self._req("remove_graph", {"graph_id": graph_id}))
+
     async def start_creature(self, creature_id: str) -> None:
         _maybe_raise(await self._req("start_creature", {"creature_id": creature_id}))
 

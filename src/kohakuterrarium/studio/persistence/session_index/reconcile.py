@@ -221,7 +221,13 @@ def reconcile(
     if not session_dir.exists():
         return ReconcileReport(read=0, deleted=0, total=0, elapsed_ms=0.0)
 
-    on_disk_paths = {p.name: p for p in pick_canonical_per_session(session_dir)}
+    mirror_paths = {
+        p.name: p for p in pick_canonical_per_session(session_dir / "mirror")
+    }
+    on_disk_paths = {
+        **mirror_paths,
+        **{p.name: p for p in pick_canonical_per_session(session_dir)},
+    }
     in_index = set(index.all_filenames())
 
     # 1. Drop entries whose file is gone.  Doing this first means a

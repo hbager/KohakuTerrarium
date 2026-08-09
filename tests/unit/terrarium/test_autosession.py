@@ -56,6 +56,21 @@ class TestAutosessionViaSessionDir:
         finally:
             reopened.close(update_status=False)
 
+    async def test_remove_graph_closes_owned_store(self, tmp_path):
+        session_dir = tmp_path / "runs"
+        t = Terrarium(session_dir=str(session_dir))
+        c = await t.add_creature(_prebuilt("alice"), start=False)
+        gid = c.graph_id
+        store_path = session_dir / f"{c.creature_id}.kohakutr"
+        await t.remove_graph(gid)
+        assert gid not in t._session_stores
+        assert gid not in t._owned_sessions
+        reopened = SessionStore.open_readonly(store_path)
+        try:
+            assert reopened.load_meta()["status"] == "paused"
+        finally:
+            reopened.close()
+
     async def test_explicit_creature_pwd_is_persisted_in_meta(self, tmp_path):
         session_dir = tmp_path / "runs"
         workspace = tmp_path / "workspace"

@@ -15,6 +15,7 @@ from kohakuterrarium.terrarium.group_tool_context import (
     compute_group,
 )
 from kohakuterrarium.terrarium.tools_group_common import (
+    creature_pwd,
     ok,
     resolve_or_error,
     serialize_channel_history,
@@ -159,6 +160,7 @@ class GroupStatusTool(BaseTool):
                     "graph_id": c.graph_id,
                     "listen_channels": list(c.listen_channels),
                     "send_channels": list(c.send_channels),
+                    "pwd": creature_pwd(c),
                 }
             )
 

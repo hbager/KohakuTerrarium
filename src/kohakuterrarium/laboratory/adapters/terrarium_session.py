@@ -140,9 +140,18 @@ class TerrariumSessionAdapter:
         path = body.get("path")
         if not isinstance(path, str) or not path:
             raise ValueError("path is required")
+        stores = getattr(self._engine, "_session_stores", {}) or {}
+        requested_sid = body.get("session_id")
+        if isinstance(requested_sid, str) and requested_sid in stores:
+            store = stores[requested_sid]
+            return {"session_id": requested_sid, "meta": dict(store.load_meta())}
         local = Path(path)
         if not local.exists():
             raise FileNotFoundError(f"no .kohakutr at {path!r}")
+        resolved = local.resolve()
+        for sid, store in stores.items():
+            if Path(store.path).resolve() == resolved:
+                return {"session_id": sid, "meta": dict(store.load_meta())}
         sid = await self._engine.adopt_session(
             local,
             pwd=body.get("pwd_override"),

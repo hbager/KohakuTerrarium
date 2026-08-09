@@ -129,7 +129,12 @@ async def _resume_agent_into_engine(
         await _cleanup_failed_resume(engine, store, set())
         raise
     agents = list(meta.get("agents") or [])
-    if len(agents) > 1:
+    runtime_names = {
+        item.get("name")
+        for item in (meta.get("runtime_creatures") or [])
+        if isinstance(item, dict) and item.get("name")
+    }
+    if len(agents) > 1 or (runtime_names and runtime_names == set(agents)):
         return await _resume_runtime_group_into_engine(
             engine, store, meta, pwd=pwd, llm=llm
         )
@@ -154,9 +159,7 @@ async def _resume_agent_into_engine(
     try:
         # ``session=False``: the SAVED store attaches below — autosession
         # minting a fresh sibling file here would orphan it on disk.
-        creature = await engine.add_creature(
-            creature_obj, start=True, session=False
-        )
+        creature = await engine.add_creature(creature_obj, start=True, session=False)
 
         # Attach at graph level. ``Agent.attach_session_store`` is
         # idempotent for the same store, so this updates graph bookkeeping
@@ -187,19 +190,30 @@ async def _resume_runtime_group_into_engine(
 ) -> str:
     created_graph_ids: set[str] = set()
     try:
-        config_path = meta.get("config_path", "")
-        config_snapshot = meta.get("config_snapshot") or {}
-        if not config_path and not config_snapshot:
-            raise ValueError("Session has no config_path or config_snapshot in metadata")
-
-        effective_pwd = pwd or meta.get("pwd", ".")
-        if not (effective_pwd and os.path.isdir(effective_pwd)):
-            effective_pwd = None
+        descriptors = list(meta.get("runtime_creatures") or [])
+        if not descriptors:
+            descriptors = [
+                {
+                    "name": name,
+                    "config_path": meta.get("config_path", ""),
+                    "config_snapshot": meta.get("config_snapshot") or {},
+                    "pwd": meta.get("pwd", "."),
+                }
+                for name in list(meta.get("agents") or [])
+            ]
 
         sid: str | None = None
-        for agent_name in list(meta.get("agents") or []):
+        for descriptor in descriptors:
+            agent_name = descriptor.get("name")
+            config_path = descriptor.get("config_path", "")
+            config_snapshot = descriptor.get("config_snapshot") or {}
+            if not agent_name or not (config_path or config_snapshot):
+                raise ValueError("Runtime creature has incomplete metadata")
+            effective_pwd = pwd or descriptor.get("pwd") or meta.get("pwd", ".")
+            if not (effective_pwd and os.path.isdir(effective_pwd)):
+                effective_pwd = None
             agent = _rebuild_agent(
-                config_path=config_path,
+                config_path="" if config_snapshot else config_path,
                 config_snapshot=config_snapshot,
                 llm=llm,
                 io_kwargs={"input_module": NoneInput()},
@@ -207,10 +221,13 @@ async def _resume_runtime_group_into_engine(
             )
             inject_saved_state(agent, store, agent_name)
             creature_obj = Creature(
-                creature_id=_safe_creature_id(agent.config.name),
-                name=agent.config.name,
+                creature_id=descriptor.get("creature_id")
+                or _safe_creature_id(agent.config.name),
+                name=agent_name,
                 agent=agent,
                 config=agent.config,
+                is_privileged=bool(descriptor.get("is_privileged", False)),
+                parent_creature_id=descriptor.get("parent_creature_id"),
             )
             try:
                 creature = await engine.add_creature(
@@ -238,7 +255,7 @@ async def _resume_runtime_group_into_engine(
         "Runtime group session resumed into engine",
         session_id=sid,
         path=str(store.path),
-        creatures=len(meta.get("agents") or []),
+        creatures=len(descriptors),
     )
     return sid
 

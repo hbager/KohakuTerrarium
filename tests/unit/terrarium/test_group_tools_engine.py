@@ -148,6 +148,7 @@ class TestGroupStatusBehaviour:
             assert body["self"]["creature_id"] == "root"
             assert body["self"]["is_privileged"] is True
             ids = {c["creature_id"] for c in body["creatures"]}
+            assert all("pwd" in c for c in body["creatures"])
             # Both creatures share the graph → both in the snapshot.
             assert ids == {"root", "bob"}
             assert body["graph_id"] == root.graph_id

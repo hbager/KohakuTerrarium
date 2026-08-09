@@ -113,6 +113,68 @@ def mint_store(
         raise
 
 
+def register_creature_in_meta(
+    store: SessionStore,
+    creature: "Creature",
+    config: Any = None,
+) -> None:
+    """Persist one runtime creature's resumable build description."""
+    config_obj = getattr(getattr(creature, "agent", None), "config", None)
+    name = (
+        getattr(creature, "name", None)
+        or getattr(config_obj, "name", None)
+        or creature.creature_id
+    )
+    current = list(store.meta.get("agents") or [])
+    if name not in current:
+        current.append(name)
+        store.meta["agents"] = current
+    if len(current) > 1 and store.meta.get("config_type") == "agent":
+        store.meta["config_type"] = "terrarium"
+
+    config_path, snapshot = describe_build_input(config)
+    if config_obj is not None:
+        _, live_snapshot = describe_build_input(config_obj)
+        snapshot = live_snapshot or snapshot
+    working_dir = getattr(
+        getattr(creature.agent, "executor", None), "_working_dir", None
+    )
+    descriptor = {
+        "creature_id": creature.creature_id,
+        "name": name,
+        "config_path": config_path,
+        "config_snapshot": snapshot or {},
+        "pwd": str(working_dir) if working_dir is not None else "",
+        "parent_creature_id": getattr(creature, "parent_creature_id", None),
+        "is_privileged": bool(getattr(creature, "is_privileged", False)),
+    }
+    descriptors = list(store.meta.get("runtime_creatures") or [])
+    descriptors = [
+        item for item in descriptors if item.get("creature_id") != creature.creature_id
+    ]
+    descriptors.append(descriptor)
+    store.meta["runtime_creatures"] = descriptors
+
+
+def refresh_runtime_group_meta(
+    store: SessionStore, creatures: list["Creature"]
+) -> None:
+    """Replace a runtime group's descriptors with its current live members."""
+    previous = {
+        item.get("creature_id"): item
+        for item in (store.meta.get("runtime_creatures") or [])
+        if isinstance(item, dict) and item.get("creature_id")
+    }
+    if not previous:
+        return
+    store.meta["runtime_creatures"] = []
+    store.meta["agents"] = []
+    store.meta["config_type"] = "agent"
+    for creature in creatures:
+        config_path = previous.get(creature.creature_id, {}).get("config_path", "")
+        register_creature_in_meta(store, creature, config_path or None)
+
+
 def register_agents_in_meta(store: SessionStore, names: list[str]) -> None:
     """Merge ``names`` into ``meta["agents"]``; promote to terrarium.
 
@@ -177,13 +239,13 @@ async def attach_for_new_creature(
     if session is False:
         return existing
     if isinstance(session, SessionStore):
-        register_agents_in_meta(session, [creature.name])
+        register_creature_in_meta(session, creature, config)
         await engine.attach_session(gid, session)
         return session
 
     if session is None and existing is not None:
         # Joining a graph that already persists — fold this creature in.
-        register_agents_in_meta(existing, [creature.name])
+        register_creature_in_meta(existing, creature, config)
         if hasattr(creature.agent, "attach_session_store"):
             creature.agent.attach_session_store(existing)
         return existing
@@ -226,6 +288,7 @@ async def attach_for_new_creature(
         session_id=creature.creature_id,
         pwd=str(working_dir) if working_dir is not None else None,
     )
+    register_creature_in_meta(store, creature, config)
     engine._owned_sessions.add(gid)
     await engine.attach_session(gid, store)
     return store

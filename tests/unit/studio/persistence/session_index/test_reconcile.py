@@ -339,6 +339,22 @@ class TestReconcile:
         assert report.total == 2
         assert idx.list().total == 2
 
+    def test_bootstrap_includes_mirror_sessions(self, idx, session_dir):
+        mirror_dir = session_dir / "mirror"
+        mirror_dir.mkdir()
+        _make_session(mirror_dir, "remote", agent="worker")
+        report = reconcile(idx, session_dir, full=True)
+        assert report.total == 1
+        assert idx.get("remote.kohakutr")["agents"] == ["worker"]
+
+    def test_root_session_wins_over_same_named_mirror(self, idx, session_dir):
+        mirror_dir = session_dir / "mirror"
+        mirror_dir.mkdir()
+        _make_session(mirror_dir, "same", agent="remote")
+        _make_session(session_dir, "same", agent="local")
+        reconcile(idx, session_dir, full=True)
+        assert idx.get("same.kohakutr")["agents"] == ["local"]
+
     def test_incremental_skips_unchanged_files(self, idx, session_dir):
         _make_session(session_dir, "alice")
         reconcile(idx, session_dir, full=True)

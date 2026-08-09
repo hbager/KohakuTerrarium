@@ -42,6 +42,18 @@ def resolve_or_error(
         return None, err(str(exc))
 
 
+def creature_pwd(creature: Any) -> str:
+    agent = getattr(creature, "agent", None)
+    workspace = getattr(agent, "workspace", None)
+    if workspace is not None:
+        return workspace.get()
+    executor = getattr(agent, "executor", None)
+    working_dir = (
+        getattr(executor, "_working_dir", None) if executor is not None else None
+    )
+    return str(working_dir) if working_dir is not None else ""
+
+
 def serialize_channel_history(channel: Any, limit: int) -> list[dict[str, Any]]:
     history = list(getattr(channel, "history", []) or [])[-limit:]
     out: list[dict[str, Any]] = []

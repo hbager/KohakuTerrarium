@@ -52,9 +52,7 @@ def attach_session_store_for_creature(
             session_stores[sid] = existing
             engine._session_stores[sid] = existing
             try:
-                _autosession.register_agents_in_meta(
-                    existing, [creature.agent.config.name]
-                )
+                _autosession.register_creature_in_meta(existing, creature, config_path)
             except Exception:
                 logger.warning("meta agent-list update skipped", exc_info=True)
             # The reused store may have been minted by the ENGINE
@@ -82,6 +80,7 @@ def attach_session_store_for_creature(
                 getattr(getattr(creature.agent, "executor", None), "_working_dir", "")
             ),
         )
+        _autosession.register_creature_in_meta(store, creature, config_path)
         creature.agent.attach_session_store(store)
         session_stores[sid] = store
         # Mirror to engine map so channel-persistence callback finds it.

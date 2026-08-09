@@ -224,7 +224,7 @@ class TerrariumService(Protocol):
         ...
 
     async def remove_creature(self, creature_id: str) -> None: ...
-
+    async def remove_graph(self, graph_id: str) -> None: ...
     async def start_creature(self, creature_id: str) -> None: ...
 
     async def stop_creature(self, creature_id: str) -> None: ...
@@ -624,6 +624,9 @@ class LocalTerrariumService:
 
     async def remove_creature(self, creature_id: str) -> None:
         await self._engine.remove_creature(creature_id)
+
+    async def remove_graph(self, graph_id: str) -> None:
+        await self._engine.remove_graph(graph_id)
 
     async def start_creature(self, creature_id: str) -> None:
         await self._engine.start(creature_id)

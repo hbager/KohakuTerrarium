@@ -351,15 +351,29 @@ class MultiNodeTerrariumService:
             creature_id, lambda svc: svc.remove_creature(creature_id)
         )
         self._home.pop(creature_id, None)
-        # Also purge every name-cache entry whose value's creature_id
-        # matches the removed creature.  The sync output-wire resolver
-        # reads this cache without an async hop, so a stale entry would
-        # keep routing emits to the dead address until the next
-        # ``list_creatures`` fan-out.
+        # Purge matching name-cache entries so sync output-wire routing
+        # cannot retain a dead creature address.
         for key in [
             k for k, v in self._creature_name_cache.items() if v[1] == creature_id
         ]:
             self._creature_name_cache.pop(key, None)
+
+    async def remove_graph(self, graph_id: str) -> None:
+        node_id = await self._resolve_graph_home(graph_id)
+        service = self.service_for(node_id)
+        graph = await service.get_graph(graph_id)
+        await service.remove_graph(graph_id)
+        if graph is not None:
+            creature_ids = set(graph.creature_ids)
+            for creature_id in creature_ids:
+                self._home.pop(creature_id, None)
+            stale_names = [
+                key
+                for key, value in self._creature_name_cache.items()
+                if value[1] in creature_ids
+            ]
+            for key in stale_names:
+                self._creature_name_cache.pop(key, None)
 
     async def start_creature(self, creature_id: str) -> None:
         await self._route_per_creature(

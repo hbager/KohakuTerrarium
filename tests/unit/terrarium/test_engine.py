@@ -52,6 +52,22 @@ class TestAddRemoveCreature:
         finally:
             await t.shutdown()
 
+    async def test_remove_graph_is_atomic(self):
+        t = (
+            await TestTerrariumBuilder()
+            .with_creature("alice")
+            .with_creature("bob")
+            .with_creature("carol")
+            .build()
+        )
+        gid = t.get_creature("alice").graph_id
+        try:
+            await t.remove_graph(gid)
+            assert t.list_graphs() == []
+            assert t.list_creatures() == []
+        finally:
+            await t.shutdown()
+
     async def test_remove_unknown_raises(self):
         t = Terrarium()
         with pytest.raises(KeyError):

@@ -348,27 +348,44 @@ async def _push_and_resume_member(
 
     rel = f"resume/{path.name}"
     try:
-        await stream_write_file(host, on_node, "config://", rel, data)
-        target_path_resp = await host.request(
+        stores_resp = await host.request(
             to_node=on_node,
-            namespace="terrarium.files",
-            type="stat",
-            body={"scope": "config://", "path": rel},
+            namespace="terrarium.session",
+            type="stores",
+            body={},
             timeout=10.0,
         )
-        if isinstance(target_path_resp, dict) and "error" in target_path_resp:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"worker {on_node!r} failed to receive .kohakutr: "
-                    f"{target_path_resp['error'].get('message', '')}"
-                ),
+        live_ids = (
+            stores_resp.get("session_ids", [])
+            if isinstance(stores_resp, dict) and "error" not in stores_resp
+            else []
+        )
+        already_live = normalize_session_stem(path) in live_ids
+        if not already_live:
+            await stream_write_file(host, on_node, "config://", rel, data)
+            target_path_resp = await host.request(
+                to_node=on_node,
+                namespace="terrarium.files",
+                type="stat",
+                body={"scope": "config://", "path": rel},
+                timeout=10.0,
             )
+            if isinstance(target_path_resp, dict) and "error" in target_path_resp:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        f"worker {on_node!r} failed to receive .kohakutr: "
+                        f"{target_path_resp['error'].get('message', '')}"
+                    ),
+                )
         worker_path_resp = await host.request(
             to_node=on_node,
             namespace="terrarium.session",
             type="resume",
-            body={"path": _worker_absolute_for(rel)},
+            body={
+                "path": _worker_absolute_for(rel),
+                "session_id": normalize_session_stem(path),
+            },
             timeout=60.0,
         )
         if isinstance(worker_path_resp, dict) and "error" in worker_path_resp:

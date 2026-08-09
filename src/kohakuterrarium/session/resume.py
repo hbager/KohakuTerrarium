@@ -482,6 +482,14 @@ def detect_session_type(session_path: str | Path) -> str:
     store = SessionStore(resolved)
     try:
         meta = store.load_meta()
+        runtime_names = {
+            item.get("name")
+            for item in (meta.get("runtime_creatures") or [])
+            if isinstance(item, dict) and item.get("name")
+        }
+        agent_names = set(meta.get("agents") or [])
+        if len(agent_names) > 1 and runtime_names == agent_names:
+            return "agent"
         config_type = meta.get("config_type", "agent")
         if config_type == "terrarium" and _looks_like_agent_config_path(
             meta.get("config_path", "")

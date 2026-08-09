@@ -57,6 +57,10 @@ class TestMergeSessionStores:
         try:
             s1.init_meta("sid-a", "agent", "/p", "/w", ["alice"])
             s2.init_meta("sid-b", "agent", "/p", "/w", ["bob"])
+            s1.meta["runtime_creatures"] = [
+                {"creature_id": "alice-id", "name": "alice"}
+            ]
+            s2.meta["runtime_creatures"] = [{"creature_id": "bob-id", "name": "bob"}]
             s1.append_event("alice", "x", {"v": 1})
             s2.append_event("bob", "y", {"v": 2})
             s1.flush()
@@ -71,6 +75,10 @@ class TestMergeSessionStores:
                 assert "sid-b" in parents
                 assert merged.get_events("alice")
                 assert merged.get_events("bob")
+                assert merged.meta["agents"] == ["alice", "bob"]
+                assert {
+                    item["creature_id"] for item in merged.meta["runtime_creatures"]
+                } == {"alice-id", "bob-id"}
             finally:
                 merged.close()
         finally:

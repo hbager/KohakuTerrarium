@@ -19,6 +19,8 @@ from typing import Any
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.sessions import cluster_fold
 from kohakuterrarium.studio._runtime import host_engine_or_none
+import kohakuterrarium.terrarium.autosession as _autosession
+import kohakuterrarium.terrarium.topology_snapshot as _topology_snapshot
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -70,14 +72,32 @@ async def stop_session(
                 graph = g
                 break
 
+    store = None
     if graph is not None:
-        # Local path — stop every creature in the graph.  The engine
-        # drops the graph automatically once the last creature leaves.
-        for cid in list(graph.creature_ids):
-            try:
-                await engine.remove_creature(cid)
-            except KeyError:
-                pass
+        engine_stores = getattr(engine, "_session_stores", None)
+        store = (
+            engine_stores.get(session_id) if isinstance(engine_stores, dict) else None
+        )
+        if store is not None:
+            creatures = [
+                engine.get_creature(cid)
+                for cid in graph.creature_ids
+                if cid in engine._creatures
+            ]
+            _autosession.refresh_runtime_group_meta(store, creatures)
+            _topology_snapshot.snapshot(engine, session_id)
+        # Detach persistence before removals. Removing one member can split
+        # the graph; a still-attached store would be copied to each temporary
+        # component and leave orphan session files/stores behind.
+        engine_stores = getattr(engine, "_session_stores", None)
+        store = (
+            engine_stores.pop(session_id, None)
+            if isinstance(engine_stores, dict)
+            else store
+        )
+        # Local path — remove the graph atomically so disconnected
+        # creatures never create intermediate split graphs.
+        await engine.remove_graph(session_id)
     else:
         # Remote path — the graph lives on a worker.  Look up the
         # creature_id we cached at spawn time and route the removal
@@ -86,7 +106,14 @@ async def stop_session(
         if meta_entry is None or not meta_entry.get("on_node"):
             raise KeyError(f"session {session_id!r} not found")
         cid = meta_entry.get("creature_id")
-        if cid and hasattr(service, "remove_creature"):
+        removed_graph = False
+        if hasattr(service, "remove_graph"):
+            try:
+                await service.remove_graph(session_id)
+                removed_graph = True
+            except KeyError:
+                pass
+        if not removed_graph and cid and hasattr(service, "remove_creature"):
             try:
                 await service.remove_creature(cid)
             except KeyError:
@@ -103,10 +130,20 @@ async def stop_session(
     # WinError 32. Drop it from the engine registry too so resume does
     # not hand back a closed store.  Lab-host has no host engine, so
     # there is no engine-side store registry to drop from.
-    store = session_stores.pop(session_id, None)
+    store = session_stores.pop(session_id, None) or store
     engine_stores = getattr(engine, "_session_stores", None) if engine else None
     if isinstance(engine_stores, dict):
         store = engine_stores.pop(session_id, None) or store
+    if store is not None and hasattr(store, "update_status"):
+        try:
+            store.update_status("paused")
+        except Exception as e:
+            logger.warning(
+                "Failed to pause session store on stop",
+                session_id=session_id,
+                error=str(e),
+                exc_info=True,
+            )
     # Detach the live SessionIndexHook (if one was bound at session
     # start) BEFORE closing the store so its final flush sees a still-
     # subscribable store.  Detach is idempotent + best-effort.
@@ -125,7 +162,7 @@ async def stop_session(
                 )
     if store is not None and hasattr(store, "close"):
         try:
-            store.close()
+            store.close(update_status=False)
         except Exception as e:
             logger.warning(
                 "Failed to close session store on stop",

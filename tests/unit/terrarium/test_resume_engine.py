@@ -198,6 +198,54 @@ class TestResumeIntoEngine:
         finally:
             await t.shutdown()
 
+    async def test_single_runtime_descriptor_restores_its_own_identity(
+        self, monkeypatch, tmp_path
+    ):
+        meta = {
+            "agents": ["worker"],
+            "runtime_creatures": [
+                {
+                    "creature_id": "worker-fixed-id",
+                    "name": "worker",
+                    "config_path": "/old/root/config",
+                    "config_snapshot": {"name": "worker"},
+                    "pwd": str(tmp_path),
+                    "parent_creature_id": "root-old-id",
+                    "is_privileged": False,
+                }
+            ],
+        }
+        store = SimpleNamespace(
+            path=tmp_path / "saved.kohakutr",
+            load_meta=lambda: meta,
+            update_status=lambda status: None,
+            close=lambda *args, **kwargs: None,
+        )
+        captured = {}
+        fake_agent = _FakeAgent(name="worker")
+        fake_agent.config = SimpleNamespace(name="worker")
+
+        def rebuild(**kwargs):
+            captured.update(kwargs)
+            return fake_agent
+
+        monkeypatch.setattr(resume_mod, "_rebuild_agent", rebuild)
+        monkeypatch.setattr(resume_mod, "inject_saved_state", lambda *args: None)
+        t = await TestTerrariumBuilder().build()
+        try:
+            gid = await resume_mod._resume_runtime_group_into_engine(
+                t, store, meta, pwd=None, llm=None
+            )
+            creature = t.get_creature("worker-fixed-id")
+            assert creature.graph_id == gid
+            assert creature.name == "worker"
+            assert creature.parent_creature_id == "root-old-id"
+            assert captured["config_path"] == ""
+            assert captured["config_snapshot"] == {"name": "worker"}
+            assert captured["pwd"] == str(tmp_path)
+        finally:
+            await t.shutdown()
+
     async def test_terrarium_path_dispatches(self, monkeypatch, tmp_path):
         monkeypatch.setattr(resume_mod, "detect_session_type", lambda p: "terrarium")
 
@@ -350,7 +398,9 @@ class TestResumeIntoEngine:
         monkeypatch.setattr(
             resume_mod,
             "_topo_snap",
-            SimpleNamespace(replay=AsyncMock(side_effect=RuntimeError("replay failed"))),
+            SimpleNamespace(
+                replay=AsyncMock(side_effect=RuntimeError("replay failed"))
+            ),
         )
         t.attach_session = AsyncMock()
         try:
@@ -527,9 +577,7 @@ class TestResumeIntoEngine:
             # SimpleNamespace store does not have to behave like a
             # SessionStore.
             t.attach_session = AsyncMock()
-            gid = await resume_mod.resume_into_engine(
-                t, tmp_path / "saved.kohakutr"
-            )
+            gid = await resume_mod.resume_into_engine(t, tmp_path / "saved.kohakutr")
             # No ghost store file was minted next to the saved session;
             # ownership tracks only the resumed graph so shutdown closes it.
             assert list(session_dir.glob("*.kohakutr")) == []

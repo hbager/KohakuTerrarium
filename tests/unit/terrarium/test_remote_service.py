@@ -259,6 +259,11 @@ class TestLifecycle:
         svc = _make_service({"remove_creature": {}})
         assert await svc.remove_creature("cid") is None
 
+    async def test_remove_graph_returns_none(self):
+        svc = _make_service({"remove_graph": {}})
+        assert await svc.remove_graph("g1") is None
+        assert svc._sender.calls[-1][1:] == ("remove_graph", {"graph_id": "g1"})
+
     async def test_start_stop_creature(self):
         svc = _make_service({"start_creature": {}, "stop_creature": {}})
         await svc.start_creature("cid")

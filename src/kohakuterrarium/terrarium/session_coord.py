@@ -90,6 +90,7 @@ _RESUMABLE_META_KEYS: tuple[str, ...] = (
     "terrarium_channels",
     "terrarium_creatures",
     "viewer_default_agent",
+    "runtime_creatures",
 )
 
 
@@ -109,6 +110,32 @@ def _inherit_resumable_meta(src_meta: dict, dst_store: SessionStore) -> None:
             dst_store.meta[key] = value
         except Exception:
             logger.warning("split/merge: meta key %r write failed", key, exc_info=True)
+
+
+def _merge_runtime_creature_meta(
+    stores: list[SessionStore], destination: SessionStore
+) -> None:
+    agents: list[str] = []
+    descriptors: dict[str, dict] = {}
+    for store in stores:
+        try:
+            meta = store.load_meta()
+        except Exception:
+            continue
+        for name in meta.get("agents") or []:
+            if name not in agents:
+                agents.append(name)
+        for item in meta.get("runtime_creatures") or []:
+            if not isinstance(item, dict):
+                continue
+            key = item.get("creature_id") or item.get("name")
+            if key:
+                descriptors[str(key)] = item
+    if not descriptors:
+        return
+    destination.meta["agents"] = agents
+    destination.meta["config_type"] = "terrarium" if len(agents) > 1 else "agent"
+    destination.meta["runtime_creatures"] = list(descriptors.values())
 
 
 def merge_session_stores(
@@ -142,6 +169,7 @@ def merge_session_stores(
         new_store.meta["parent_session_ids"] = parents
         new_store.meta["merged_at"] = time.time()
         _inherit_resumable_meta(inherited_meta, new_store)
+        _merge_runtime_creature_meta(old_stores, new_store)
     except Exception:
         logger.warning("merge: meta write failed", exc_info=True)
     logger.info(
@@ -229,6 +257,7 @@ def apply_merge(
         # "merged" one; later writes simply land in it.  Drop the others'
         # references from the engine.
         kept = old_stores[0]
+        _merge_runtime_creature_meta(old_stores, kept)
     else:
         kept_store = engine._session_stores.get(keep_gid)
         kept_path = (
@@ -261,6 +290,7 @@ def apply_merge(
             try:
                 kept.meta["parent_session_ids"] = parents
                 kept.meta["merged_at"] = time.time()
+                _merge_runtime_creature_meta(old_stores, kept)
             except Exception:
                 logger.warning("merge: meta write failed", exc_info=True)
         else:
@@ -323,6 +353,14 @@ def _refresh_meta_for_split_graph(
     try:
         store.meta["agents"] = agents
         store.meta["config_type"] = "agent" if len(agents) <= 1 else "terrarium"
+        descriptors = list(store.meta.get("runtime_creatures") or [])
+        if descriptors:
+            member_ids = set(creatures)
+            store.meta["runtime_creatures"] = [
+                item
+                for item in descriptors
+                if isinstance(item, dict) and item.get("creature_id") in member_ids
+            ]
     except Exception:
         logger.warning("split: meta refresh failed", exc_info=True)
 

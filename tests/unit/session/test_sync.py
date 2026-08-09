@@ -254,7 +254,12 @@ class TestSessionMirrorWriter:
         # has no config_type / config_path and a resume off it fails
         # ("Session is a None, not an agent").
         node = _FakeNode()
-        writer = SessionMirrorWriter(node, tmp_path / "mirror")
+        statuses = []
+        writer = SessionMirrorWriter(
+            node,
+            tmp_path / "mirror",
+            on_meta_updated=lambda store: statuses.append(store.load_meta()["status"]),
+        )
         try:
             msg = AppMessage(
                 namespace=NAMESPACE,
@@ -265,6 +270,7 @@ class TestSessionMirrorWriter:
                         "config_type": "agent",
                         "config_path": "/cfg",
                         "agents": ["alice"],
+                        "status": "paused",
                     },
                 },
                 sender_node="worker-1",
@@ -278,6 +284,7 @@ class TestSessionMirrorWriter:
             assert meta["config_type"] == "agent"
             assert meta["config_path"] == "/cfg"
             assert meta["agents"] == ["alice"]
+            assert statuses == ["paused"]
         finally:
             writer.close()
 
@@ -467,6 +474,18 @@ class TestSessionEventTee:
             assert body["meta"]["config_type"] == "agent"
             assert body["meta"]["config_path"] == "/cfg/path"
             assert body["meta"]["agents"] == ["alice"]
+        finally:
+            tee.detach()
+            store.close()
+
+    async def test_flush_meta_times_out_when_link_is_down(self, tmp_path):
+        store = SessionStore(str(tmp_path / "s.kohakutr"))
+        node = _AsyncFakeNode(fail=True)
+        tee = SessionEventTee("sess", store, node)
+        try:
+            tee.attach()
+            await tee.flush_meta(timeout=0.01)
+            assert tee._attached is True
         finally:
             tee.detach()
             store.close()

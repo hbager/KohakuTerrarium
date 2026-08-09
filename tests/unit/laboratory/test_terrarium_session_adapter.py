@@ -268,6 +268,24 @@ class TestResume:
         assert call["pwd"] == "/work"
         assert call["llm"] == "gpt"
 
+    async def test_resume_reuses_store_already_live_from_same_path(
+        self, _adapter, _engine, tmp_path
+    ):
+        kohakutr = tmp_path / "already-live.kohakutr"
+        live = SessionStore(str(kohakutr))
+        live.meta["agents"] = ["alice"]
+        _engine._session_stores["g-live"] = live
+
+        out = await _adapter._dispatch(
+            _msg(
+                "resume",
+                {"path": str(kohakutr), "pwd_override": "/ignored", "llm": "ignored"},
+            )
+        )
+
+        assert out == {"session_id": "g-live", "meta": {"agents": ["alice"]}}
+        assert _engine._adopt_calls == []
+
     async def test_resume_adopt_with_no_resulting_store_returns_empty_meta(
         self, _adapter, _engine, tmp_path
     ):

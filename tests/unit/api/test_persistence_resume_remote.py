@@ -140,6 +140,30 @@ class TestRemoteWritePath:
         assert "write_commit" in pushed
         assert "write" not in pushed
 
+    def test_remote_resume_reuses_active_worker_session_without_rewriting(
+        self, monkeypatch, tmp_path
+    ):
+        p = tmp_path / "x.kohakutr"
+        p.write_bytes(b"must-not-be-overwritten")
+        monkeypatch.setattr(resume_mod, "resolve_session_path_default", lambda n: p)
+        host = _FakeHost(
+            responses={
+                "terrarium.session:stores": {"session_ids": ["x"]},
+                "terrarium.session:resume": {
+                    "session_id": "x",
+                    "meta": {"agents": ["alice"], "config_type": "agent"},
+                },
+            }
+        )
+
+        resp = TestClient(_app(service=_Svc(host))).post(
+            "/sessions/x/resume", json={"on_node": "w1"}
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["instance_id"] == "x"
+        assert [c for c in host.calls if c["namespace"] == "terrarium.files"] == []
+
     def test_remote_no_session_id_502(self, monkeypatch, tmp_path):
         p = tmp_path / "x.kohakutr"
         p.write_bytes(b"data")

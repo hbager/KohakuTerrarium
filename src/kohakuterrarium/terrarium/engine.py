@@ -393,6 +393,42 @@ class Terrarium:
         # ``apply_split_bookkeeping`` is a no-op for non-split deltas.
         _lifecycle.apply_split_bookkeeping(self, delta)
 
+    async def remove_graph(self, graph: GraphRef) -> None:
+        """Stop and remove an entire graph without intermediate splits."""
+        gid = self._resolve_graph_id(graph)
+        g = self._topology.graphs.get(gid)
+        if g is None:
+            raise KeyError(f"graph {gid!r} not in engine")
+        creature_ids = list(g.creature_ids)
+        for cid in creature_ids:
+            creature = self._creatures.get(cid)
+            if creature is not None and creature.is_running:
+                await creature.stop()
+        for cid in creature_ids:
+            self._topology.creature_to_graph.pop(cid, None)
+            self._creatures.pop(cid, None)
+            self._emit(
+                EngineEvent(
+                    kind=EventKind.CREATURE_STOPPED,
+                    creature_id=cid,
+                    graph_id=gid,
+                )
+            )
+        self._topology.graphs.pop(gid, None)
+        self._environments.pop(gid, None)
+        store = self._session_stores.pop(gid, None)
+        self._owned_sessions.discard(gid)
+        if store is not None:
+            try:
+                store.close()
+            except Exception:  # pragma: no cover - defensive
+                _logger.warning(
+                    "remove_graph: closing session store failed",
+                    graph_id=gid,
+                    exc_info=True,
+                )
+        _wiring.install_output_wiring_resolver(self)
+
     def get_creature(self, creature_id: str) -> Creature:
         """Return the creature with the given id.  Raises ``KeyError``."""
         c = self._creatures.get(creature_id)

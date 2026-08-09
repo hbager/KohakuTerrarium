@@ -17,16 +17,16 @@ from kohakuterrarium.terrarium.group_tool_context import (
     cross_cluster_target_error,
     resolve_group_target,
 )
-from kohakuterrarium.terrarium.tools_group_common import err, ok, resolve_or_error
+from kohakuterrarium.terrarium.tools_group_common import (
+    creature_pwd,
+    err,
+    ok,
+    resolve_or_error,
+)
 
 
 def _caller_pwd(gctx: GroupContext) -> str:
-    executor = getattr(gctx.caller.agent, "executor", None)
-    if executor is not None:
-        wd = getattr(executor, "_working_dir", None)
-        if wd is not None:
-            return str(wd)
-    return ""
+    return creature_pwd(gctx.caller)
 
 
 @register_builtin("group_add_node")
@@ -94,12 +94,10 @@ class GroupAddNodeTool(BaseTool):
                 is_privileged=False,
                 parent_creature_id=gctx.caller.creature_id,
                 io="none",
+                name=(args.get("name") or "").strip() or None,
             )
         except Exception as exc:
             return err(f"failed to spawn creature from {config_path!r}: {exc}")
-
-        if name := (args.get("name") or "").strip():
-            group_hooks.apply_creature_name(new, name)
 
         group_hooks.attach_session_store(
             gctx.engine, new, config_path=config_path, config_type="agent"
@@ -120,6 +118,7 @@ class GroupAddNodeTool(BaseTool):
                 "graph_id": new.graph_id,
                 "parent_creature_id": new.parent_creature_id,
                 "caller_graph_id": gctx.caller.graph_id,
+                "pwd": creature_pwd(new),
             }
         )
 

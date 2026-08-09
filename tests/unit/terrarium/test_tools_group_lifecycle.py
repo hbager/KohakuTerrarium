@@ -136,6 +136,7 @@ class TestGroupAddNode:
         body = _parse(r)
         assert body["creature_id"] == "cid-new"
         assert body["parent_creature_id"] == "caller"
+        assert body["pwd"] == ""
         gctx.engine.add_creature.assert_awaited_once_with(
             "./c",
             graph="g1",
@@ -144,6 +145,7 @@ class TestGroupAddNode:
             is_privileged=False,
             parent_creature_id="caller",
             io="none",
+            name="alice",
         )
         assert gctx.engine.emitted  # emit fired
 

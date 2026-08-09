@@ -31,6 +31,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 from kohakuterrarium.laboratory._internal.app import AppMessage
@@ -118,6 +119,19 @@ class SessionEventTee:
             meta = {}
         return ("meta", {"session_id": self._session_id, "meta": _json_safe(meta)})
 
+    async def flush_meta(self, timeout: float = 5.0) -> None:
+        """Queue current metadata after pending events and wait briefly."""
+        if not self._attached:
+            return
+        self._enqueue(self._meta_item(), "meta")
+        try:
+            await asyncio.wait_for(self._queue.join(), timeout=timeout)
+        except TimeoutError:
+            logger.warning(
+                "session-sync: timed out flushing final metadata",
+                session_id=self._session_id,
+            )
+
     def detach(self) -> None:
         """Unsubscribe and stop the pump.  Idempotent."""
         if not self._attached:
@@ -164,6 +178,7 @@ class SessionEventTee:
         except asyncio.QueueFull:  # pragma: no cover - depends on load
             try:
                 self._queue.get_nowait()
+                self._queue.task_done()
             except asyncio.QueueEmpty:
                 pass
             try:
@@ -191,6 +206,7 @@ class SessionEventTee:
                             body=body,
                         )
                         consecutive_failures = 0
+                        self._queue.task_done()
                         break
                     except Exception:  # pragma: no cover - depends on link
                         consecutive_failures += 1
@@ -253,12 +269,14 @@ class SessionMirrorWriter:
         mirror_dir: str | Path,
         *,
         max_open_stores: int = DEFAULT_MIRROR_MAX_OPEN_STORES,
+        on_meta_updated: Callable[[SessionStore], None] | None = None,
     ) -> None:
         self._node = lab_node
         self._mirror_dir = Path(mirror_dir)
         self._mirror_dir.mkdir(parents=True, exist_ok=True)
         self._stores: dict[str, SessionStore] = {}
         self._max_open_stores = max(1, max_open_stores)
+        self._on_meta_updated = on_meta_updated
         lab_node.register_app_extension(NAMESPACE, self._dispatch)
 
     def close(self) -> None:
@@ -350,6 +368,11 @@ class SessionMirrorWriter:
                     key,
                     session_id,
                 )
+        if self._on_meta_updated is not None:
+            try:
+                self._on_meta_updated(store)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("session-sync mirror: index update failed")
         return None
 
     async def _dispatch(self, msg: AppMessage) -> None:

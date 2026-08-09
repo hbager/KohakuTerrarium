@@ -457,6 +457,16 @@ class TerrariumRuntimeAdapter:
                 await self._engine.remove_creature(cid)
                 return {}
 
+            case "remove_graph":
+                graph_id = msg.body["graph_id"]
+                if self._engine._topology.graphs.get(graph_id) is None:
+                    raise KeyError(f"graph {graph_id!r} not found")
+                await self._engine.stop_graph(graph_id)
+                if self._session_attacher is not None:
+                    await self._session_attacher.close_graph(graph_id)
+                await self._engine.remove_graph(graph_id)
+                return {}
+
             case "start_creature":
                 cid = msg.body["creature_id"]
                 self._require_hosted(cid)

@@ -35,6 +35,8 @@ from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.laboratory.protocols import LabNotifier
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.sync import SessionEventTee
+from kohakuterrarium.terrarium import autosession as _autosession
+from kohakuterrarium.terrarium import topology_snapshot as _topology_snapshot
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.utils.config_dir import config_dir
 from kohakuterrarium.utils.logging import get_logger
@@ -227,10 +229,7 @@ class WorkerSessionAttacher:
         except Exception:  # pragma: no cover - defensive
             meta = {}
         if meta.get("config_type"):
-            agents = list(meta.get("agents") or [])
-            if name not in agents:
-                agents.append(name)
-                store.meta["agents"] = agents
+            _autosession.register_creature_in_meta(store, creature)
             return
         config_path = str(getattr(cfg, "agent_path", "") or "")
         pwd = str(getattr(getattr(agent, "executor", None), "_working_dir", "") or "")
@@ -259,10 +258,34 @@ class WorkerSessionAttacher:
                 agents=[name],
                 config_snapshot=snapshot,
             )
+            _autosession.register_creature_in_meta(store, creature)
         except Exception:  # pragma: no cover - defensive
             logger.exception(
                 "auto-session-attach: init_meta failed for graph %r", graph_id
             )
+
+    async def close_graph(self, graph_id: str) -> None:
+        """Persist and close one graph's worker-owned session resources."""
+        store = self._engine._session_stores.get(graph_id)
+        graph = self._engine._topology.graphs.get(graph_id)
+        if store is not None and graph is not None:
+            creatures = [
+                self._engine.get_creature(cid)
+                for cid in graph.creature_ids
+                if cid in self._engine._creatures
+            ]
+            _autosession.refresh_runtime_group_meta(store, creatures)
+            _topology_snapshot.snapshot(self._engine, graph_id)
+            store.update_status("paused")
+        tee = self._graph_tees.pop(graph_id, None)
+        if tee is not None:
+            await tee.flush_meta()
+            tee.detach()
+        self._graph_refs.pop(graph_id, None)
+        store = self._engine._session_stores.pop(graph_id, None) or store
+        self._engine._owned_sessions.discard(graph_id)
+        if store is not None:
+            store.close(update_status=False)
 
     def detach(self, creature_id: str) -> None:
         """Detach the Tee for ``creature_id``.
