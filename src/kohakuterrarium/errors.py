@@ -93,6 +93,18 @@ class LLMNotConfiguredError(LLMError, ValueError):
     """No usable LLM could be resolved (missing key, unknown profile, ...)."""
 
 
+class EmptyLLMResponseError(LLMError):
+    """The provider finished (HTTP 200) without any presentable output.
+
+    Raised when the empty-response retry budget is exhausted or
+    transient retries are disabled — the stream/completion completed
+    normally but produced no non-blank text, no native tool call, and
+    no presentable structured assistant part (image etc.). Subclasses
+    ``LLMError`` so the controller's existing ``processing_error`` flow
+    handles it like any other LLM failure.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Sessions
 # ---------------------------------------------------------------------------
