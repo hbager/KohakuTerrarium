@@ -78,7 +78,12 @@ class TestAutosessionViaSessionDir:
         config = _write_cfg(tmp_path)
         t = Terrarium(pwd=str(tmp_path), session_dir=str(session_dir))
         try:
-            c = await t.add_creature(str(config), pwd=str(workspace), start=False)
+            c = await t.add_creature(
+                str(config),
+                llm=ScriptedLLM(),
+                pwd=str(workspace),
+                start=False,
+            )
             meta = t._session_stores[c.graph_id].load_meta()
             assert meta["pwd"] == str(workspace)
         finally:

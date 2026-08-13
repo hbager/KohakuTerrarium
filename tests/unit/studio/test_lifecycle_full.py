@@ -303,6 +303,7 @@ class TestStartTerrarium:
                 name="worker",
                 parent_creature_id=root.creature_id,
                 io="none",
+                strict=False,
             )
             lifecycle.attach_session_store_for_creature(
                 service, worker, config_path=str(worker_cfg)

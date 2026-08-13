@@ -64,20 +64,17 @@ class TestWaitForPort:
         # Open the port from another thread half a second after the
         # call starts; the waiter should succeed.
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", 0))
         port = s.getsockname()[1]
-        s.close()
 
         def _open_later():
             time.sleep(0.5)
-            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                srv.bind(("127.0.0.1", port))
-                srv.listen(1)
+                s.listen(1)
                 time.sleep(2.0)
             finally:
-                srv.close()
+                s.close()
 
         t = threading.Thread(target=_open_later, daemon=True)
         t.start()
