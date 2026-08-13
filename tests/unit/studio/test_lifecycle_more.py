@@ -257,9 +257,7 @@ class TestClusterFoldPersistence:
                 store.close(update_status=False)
 
         service = SimpleNamespace(
-            _cluster_links={
-                frozenset({("node-a", "sid-a"), ("node-b", "sid-b")})
-            }
+            _cluster_links={frozenset({("node-a", "sid-a"), ("node-b", "sid-b")})}
         )
 
         cluster_fold.persist_cluster_members_to_mirror(service, "sid-a", mirror_dir)

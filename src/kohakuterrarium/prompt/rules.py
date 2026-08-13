@@ -47,7 +47,9 @@ def build_rule_prompt(
     sections: list[str] = []
     seen_contents: set[str] = set()
 
-    for label, path in discover_rule_files(project_dir=project_dir, agent_path=agent_path):
+    for label, path in discover_rule_files(
+        project_dir=project_dir, agent_path=agent_path
+    ):
         try:
             content = path.read_text(encoding="utf-8").strip()
         except OSError as exc:

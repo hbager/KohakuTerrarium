@@ -142,9 +142,7 @@ class OpenAIProvider(BaseLLMProvider):
         self._api_key_pool = (
             api_key if isinstance(api_key, KeyPool) and auth_mode != "none" else None
         )
-        api_key_for_client = (
-            api_key.first if isinstance(api_key, KeyPool) else api_key
-        )
+        api_key_for_client = api_key.first if isinstance(api_key, KeyPool) else api_key
         if auth_mode == "none":
             api_key_for_client = None
         self._api_key = api_key_for_client
@@ -293,7 +291,9 @@ class OpenAIProvider(BaseLLMProvider):
             return False
         new_key = new_key_pool.first
         old_key = self._api_key_pool.first if self._api_key_pool else self._api_key
-        if new_key == old_key and new_key_pool == (self._api_key_pool or KeyPool([self._api_key or ""])):
+        if new_key == old_key and new_key_pool == (
+            self._api_key_pool or KeyPool([self._api_key or ""])
+        ):
             return False
         old = self._client
         self._api_key_pool = new_key_pool if new_key_pool.is_pool else None

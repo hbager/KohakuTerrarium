@@ -6,7 +6,6 @@ from kohakuterrarium.llm.openai_helpers import (
     lift_legacy_reasoning_effort,
 )
 
-
 # =========================================================================
 # ROOCODE_USER_AGENT constant
 # =========================================================================
@@ -160,9 +159,7 @@ def test_apply_request_controls_sets_service_tier():
 def test_apply_request_controls_promotes_legacy_effort():
     kwargs: dict = {}
     extra = {"reasoning": {"effort": "medium"}}
-    result = apply_request_controls(
-        kwargs, extra, base_url="https://api.openai.com/v1"
-    )
+    result = apply_request_controls(kwargs, extra, base_url="https://api.openai.com/v1")
     assert kwargs["reasoning_effort"] == "medium"
     assert "reasoning" not in result
 

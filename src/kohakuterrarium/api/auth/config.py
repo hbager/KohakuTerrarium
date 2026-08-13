@@ -24,6 +24,7 @@ without setting any new config.
 """
 
 import os
+
 try:
     import tomllib
 except ImportError:  # pragma: no cover - Python <3.11 fallback

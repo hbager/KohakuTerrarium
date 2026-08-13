@@ -314,9 +314,7 @@ class TestResolveControllerLlm:
         assert profile.retry_policy["max_attempts"] == 5
 
     def test_auth_mode_override_applied(self):
-        profile = resolve_controller_llm(
-            {"llm": "openai/gpt-5.4", "auth_mode": "none"}
-        )
+        profile = resolve_controller_llm({"llm": "openai/gpt-5.4", "auth_mode": "none"})
         assert profile.auth_mode == "none"
 
     def test_transport_auth_mode_hint_does_not_override_backend_auth(self):

@@ -852,9 +852,7 @@ class TestSessionArtifactResolution:
             [
                 {
                     "type": "image_url",
-                    "image_url": {
-                        "url": "/api/sessions/current/artifacts/pic.png"
-                    },
+                    "image_url": {"url": "/api/sessions/current/artifacts/pic.png"},
                 },
                 {
                     "type": "image_url",

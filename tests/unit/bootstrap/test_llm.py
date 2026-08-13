@@ -277,9 +277,7 @@ class TestCreateFromProfile:
         provider = _create_from_profile(profile)
         assert isinstance(provider, CodexOAuthProvider)
 
-    def test_codex_missing_base_url_env_does_not_fall_back_to_oauth(
-        self, monkeypatch
-    ):
+    def test_codex_missing_base_url_env_does_not_fall_back_to_oauth(self, monkeypatch):
         monkeypatch.delenv("KT_CODEX_ENDPOINT", raising=False)
         profile = LLMProfile(
             name="custom",

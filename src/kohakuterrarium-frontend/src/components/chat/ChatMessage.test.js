@@ -68,7 +68,10 @@ describe("ChatMessage — edit rerun UX", () => {
 
     const textarea = wrapper.find("textarea")
     await textarea.setValue("new text")
-    await wrapper.findAll("button").find((btn) => btn.text() === "Save & Rerun").trigger("click")
+    await wrapper
+      .findAll("button")
+      .find((btn) => btn.text() === "Save & Rerun")
+      .trigger("click")
     await nextTick()
 
     expect(chat.editMessage).toHaveBeenCalledOnce()

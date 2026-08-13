@@ -995,8 +995,4 @@ class MultiNodeTerrariumService:
         return _cluster_members_for_fn(self, graph_id)
 
 
-__all__ = [
-    "CrossNodeNotSupportedError",
-    "MultiNodeTerrariumService",
-    "HOST_NODE",
-]
+__all__ = ["CrossNodeNotSupportedError", "MultiNodeTerrariumService", "HOST_NODE"]

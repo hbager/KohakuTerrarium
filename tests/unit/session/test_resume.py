@@ -376,7 +376,9 @@ class TestDetectSessionType:
         path = tmp_path / "x.kohakutr.v2"
         config_dir = tmp_path / "recipe"
         config_dir.mkdir()
-        (config_dir / "terrarium.yaml").write_text("name: t\ncreatures: []\n", encoding="utf-8")
+        (config_dir / "terrarium.yaml").write_text(
+            "name: t\ncreatures: []\n", encoding="utf-8"
+        )
         store = SessionStore(str(path))
         try:
             store.meta["format_version"] = 2
@@ -401,7 +403,9 @@ class TestDetectSessionType:
         path = tmp_path / "x.kohakutr.v2"
         config_dir = tmp_path / "combo"
         _write_agent_config(config_dir)
-        (config_dir / "terrarium.yaml").write_text("name: t\ncreatures: []\n", encoding="utf-8")
+        (config_dir / "terrarium.yaml").write_text(
+            "name: t\ncreatures: []\n", encoding="utf-8"
+        )
         store = SessionStore(str(path))
         try:
             store.meta["format_version"] = 2
@@ -659,7 +663,9 @@ class TestResumeAgent:
     def test_rejects_real_terrarium_session(self, tmp_path, patched_llm):
         config_dir = tmp_path / "recipe"
         config_dir.mkdir()
-        (config_dir / "terrarium.yaml").write_text("name: t\ncreatures: []\n", encoding="utf-8")
+        (config_dir / "terrarium.yaml").write_text(
+            "name: t\ncreatures: []\n", encoding="utf-8"
+        )
         path = self._make_session(tmp_path, config_dir, config_type="terrarium")
         # A real terrarium session must not resume through the agent path.
         with pytest.raises(ValueError, match="terrarium"):
@@ -671,7 +677,9 @@ class TestResumeAgent:
         # was deleted; pointing users there is a dead end.
         config_dir = tmp_path / "recipe"
         config_dir.mkdir()
-        (config_dir / "terrarium.yaml").write_text("name: t\ncreatures: []\n", encoding="utf-8")
+        (config_dir / "terrarium.yaml").write_text(
+            "name: t\ncreatures: []\n", encoding="utf-8"
+        )
         path = self._make_session(tmp_path, config_dir, config_type="terrarium")
         with pytest.raises(ValueError) as excinfo:
             resume_agent(path)

@@ -176,9 +176,7 @@ def lift_legacy_reasoning_effort(
     if not isinstance(effort, str) or not effort:
         return extra, ""
 
-    remaining = {
-        k: v for k, v in reasoning.items() if k not in {"enabled", "effort"}
-    }
+    remaining = {k: v for k, v in reasoning.items() if k not in {"enabled", "effort"}}
     next_extra = dict(extra)
     if remaining:
         next_extra["reasoning"] = remaining

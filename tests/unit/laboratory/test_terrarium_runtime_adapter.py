@@ -254,9 +254,7 @@ class TestTopologyReads:
 class TestLifecycleOps:
     async def test_add_creature_prewarms_llm_override_before_build(self):
         engine = await TestTerrariumBuilder().with_creature("spawned").build()
-        adapter = TerrariumRuntimeAdapter(
-            engine, _FakeNode(), identity_cache=object()
-        )
+        adapter = TerrariumRuntimeAdapter(engine, _FakeNode(), identity_cache=object())
         calls = []
 
         async def prewarm(selector):
@@ -273,7 +271,9 @@ class TestLifecycleOps:
                 _msg(
                     "add_creature",
                     {
-                        "config": pack_creature_build_input(AgentConfig(name="spawned")),
+                        "config": pack_creature_build_input(
+                            AgentConfig(name="spawned")
+                        ),
                         "llm": "opencode-zen/zen-free",
                         "start": False,
                     },

@@ -159,6 +159,7 @@ class TestReplayConversation:
             {"role": "assistant", "content": "[compacted summary]"},
             {"role": "user", "content": "msg1"},
         ]
+
     def test_mid_turn_injected_user_is_replayed_as_user_message(self):
         events = [
             {"type": "user_message", "content": "u1", "event_id": 1},

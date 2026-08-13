@@ -9,7 +9,6 @@ identity no-op when nothing needs resolving (the common hot path).
 
 import base64
 
-from kohakuterrarium.llm import artifact_resolve
 from kohakuterrarium.llm.artifact_resolve import (
     resolve_artifact_url,
     resolve_message_image_urls,
@@ -46,12 +45,10 @@ class TestResolveArtifactUrl:
     def test_resolved_to_data_url(self, tmp_path, monkeypatch):
         store = _lay_artifact(tmp_path, monkeypatch)
         try:
-            out = resolve_artifact_url(
-                "/api/sessions/sid123/artifacts/pic.png", store
+            out = resolve_artifact_url("/api/sessions/sid123/artifacts/pic.png", store)
+            assert (
+                out == "data:image/png;base64," + base64.b64encode(b"PNGDATA").decode()
             )
-            assert out == "data:image/png;base64," + base64.b64encode(
-                b"PNGDATA"
-            ).decode()
         finally:
             store.close(update_status=False)
 

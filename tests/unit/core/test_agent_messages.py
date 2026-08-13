@@ -277,6 +277,7 @@ class TestResolveEditMessageIndex:
         idx = agent._resolve_edit_message_index(msgs, -1, turn_index=2)
         # Should resolve to the second user message.
         assert msgs[idx].content == "u2"
+
     def test_turn_index_does_not_override_explicit_user_position(self, agent):
         msgs = self._make_msgs(agent)
         # Mid-turn injected user input shares turn 1 but is a distinct

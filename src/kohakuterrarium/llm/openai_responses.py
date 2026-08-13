@@ -13,7 +13,13 @@ from typing import Any, AsyncIterator
 from openai import AsyncOpenAI
 
 from kohakuterrarium.llm.api_keys import KeyPool, get_api_key
-from kohakuterrarium.llm.base import BaseLLMProvider, ChatResponse, LLMConfig, NativeToolCall, ToolSchema
+from kohakuterrarium.llm.base import (
+    BaseLLMProvider,
+    ChatResponse,
+    LLMConfig,
+    NativeToolCall,
+    ToolSchema,
+)
 from kohakuterrarium.llm.codex_format import fix_tool_call_pairing, to_responses_input
 from kohakuterrarium.llm.openai import OPENAI_BASE_URL, ROOCODE_USER_AGENT
 from kohakuterrarium.llm.openai_sanitize import strip_kt_extras, strip_surrogates
@@ -256,7 +262,9 @@ class OpenAIResponsesProvider(BaseLLMProvider):
         if temp is not None:
             create_kwargs["temperature"] = temp
 
-        max_tok = kwargs.get("max_tokens", kwargs.get("max_output_tokens", self.max_tokens))
+        max_tok = kwargs.get(
+            "max_tokens", kwargs.get("max_output_tokens", self.max_tokens)
+        )
         if max_tok is not None:
             create_kwargs["max_output_tokens"] = max_tok
 
@@ -312,7 +320,9 @@ class OpenAIResponsesProvider(BaseLLMProvider):
         overflow_recovered = False
         while True:
             try:
-                async for chunk in self._raw_stream_chat(current, tools=tools, **kwargs):
+                async for chunk in self._raw_stream_chat(
+                    current, tools=tools, **kwargs
+                ):
                     yield chunk
                 return
             except Exception as exc:
@@ -336,7 +346,10 @@ class OpenAIResponsesProvider(BaseLLMProvider):
                         continue
                     if self._api_key_failover_limit() > 1:
                         raise
-                if cls in self._retry_policy.retry_classes and attempt < self._retry_policy.max_retries:
+                if (
+                    cls in self._retry_policy.retry_classes
+                    and attempt < self._retry_policy.max_retries
+                ):
                     attempt += 1
                     delay = backoff_delay(attempt, self._retry_policy)
                     logger.warning(
@@ -360,7 +373,9 @@ class OpenAIResponsesProvider(BaseLLMProvider):
         self._last_tool_calls = []
         self._last_usage = {}
         self._last_assistant_parts = []
-        create_kwargs = self._build_create_kwargs(messages, stream=True, tools=tools, **kwargs)
+        create_kwargs = self._build_create_kwargs(
+            messages, stream=True, tools=tools, **kwargs
+        )
         stream = await self._client.responses.create(**create_kwargs)
         collected_tool_calls: list[NativeToolCall] = []
 
@@ -384,7 +399,9 @@ class OpenAIResponsesProvider(BaseLLMProvider):
 
         self._last_tool_calls = collected_tool_calls
 
-    async def _complete_chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> ChatResponse:
+    async def _complete_chat(
+        self, messages: list[dict[str, Any]], **kwargs: Any
+    ) -> ChatResponse:
         current = messages
         attempt = 0
         api_key_failures = 0
@@ -413,7 +430,10 @@ class OpenAIResponsesProvider(BaseLLMProvider):
                         continue
                     if self._api_key_failover_limit() > 1:
                         raise
-                if cls in self._retry_policy.retry_classes and attempt < self._retry_policy.max_retries:
+                if (
+                    cls in self._retry_policy.retry_classes
+                    and attempt < self._retry_policy.max_retries
+                ):
                     attempt += 1
                     delay = backoff_delay(attempt, self._retry_policy)
                     logger.warning(
@@ -427,7 +447,9 @@ class OpenAIResponsesProvider(BaseLLMProvider):
                     continue
                 raise
 
-    async def _raw_complete_chat(self, messages: list[dict[str, Any]], **kwargs: Any) -> ChatResponse:
+    async def _raw_complete_chat(
+        self, messages: list[dict[str, Any]], **kwargs: Any
+    ) -> ChatResponse:
         self._last_tool_calls = []
         self._last_usage = {}
         self._last_assistant_parts = []

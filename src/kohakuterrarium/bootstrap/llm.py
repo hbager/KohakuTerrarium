@@ -254,9 +254,7 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
         return provider
 
     no_auth = auth_mode == "none"
-    api_key = (
-        get_api_key(profile.provider) if profile.provider and not no_auth else ""
-    )
+    api_key = get_api_key(profile.provider) if profile.provider and not no_auth else ""
     if not api_key and profile.api_key_env and not no_auth:
         api_key = get_api_key(profile.api_key_env)
     # Resolve ``${VAR}`` if stored keys are templates without collapsing pools.

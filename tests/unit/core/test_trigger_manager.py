@@ -157,15 +157,16 @@ class TestAddRemoveList:
 
             new_started.set()
             await old_released.wait()
-            assert await asyncio.wait_for(
-                asyncio.create_task(mgr.remove("same-id")), timeout=1
-            ) is True
+            assert (
+                await asyncio.wait_for(
+                    asyncio.create_task(mgr.remove("same-id")), timeout=1
+                )
+                is True
+            )
             new_removed.set()
 
         mgr = TriggerManager(process)
-        await mgr.add(
-            TimerTrigger(interval=0.01, prompt="old"), trigger_id="same-id"
-        )
+        await mgr.add(TimerTrigger(interval=0.01, prompt="old"), trigger_id="same-id")
         await asyncio.wait_for(new_removed.wait(), timeout=1)
         await asyncio.sleep(0.03)
 

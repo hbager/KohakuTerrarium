@@ -316,9 +316,7 @@ def _legacy_default_profile_by_model(
     model: str, selections: dict[str, str] | None = None
 ) -> LLMProfile | None:
     matches = [
-        preset
-        for preset in _all_preset_definitions().values()
-        if preset.model == model
+        preset for preset in _all_preset_definitions().values() if preset.model == model
     ]
     if not matches:
         return None
@@ -615,9 +613,7 @@ def resolve_controller_llm(
         for group in selector_selections:
             merged_selections.pop(group, None)
         merged_selections.update(selection_overrides)
-        profile = _get_profile_from_selector(
-            name, merged_selections, provider=provider
-        )
+        profile = _get_profile_from_selector(name, merged_selections, provider=provider)
     elif raw_model:
         model_name, model_selector_selections = parse_variation_selector(raw_model)
         if model_name:
@@ -769,7 +765,9 @@ def list_all() -> list[dict[str, Any]]:
         result.append(_entry(profile, definitions.get((provider, name)), "preset"))
 
     default = get_default_model()
-    default_base, default_selections = parse_variation_selector(default) if default else ("", {})
+    default_base, default_selections = (
+        parse_variation_selector(default) if default else ("", {})
+    )
     default_provider, default_bare = _split_provider_prefix(default_base)
     if default_base and not default_provider:
         resolved_default = _legacy_default_profile_by_model(
