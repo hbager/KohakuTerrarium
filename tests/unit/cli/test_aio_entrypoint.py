@@ -6,9 +6,9 @@ end-to-end here.  We DO test every helper it composes
 against the real filesystem and a real loopback socket.
 """
 
+from contextlib import nullcontext
 import socket
-import threading
-import time
+from unittest.mock import MagicMock
 
 
 from kohakuterrarium.cli import _aio_entrypoint as aio
@@ -60,28 +60,13 @@ class TestWaitForPort:
         # Pick a random high port unlikely to be bound.
         assert aio._wait_for_port("127.0.0.1", 1, timeout_s=0.3) is False
 
-    def test_returns_true_when_port_opens_mid_wait(self):
-        # Open the port from another thread half a second after the
-        # call starts; the waiter should succeed.
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
+    def test_retries_until_port_opens(self, monkeypatch):
+        connect = MagicMock(side_effect=[OSError, nullcontext()])
+        monkeypatch.setattr(aio.socket, "create_connection", connect)
+        monkeypatch.setattr(aio.time, "sleep", lambda _seconds: None)
 
-        def _open_later():
-            time.sleep(0.5)
-            try:
-                s.listen(1)
-                time.sleep(2.0)
-            finally:
-                s.close()
-
-        t = threading.Thread(target=_open_later, daemon=True)
-        t.start()
-        try:
-            assert aio._wait_for_port("127.0.0.1", port, timeout_s=3.0) is True
-        finally:
-            t.join(timeout=3.5)
+        assert aio._wait_for_port("127.0.0.1", 1234, timeout_s=3.0) is True
+        assert connect.call_count == 2
 
 
 class TestKtExecutable:
