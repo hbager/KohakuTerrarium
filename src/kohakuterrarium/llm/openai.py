@@ -102,6 +102,8 @@ class OpenAIProvider(BaseLLMProvider):
         self._ws_session: ResponsesWSSession | None = None
         self.echo_reasoning = bool(echo_reasoning)
         self._retry_policy = RetryPolicy.from_value(retry_policy)
+        if auth_mode not in {"api_key", "none"}:
+            raise ValueError(f"Unsupported auth mode: {auth_mode}")
         self._api_key_pool = api_key if isinstance(api_key, KeyPool) and auth_mode != "none" else None
         api_key_for_client = api_key.first if isinstance(api_key, KeyPool) else api_key
         if auth_mode == "none":
@@ -110,7 +112,12 @@ class OpenAIProvider(BaseLLMProvider):
         self.auth_mode = auth_mode
         self._base_url_input = base_url
         self._timeout = timeout
-        self._extra_headers = extra_headers or {}
+        clean_extra_headers = {
+            key: value
+            for key, value in (extra_headers or {}).items()
+            if auth_mode != "none" or key.lower() != "authorization"
+        }
+        self._extra_headers = clean_extra_headers
         self._max_retries = max_retries
         self._last_usage: dict[str, int] = {}
         self._last_assistant_extra_fields: dict[str, Any] = {}
@@ -124,12 +131,15 @@ class OpenAIProvider(BaseLLMProvider):
                 "Set OPENROUTER_API_KEY or OPENAI_API_KEY environment variable."
             )
 
+        default_headers = {"User-Agent": ROOCODE_USER_AGENT, **clean_extra_headers}
+        if auth_mode == "none":
+            default_headers["Authorization"] = ""
         self._client = AsyncOpenAI(
             api_key=api_key_for_client or "not-used",
             base_url=base_url,
             timeout=timeout,
             max_retries=max_retries,
-            default_headers={"User-Agent": ROOCODE_USER_AGENT, **self._extra_headers},
+            default_headers=default_headers,
         )
 
         # Report caching once at construction rather than on every request.
@@ -204,6 +214,8 @@ class OpenAIProvider(BaseLLMProvider):
 
     def reload_credentials(self) -> bool:
         """Rotate profile-backed credentials and rebuild the SDK client in place."""
+        if self.auth_mode == "none":
+            return False
         # Profile identity is authoritative; inline providers have no reload source.
         lookup_key = getattr(self, "_credential_provider", "") or self.provider_name
         if not lookup_key:
@@ -245,7 +257,7 @@ class OpenAIProvider(BaseLLMProvider):
 
     def _apply_request_api_key(self, create_kwargs: dict[str, Any]) -> None:
         """Attach the next pool key as a per-request authorization header."""
-        if not self._api_key_pool:
+        if self.auth_mode == "none" or not self._api_key_pool:
             return
         key = self._api_key_pool.next()
         if key:

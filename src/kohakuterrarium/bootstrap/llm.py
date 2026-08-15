@@ -158,6 +158,10 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
         backend_type=profile.backend_type,
     )
 
+    auth_mode = getattr(profile, "auth_mode", "api_key")
+    if auth_mode == "none" and profile.backend_type != "openai":
+        raise ValueError("auth_mode 'none' is only supported by openai backends")
+
     if profile.backend_type == "fake_test":
         # This backend validates the full credential path without network access.
         api_key = _resolve_profile_key(profile, keep_pool=False)
@@ -206,8 +210,9 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
         _apply_backend_native_identity(provider, profile)
         return provider
 
-    api_key = _resolve_profile_key(profile, keep_pool=True)
-    if not api_key:
+    no_auth = auth_mode == "none"
+    api_key = "" if no_auth else _resolve_profile_key(profile, keep_pool=True)
+    if not api_key and not no_auth:
         # Workers use the controller's identity store as the canonical key source.
         if _api_keys._resolver is not None:
             raise ValueError(
@@ -271,6 +276,7 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
             api_key=api_key,
             base_url=base_url,
             model=profile.model,
+            auth_mode=auth_mode,
             temperature=profile.temperature,
             max_tokens=profile.max_output or None,
             reasoning_effort=profile.reasoning_effort,
@@ -280,7 +286,7 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
         )
     provider._profile_max_context = profile.max_context
     # Retain the credential lookup key independently of native-tool identity.
-    if profile.provider:
+    if profile.provider and not no_auth:
         provider._credential_provider = profile.provider
     _apply_backend_native_identity(provider, profile)
     return provider
@@ -334,8 +340,9 @@ def _create_from_inline(config: AgentConfig) -> LLMProvider:
         return provider
 
     # Only explicit Anthropic auth selects its native transport for legacy configs.
-    api_key = config.get_api_key()
-    if not api_key:
+    no_auth = config.auth_mode == "none"
+    api_key = "" if no_auth else config.get_api_key()
+    if not api_key and not no_auth:
         env_hint = (
             f"Set the {config.api_key_env} environment variable."
             if config.api_key_env
@@ -375,6 +382,7 @@ def _create_from_inline(config: AgentConfig) -> LLMProvider:
         api_key=api_key,
         base_url=config.base_url,
         model=config.model,
+        auth_mode="none" if no_auth else "api_key",
         temperature=config.temperature,
         max_tokens=config.max_tokens,
         reasoning_effort=config.reasoning_effort,

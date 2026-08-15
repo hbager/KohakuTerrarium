@@ -18,6 +18,7 @@ class LLMBackend:
     backend_type: str
     base_url: str = ""
     api_key_env: str = ""
+    auth_mode: str = "api_key"
     provider_name: str = ""
     provider_native_tools: list[str] = field(default_factory=list)
 
@@ -27,6 +28,8 @@ class LLMBackend:
             data["base_url"] = self.base_url
         if self.api_key_env:
             data["api_key_env"] = self.api_key_env
+        if self.auth_mode != "api_key":
+            data["auth_mode"] = self.auth_mode
         if self.provider_name:
             data["provider_name"] = self.provider_name
         if self.provider_native_tools:
@@ -43,6 +46,7 @@ class LLMBackend:
             backend_type=data.get("backend_type") or data.get("provider", "openai"),
             base_url=data.get("base_url", ""),
             api_key_env=data.get("api_key_env", ""),
+            auth_mode=data.get("auth_mode", "api_key") or "api_key",
             provider_name=data.get("provider_name", ""),
             provider_native_tools=[str(tool) for tool in native_tools if tool],
         )
@@ -116,6 +120,7 @@ class LLMProfile:
     max_output: int = 65536
     base_url: str = ""
     api_key_env: str = ""
+    auth_mode: str = "api_key"
     temperature: float | None = None
     reasoning_effort: str = ""
     service_tier: str = ""
@@ -144,6 +149,7 @@ class LLMProfile:
             max_output=data.get("max_output", 65536),
             base_url=data.get("base_url", ""),
             api_key_env=data.get("api_key_env", ""),
+            auth_mode=data.get("auth_mode", "api_key") or "api_key",
             temperature=data.get("temperature"),
             reasoning_effort=data.get("reasoning_effort", ""),
             service_tier=data.get("service_tier", ""),
@@ -168,6 +174,8 @@ class LLMProfile:
             data["base_url"] = self.base_url
         if self.api_key_env:
             data["api_key_env"] = self.api_key_env
+        if self.auth_mode != "api_key":
+            data["auth_mode"] = self.auth_mode
         if self.temperature is not None:
             data["temperature"] = self.temperature
         if self.reasoning_effort:

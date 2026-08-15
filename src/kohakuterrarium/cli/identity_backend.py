@@ -46,6 +46,11 @@ def add_or_update_cli(name: str | None = None) -> int:
         ["openai", "openai_responses", "codex", "anthropic"],
         existing.backend_type if existing else "openai",
     )
+    auth_mode = _prompt_choice(
+        "Authentication",
+        ["api_key", "none"] if backend_type == "openai" else ["api_key"],
+        existing.auth_mode if existing else "api_key",
+    )
     provider_name = _prompt(
         "Provider identity (for native-tool compatibility)",
         existing.provider_name if existing and existing.provider_name else backend_name,
@@ -61,6 +66,7 @@ def add_or_update_cli(name: str | None = None) -> int:
             api_key_env=_prompt(
                 "API key env", existing.api_key_env if existing else ""
             ),
+            auth_mode=auth_mode,
             provider_name=provider_name.strip(),
             provider_native_tools=native_tools,
         )

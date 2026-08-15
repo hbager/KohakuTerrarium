@@ -42,6 +42,7 @@ def list_backends() -> list[dict[str, Any]]:
             "backend_type": backend.backend_type,
             "base_url": backend.base_url or "",
             "api_key_env": backend.api_key_env or "",
+            "auth_mode": backend.auth_mode,
             "provider_name": backend.provider_name or "",
             "provider_native_tools": list(backend.provider_native_tools),
             "built_in": name in _BUILT_IN_BACKEND_NAMES,
@@ -61,6 +62,7 @@ def save_backend_record(
     backend_type: str,
     base_url: str = "",
     api_key_env: str = "",
+    auth_mode: str = "api_key",
     provider_name: str = "",
     provider_native_tools: list[str] | None = None,
 ) -> LLMBackend:
@@ -74,6 +76,7 @@ def save_backend_record(
         backend_type=backend_type,
         base_url=base_url or "",
         api_key_env=api_key_env or "",
+        auth_mode=auth_mode,
         provider_name=provider_name or "",
         provider_native_tools=list(provider_native_tools or []),
     )

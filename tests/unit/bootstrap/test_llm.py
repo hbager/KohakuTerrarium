@@ -305,6 +305,36 @@ class TestCreateFromProfile:
         with pytest.raises(ValueError, match="kt login openai"):
             _create_from_profile(profile)
 
+    def test_no_auth_openai_profile_skips_key_resolution(self, monkeypatch):
+        monkeypatch.setattr(
+            llm_mod,
+            "get_api_key",
+            lambda key: pytest.fail("no-auth backend must not resolve an API key"),
+        )
+        profile = LLMProfile(
+            name="public",
+            model="free-model",
+            provider="public",
+            backend_type="openai",
+            base_url="https://example.test/v1",
+            auth_mode="none",
+        )
+        provider = _create_from_profile(profile)
+        assert isinstance(provider, OpenAIProvider)
+        assert provider.auth_mode == "none"
+        assert provider.reload_credentials() is False
+
+    def test_no_auth_rejected_for_non_openai_backend(self):
+        profile = LLMProfile(
+            name="bad",
+            model="claude-x",
+            provider="public",
+            backend_type="anthropic",
+            auth_mode="none",
+        )
+        with pytest.raises(ValueError, match="only supported by openai"):
+            _create_from_profile(profile)
+
     def test_key_pool_interpolates_every_key(self, monkeypatch):
         monkeypatch.setenv("KEY_ONE", "one")
         monkeypatch.setenv("KEY_TWO", "two")
@@ -358,6 +388,17 @@ class TestCreateFromInline:
         provider = _create_from_inline(cfg)
         assert isinstance(provider, OpenAIProvider)
         assert provider.config.model == "gpt-4"
+
+    def test_openai_inline_no_auth(self):
+        cfg = AgentConfig(
+            name="a",
+            model="free-model",
+            auth_mode="none",
+            base_url="https://example.test/v1",
+        )
+        provider = _create_from_inline(cfg)
+        assert isinstance(provider, OpenAIProvider)
+        assert provider.auth_mode == "none"
 
 
 # ── _apply_backend_native_identity ──────────────────────────────

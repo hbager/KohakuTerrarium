@@ -1,4 +1,5 @@
 import pytest
+import httpx
 
 from kohakuterrarium.llm import api_keys
 from kohakuterrarium.llm.api_keys import KeyPool
@@ -39,6 +40,57 @@ def test_list_api_keys_masks_key_lists(tmp_path, monkeypatch):
     monkeypatch.setenv("KT_CONFIG_DIR", str(tmp_path))
 
     assert api_keys.list_api_keys()["openai"] == "sk-a...1234, sk-g...5678"
+
+
+def test_openai_no_auth_with_model_preserves_auth_mode():
+    provider = OpenAIProvider(api_key="", model="gpt-test", auth_mode="none")
+
+    clone = provider.with_model("gpt-other")
+    request: dict = {}
+    clone._apply_request_api_key(request)
+
+    assert clone.auth_mode == "none"
+    assert "extra_headers" not in request
+
+
+@pytest.mark.asyncio
+async def test_openai_no_auth_sends_empty_authorization_header():
+    provider = OpenAIProvider(
+        api_key="", model="gpt-test", auth_mode="none", base_url="http://localhost/v1"
+    )
+    seen = {}
+
+    async def send(request, *args, **kwargs):
+        seen.update(request.headers)
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "id": "x",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "gpt-test",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                    "total_tokens": 2,
+                },
+            },
+        )
+
+    provider._client._client.send = send
+    try:
+        assert (await provider.chat_complete([{"role": "user", "content": "hi"}])).content == "ok"
+        assert seen["authorization"] == ""
+    finally:
+        await provider.close()
 
 
 def test_openai_provider_applies_rotating_authorization_header():

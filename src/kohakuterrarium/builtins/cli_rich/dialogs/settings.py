@@ -198,6 +198,7 @@ class SettingsOverlay:
                     "backend_type": backend.backend_type,
                     "base_url": backend.base_url or "",
                     "api_key_env": backend.api_key_env or "",
+                    "auth_mode": backend.auth_mode,
                     "built_in": name in _BUILTIN_PROVIDERS,
                 }
             )
@@ -487,6 +488,13 @@ class SettingsOverlay:
                     hint="← → to cycle",
                 ),
                 FormField(
+                    label="Authentication",
+                    key="auth_mode",
+                    value=(row.get("auth_mode", "api_key") if row else "api_key"),
+                    options=["api_key", "none"],
+                    hint="none: openai only",
+                ),
+                FormField(
                     label="Base URL",
                     key="base_url",
                     value=(row.get("base_url", "") if row else ""),
@@ -638,6 +646,7 @@ class SettingsOverlay:
                     backend_type=values.get("backend_type", "openai"),
                     base_url=values.get("base_url", ""),
                     api_key_env=values.get("api_key_env", ""),
+                    auth_mode=values.get("auth_mode", "api_key"),
                 )
                 save_backend(backend)
                 self._flash = f"Provider saved: {name}"
