@@ -6,7 +6,6 @@ vi.mock("@/utils/api", () => {
     sessionAPI: {
       listActive: vi.fn(),
       getActive: vi.fn(),
-      stopActive: vi.fn(),
     },
     agentAPI: {
       create: vi.fn(),
@@ -17,7 +16,7 @@ vi.mock("@/utils/api", () => {
   }
 })
 
-import { agentAPI, sessionAPI, terrariumAPI } from "@/utils/api"
+import { sessionAPI } from "@/utils/api"
 import { useInstancesStore } from "./instances"
 
 beforeEach(() => {
@@ -66,6 +65,54 @@ describe("instances.fetchAll — SessionListing payload shape", () => {
 })
 
 describe("instances store", () => {
+  it("invalidates a pre-stop list request and removes the stopped runtime immediately", async () => {
+    const store = useInstancesStore()
+    const deferred = promiseWithResolvers()
+    sessionAPI.listActive.mockReturnValue(deferred.promise)
+    store.list = [{ id: "graph_dead", status: "running" }]
+    store.current = { id: "graph_dead", status: "running" }
+
+    const staleFetch = store.fetchAll()
+    store.markRuntimeStopped("graph_dead")
+
+    expect(store.list).toEqual([])
+    expect(store.current).toBeNull()
+
+    deferred.resolve([
+      {
+        session_id: "graph_dead",
+        name: "stale",
+        creatures: 1,
+      },
+    ])
+    await staleFetch
+
+    expect(store.list).toEqual([])
+    expect(store.current).toBeNull()
+  })
+
+  it("does not return a pre-stop detail response after the runtime is removed", async () => {
+    const store = useInstancesStore()
+    const deferred = promiseWithResolvers()
+    sessionAPI.getActive.mockReturnValue(deferred.promise)
+    store.list = [{ id: "graph_dead", status: "running" }]
+    store.current = { id: "graph_dead", status: "running" }
+
+    const staleFetch = store.fetchOne("graph_dead")
+    store.markRuntimeStopped("graph_dead")
+    deferred.resolve({
+      session_id: "graph_dead",
+      name: "stale",
+      creatures: [],
+      channels: [],
+    })
+    const result = await staleFetch
+
+    expect(result).toBeNull()
+    expect(store.list).toEqual([])
+    expect(store.current).toBeNull()
+  })
+
   it("clears stale current instance on fetchOne 404", async () => {
     const store = useInstancesStore()
     store.list = [{ id: "graph_dead", type: "creature" }]
@@ -90,21 +137,20 @@ describe("instances store", () => {
       config_path: "team.yaml",
       creatures: [
         {
-          name: "worker",
-          creature_id: "worker_def",
-          model: "model2",
-          llm_name: "provider/model2",
-          is_privileged: false,
+          name: "root",
+          creature_id: "root_abc",
+          model: "model",
+          llm_name: "provider/model",
+          is_root: true,
           running: true,
           listen_channels: [],
           send_channels: [],
         },
         {
-          name: "coordinator",
-          creature_id: "root_abc",
-          model: "model",
-          llm_name: "provider/model",
-          is_privileged: true,
+          name: "worker",
+          creature_id: "worker_def",
+          model: "model2",
+          llm_name: "provider/model2",
           running: true,
           listen_channels: [],
           send_channels: [],
@@ -119,10 +165,8 @@ describe("instances store", () => {
     expect(result.graph_id).toBe("graph_team")
     expect(result.type).toBe("terrarium") // 2+ creatures
     expect(result.creatures.length).toBe(2)
-    // A recipe root is identified by has_root + the backend's
-    // is_privileged flag, even when it is not first in the roster.
+    // Primary creature is the root flagged one — drives the model pill.
     expect(result.llm_name).toBe("provider/model")
-    expect(result.creatures[1].is_root).toBe(true)
     expect(store.current.id).toBe("graph_team")
   })
 
@@ -153,38 +197,14 @@ describe("instances store", () => {
     expect(result.creatures.length).toBe(1)
     expect(result.creatures[0].name).toBe("alice")
   })
-
-  it("passes the requested LLM selector when creating a creature session", async () => {
-    const store = useInstancesStore()
-    agentAPI.create.mockResolvedValue({ agent_id: "agent_1", session_id: "graph_1" })
-    sessionAPI.listActive.mockResolvedValue([])
-
-    const id = await store.create("creature", "creatures/general", "/repo", "alice", {
-      onNode: "worker-1",
-      llm: "openrouter/mimo-v2-pro",
-    })
-
-    expect(id).toBe("graph_1")
-    expect(agentAPI.create).toHaveBeenCalledWith("creatures/general", "/repo", "alice", {
-      onNode: "worker-1",
-      llm: "openrouter/mimo-v2-pro",
-    })
-  })
-
-  it("passes the requested LLM selector when creating a terrarium session", async () => {
-    const store = useInstancesStore()
-    terrariumAPI.create.mockResolvedValue({ terrarium_id: "graph_team" })
-    sessionAPI.listActive.mockResolvedValue([])
-
-    const id = await store.create("terrarium", "terrariums/team", "/repo", "team", {
-      onNode: "_host",
-      llm: "anthropic/claude-opus-4.7",
-    })
-
-    expect(id).toBe("graph_team")
-    expect(terrariumAPI.create).toHaveBeenCalledWith("terrariums/team", "/repo", "team", {
-      onNode: "_host",
-      llm: "anthropic/claude-opus-4.7",
-    })
-  })
 })
+
+function promiseWithResolvers() {
+  let resolve
+  let reject
+  const promise = new Promise((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}

@@ -1,8 +1,5 @@
 """
-OpenAI-compatible LLM provider using the OpenAI Python SDK.
-
-Supports OpenAI API and compatible services like OpenRouter, Together AI, etc.
-Uses AsyncOpenAI for all API calls (streaming + non-streaming).
+Provide streaming and complete chat access to OpenAI-compatible endpoints.
 """
 
 import asyncio
@@ -19,8 +16,10 @@ from kohakuterrarium.llm.base import (
     BaseLLMProvider,
     ChatResponse,
     LLMConfig,
+    OverflowRecoveryState,
     ToolSchema,
 )
+from kohakuterrarium.llm.artifact_resolve import resolve_message_image_urls
 from kohakuterrarium.llm.openai_helpers import (
     apply_request_controls,
     delta_field,
@@ -38,13 +37,14 @@ from kohakuterrarium.llm.openai_sanitize import (
     strip_kt_extras,
     strip_surrogates,
 )
+from kohakuterrarium.llm.openai_ws import stream_ws_turn
 from kohakuterrarium.llm.recovery import (
     ErrorClass,
     RetryPolicy,
     backoff_delay,
     classify_openai_error,
-    drop_last_tool_round,
 )
+from kohakuterrarium.llm.responses_ws import ResponsesWSError, ResponsesWSSession
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -52,35 +52,17 @@ logger = get_logger(__name__)
 _delta_field = delta_field
 _pack_reasoning_fields = pack_reasoning_fields
 
-# Default API endpoints
+# Canonical endpoints used by built-in profiles.
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-# ROOCODE_USER_AGENT = "RooCode/3.52.1"
-ROOCODE_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+ROOCODE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+)
 
 
 class OpenAIProvider(BaseLLMProvider):
-    """OpenAI API-compatible LLM provider using the official SDK.
-
-    Works with:
-    - OpenAI API (default)
-    - OpenRouter (set base_url to OPENROUTER_BASE_URL)
-    - Any OpenAI-compatible endpoint
-
-    Usage::
-
-        provider = OpenAIProvider(api_key="sk-...", model="gpt-4o")
-
-        # OpenRouter
-        provider = OpenAIProvider(
-            api_key="sk-or-...",
-            base_url=OPENROUTER_BASE_URL,
-            model="anthropic/claude-3-opus",
-        )
-
-        async for chunk in provider.chat(messages):
-            print(chunk, end="")
-    """
+    """OpenAI-compatible provider with retries, tools, caching, and reasoning echo."""
 
     def __init__(
         self,
@@ -99,32 +81,9 @@ class OpenAIProvider(BaseLLMProvider):
         max_retries: int = 3,
         echo_reasoning: bool = True,
         retry_policy: RetryPolicy | dict[str, Any] | None = None,
+        websocket_mode: bool = False,
     ):
-        """Initialize the OpenAI provider.
-
-        Args:
-            api_key: API key for authentication
-            model: Model identifier
-            base_url: API base URL (change for OpenRouter, etc.)
-            auth_mode: ``api_key`` (default) or ``none`` for public endpoints
-            temperature: Sampling temperature
-            max_tokens: Maximum tokens to generate
-            reasoning_effort: Optional top-level OpenAI reasoning effort.
-            service_tier: Optional top-level OpenAI service tier.
-            timeout: Request timeout in seconds
-            extra_headers: Additional headers (e.g., for OpenRouter HTTP-Referer)
-            extra_body: Additional fields merged into every API request body
-                (e.g., {"reasoning": {"enabled": True}})
-            max_retries: Maximum retry attempts for transient errors
-            echo_reasoning: When ``True`` (default) capture provider-
-                emitted reasoning fields (``reasoning_content``,
-                ``reasoning_details``, ``reasoning``) and echo them back
-                on the next turn via :attr:`last_assistant_extra_fields`.
-                Required for stateful-chain reasoning on DeepSeek V4,
-                MiMo V2.5 (OpenRouter), Qwen, Grok, and similar. Turn
-                off for providers that 400 on unknown fields (e.g.
-                older DeepSeek V3) — the agent stores nothing.
-        """
+        """Configure an OpenAI-compatible client and optional stateful reasoning echo."""
         super().__init__(
             LLMConfig(
                 model=model,
@@ -137,11 +96,13 @@ class OpenAIProvider(BaseLLMProvider):
         self.extra_body = extra_body or {}
         self.reasoning_effort = reasoning_effort or ""
         self.service_tier = service_tier
+        self._websocket_mode = bool(
+            websocket_mode or self.extra_body.get("websocket_mode")
+        )
+        self._ws_session: ResponsesWSSession | None = None
         self.echo_reasoning = bool(echo_reasoning)
         self._retry_policy = RetryPolicy.from_value(retry_policy)
-        self._api_key_pool = (
-            api_key if isinstance(api_key, KeyPool) and auth_mode != "none" else None
-        )
+        self._api_key_pool = api_key if isinstance(api_key, KeyPool) and auth_mode != "none" else None
         api_key_for_client = api_key.first if isinstance(api_key, KeyPool) else api_key
         if auth_mode == "none":
             api_key_for_client = None
@@ -149,46 +110,29 @@ class OpenAIProvider(BaseLLMProvider):
         self.auth_mode = auth_mode
         self._base_url_input = base_url
         self._timeout = timeout
-        clean_extra_headers = {
-            key: value
-            for key, value in (extra_headers or {}).items()
-            if auth_mode != "none" or key.lower() != "authorization"
-        }
-        self._extra_headers = clean_extra_headers
+        self._extra_headers = extra_headers or {}
         self._max_retries = max_retries
         self._last_usage: dict[str, int] = {}
         self._last_assistant_extra_fields: dict[str, Any] = {}
         self.prompt_cache_key: str | None = None
-        # Retained so :mod:`anthropic_cache` can sniff whether caching
-        # applies — the SDK client stores a trailing-slash-normalised URL
-        # which is fine for ``"anthropic.com" in ...`` matching.
+        # Retain the endpoint string because cache detection cannot rely on SDK internals.
         self.base_url: str = base_url or ""
 
-        if auth_mode not in {"api_key", "none"}:
-            raise ValueError(f"Unsupported auth mode: {auth_mode}")
         if not api_key_for_client and auth_mode != "none":
             raise ValueError(
                 "API key is required. "
                 "Set OPENROUTER_API_KEY or OPENAI_API_KEY environment variable."
             )
 
-        default_headers: dict[str, Any] = {
-            "User-Agent": ROOCODE_USER_AGENT,
-            **clean_extra_headers,
-        }
-        if auth_mode == "none":
-            default_headers["Authorization"] = ""
         self._client = AsyncOpenAI(
             api_key=api_key_for_client or "not-used",
             base_url=base_url,
             timeout=timeout,
             max_retries=max_retries,
-            default_headers=default_headers,
+            default_headers={"User-Agent": ROOCODE_USER_AGENT, **self._extra_headers},
         )
 
-        # Log whether auto-caching will be engaged for this provider. One
-        # line per construction (typically once per agent / model switch)
-        # is enough — the actual per-turn caching path stays silent.
+        # Report caching once at construction rather than on every request.
         anthropic = is_anthropic_endpoint(self.base_url, None)
         disabled = bool(self.extra_body.get("disable_prompt_caching"))
         if anthropic and not disabled:
@@ -206,7 +150,10 @@ class OpenAIProvider(BaseLLMProvider):
         )
 
     async def close(self) -> None:
-        """Close the underlying HTTP client."""
+        """Close the WebSocket session and the underlying HTTP client."""
+        if self._ws_session is not None:
+            await self._ws_session.close()
+            self._ws_session = None
         await self._client.close()
 
     def with_model(self, name: str) -> "OpenAIProvider":
@@ -226,6 +173,8 @@ class OpenAIProvider(BaseLLMProvider):
         clone.extra_body = dict(self.extra_body)
         clone.reasoning_effort = self.reasoning_effort
         clone.service_tier = self.service_tier
+        clone._websocket_mode = self._websocket_mode
+        clone._ws_session = None
         clone.echo_reasoning = self.echo_reasoning
         clone._retry_policy = self._retry_policy
         clone._api_key_pool = self._api_key_pool
@@ -254,35 +203,8 @@ class OpenAIProvider(BaseLLMProvider):
         return clone
 
     def reload_credentials(self) -> bool:
-        """Re-resolve the API key + rebuild the SDK client in place.
-
-        Called by the engine when the user updates a provider key via
-        the frontend Settings → Providers page. Without this hot
-        rebuild, the cached :class:`AsyncOpenAI` would keep sending
-        the stale Authorization header — the user would have to restart
-        the creature (or the server) for the new key to take effect.
-
-        Resolution uses :func:`get_api_key` against
-        :attr:`_credential_provider` (the backend NAME, e.g.
-        ``"openrouter"`` — the same key the boot path used) when set,
-        falling back to :attr:`provider_name` for legacy callers that
-        only stamp the native-tool compat field. Built-in backends
-        (openai/openrouter/anthropic/gemini/mimo) leave
-        ``provider_name`` empty by design — credential lookup has to
-        use the backend NAME instead, which is what the boot path
-        already does when fetching ``profile.provider``'s key.
-
-        Inline configs (no profile / no backend name) get a no-op
-        since they only read env at construction; the user would have
-        to set the env + restart anyway.
-
-        Returns ``True`` when the credential rotated. The old SDK
-        client is closed on the running event loop best-effort —
-        in-flight requests against it either complete naturally or
-        surface the rotation as a one-shot 401 on the next attempt.
-        """
-        if self.auth_mode == "none":
-            return False
+        """Rotate profile-backed credentials and rebuild the SDK client in place."""
+        # Profile identity is authoritative; inline providers have no reload source.
         lookup_key = getattr(self, "_credential_provider", "") or self.provider_name
         if not lookup_key:
             return False
@@ -296,6 +218,8 @@ class OpenAIProvider(BaseLLMProvider):
         ):
             return False
         old = self._client
+        old_session = self._ws_session
+        self._ws_session = None
         self._api_key_pool = new_key_pool if new_key_pool.is_pool else None
         self._api_key = new_key
         self._client = AsyncOpenAI(
@@ -307,11 +231,11 @@ class OpenAIProvider(BaseLLMProvider):
         )
         try:
             loop = asyncio.get_running_loop()
+            if old_session is not None:
+                loop.create_task(old_session.close())
             loop.create_task(old.close())
         except RuntimeError:
-            # No running loop — closing synchronously is unsafe (it'd
-            # spin up a temporary loop and confuse anyio). Drop the ref
-            # and let GC finalise the underlying httpx client.
+            # A temporary loop can corrupt anyio state, so defer cleanup to GC.
             pass
         logger.info(
             "OpenAIProvider credentials reloaded",
@@ -319,28 +243,52 @@ class OpenAIProvider(BaseLLMProvider):
         )
         return True
 
-    # ------------------------------------------------------------------
-    # Streaming
-    # ------------------------------------------------------------------
+    def _apply_request_api_key(self, create_kwargs: dict[str, Any]) -> None:
+        """Attach the next pool key as a per-request authorization header."""
+        if not self._api_key_pool:
+            return
+        key = self._api_key_pool.next()
+        if key:
+            headers = dict(create_kwargs.get("extra_headers") or {})
+            headers["Authorization"] = f"Bearer {key}"
+            create_kwargs["extra_headers"] = headers
+
+    def _api_key_failover_limit(self) -> int:
+        return min(5, len(self._api_key_pool.keys)) if self._api_key_pool else 0
+
+    def _should_failover_api_key(self, error_class: ErrorClass, failures: int) -> bool:
+        return (
+            bool(self._api_key_pool)
+            and error_class in {ErrorClass.USER_ERROR, ErrorClass.RATE_LIMIT}
+            and failures < self._api_key_failover_limit()
+        )
+
+    def _log_api_key_failover(
+        self, error_class: ErrorClass, failure_number: int, exc: Exception
+    ) -> None:
+        logger.warning(
+            "provider_api_key_failover",
+            attempt=failure_number,
+            error_class=error_class.value,
+            error=str(exc),
+        )
+
+    def _ws_session_for_turn(self) -> ResponsesWSSession | None:
+        """Return the WS session, or ``None`` when a turn is already in flight."""
+        if self._ws_session is None:
+
+            def _factory() -> Any:
+                # Late-bound so credential reloads pick up the rebuilt client.
+                return self._client.responses.connect(max_retries=0)
+
+            self._ws_session = ResponsesWSSession(_factory)
+        if self._ws_session.busy:
+            return None
+        return self._ws_session
 
     def _prepare_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Sanitize content parts, then apply Anthropic cache markers.
-
-        Step 1: strip KT-internal fields (e.g. ``ImagePart.meta``
-        carrying chat-panel badge metadata) from content parts. Strict
-        OpenAI-compatible providers — vLLM-hosted vision models, SGLang,
-        MiMo, and similar — drop or ignore content parts with unknown
-        top-level keys, producing the failure mode "the model says it
-        sees no image." OpenAI proper tolerates the extras but every
-        custom OpenAI-compat backend is its own parser. See
-        :func:`strip_kt_extras`.
-
-        Step 2: for Anthropic endpoints (and unless the user opts out
-        via ``disable_prompt_caching``), tag system + the last three
-        non-tool messages with cache_control markers.
-        Local artifact URLs are resolved at the Controller boundary before
-        plugin-transformed messages reach any provider.
-        """
+        """Resolve local images, strip internal fields, and add eligible cache markers."""
+        messages = resolve_message_image_urls(messages)
         messages = strip_kt_extras(messages)
         messages = normalize_stateful_assistant_fields(messages)
         if not is_anthropic_endpoint(self.base_url, None):
@@ -349,39 +297,12 @@ class OpenAIProvider(BaseLLMProvider):
             return messages
         return apply_anthropic_cache_markers(messages)
 
-    def _next_api_key(self) -> str:
-        """Return the API key for this request.
-
-        A KeyPool rotates keys per request; single-key providers keep the
-        initialized SDK client's key.
-        """
-        if self._api_key_pool:
-            return self._api_key_pool.next()
-        return self._api_key or ""
-
-    def _apply_request_api_key(self, create_kwargs: dict[str, Any]) -> None:
-        """Attach per-request auth headers when a key pool is configured."""
-        if self.auth_mode == "none" or not self._api_key_pool:
-            return
-        key = self._api_key_pool.next()
-        if not key:
-            return
-        headers = dict(create_kwargs.get("extra_headers") or {})
-        headers["Authorization"] = f"Bearer {key}"
-        create_kwargs["extra_headers"] = headers
-
     def _sanitize_extra_body(self, extra: dict[str, Any]) -> dict[str, Any]:
-        """Strip KT-internal knobs before sending to the provider.
-
-        ``disable_prompt_caching`` is a KohakuTerrarium-level flag (user
-        opt-out). Anthropic would reject it as an unknown field, and
-        other providers would pass it through verbatim into logs. Drop
-        it here — the caching branch already read it.
-        """
-        if "disable_prompt_caching" not in extra:
+        """Remove framework-only request knobs before provider submission."""
+        knobs = ("disable_prompt_caching", "websocket_mode")
+        if not any(k in extra for k in knobs):
             return extra
-        cleaned = {k: v for k, v in extra.items() if k != "disable_prompt_caching"}
-        return cleaned
+        return {k: v for k, v in extra.items() if k not in knobs}
 
     async def _stream_chat(
         self,
@@ -394,7 +315,7 @@ class OpenAIProvider(BaseLLMProvider):
         current = messages
         attempt = 0
         api_key_failures = 0
-        overflow_recovered = False
+        overflow_state = OverflowRecoveryState()
         while True:
             try:
                 async for chunk in self._raw_stream_chat(
@@ -404,21 +325,16 @@ class OpenAIProvider(BaseLLMProvider):
                 return
             except Exception as exc:
                 cls = classify_openai_error(exc)
-                if cls is ErrorClass.OVERFLOW and not overflow_recovered:
-                    dropped, recovered = drop_last_tool_round(current)
-                    if dropped:
-                        overflow_recovered = True
-                        current = recovered
-                        self._notify_emergency_drop(recovered)
-                        logger.warning(
-                            "provider_emergency_drop",
-                            dropped=dropped,
-                            recovered_messages=len(recovered),
-                        )
+                if cls is ErrorClass.OVERFLOW:
+                    replacement = await self._recover_from_overflow(
+                        current, overflow_state
+                    )
+                    if replacement is not None:
+                        current = replacement
                         continue
-                if cls is not ErrorClass.OVERFLOW:
+                if cls in {ErrorClass.USER_ERROR, ErrorClass.RATE_LIMIT}:
                     api_key_failures += 1
-                    if self._should_failover_api_key(cls, api_key_failures - 1):
+                    if self._should_failover_api_key(cls, api_key_failures):
                         self._log_api_key_failover(cls, api_key_failures, exc)
                         continue
                     if self._api_key_failover_limit() > 1:
@@ -451,6 +367,26 @@ class OpenAIProvider(BaseLLMProvider):
         self._last_tool_calls = []
         self._last_assistant_extra_fields = {}
 
+        if self._websocket_mode:
+            session = self._ws_session_for_turn()
+            if session is not None:
+                try:
+                    async for piece in stream_ws_turn(
+                        self, session, messages, tools, kwargs
+                    ):
+                        yield piece
+                    return
+                except ResponsesWSError as exc:
+                    if exc.mid_stream:
+                        raise
+                    logger.warning(
+                        "Responses WebSocket turn unavailable, using HTTP",
+                        error=str(exc),
+                    )
+        # An HTTP turn advances the conversation past the WS-side cache.
+        if self._ws_session is not None:
+            self._ws_session.invalidate()
+
         api_tools = [t.to_api_format() for t in tools] if tools else None
 
         create_kwargs: dict[str, Any] = {
@@ -460,7 +396,6 @@ class OpenAIProvider(BaseLLMProvider):
             "stream_options": {"include_usage": True},
         }
 
-        # Optional parameters
         temp = kwargs.get("temperature", self.config.temperature)
         if temp is not None:
             create_kwargs["temperature"] = temp
@@ -476,7 +411,6 @@ class OpenAIProvider(BaseLLMProvider):
         if api_tools:
             create_kwargs["tools"] = api_tools
 
-        # extra_body: merged into the request body by the SDK
         merged_extra = {**self.extra_body}
         if "extra_body" in kwargs:
             merged_extra.update(kwargs["extra_body"])
@@ -491,7 +425,7 @@ class OpenAIProvider(BaseLLMProvider):
         if merged_extra:
             create_kwargs["extra_body"] = merged_extra
 
-        # Prompt cache key: first-class SDK parameter for routing stickiness
+        # Stable routing allows compatible backends to reuse cached prompt prefixes.
         if self.prompt_cache_key:
             create_kwargs["prompt_cache_key"] = self.prompt_cache_key
 
@@ -514,7 +448,6 @@ class OpenAIProvider(BaseLLMProvider):
         stream = await self._client.chat.completions.create(**create_kwargs)
 
         async for chunk in stream:
-            # Usage (usually in the final chunk)
             if chunk.usage:
                 self._last_usage = extract_usage(chunk.usage)
 
@@ -523,7 +456,6 @@ class OpenAIProvider(BaseLLMProvider):
 
             delta = chunk.choices[0].delta
 
-            # Accumulate native tool call deltas
             if delta.tool_calls:
                 for tc_delta in delta.tool_calls:
                     idx = tc_delta.index
@@ -539,9 +471,7 @@ class OpenAIProvider(BaseLLMProvider):
                                 "arguments"
                             ] += tc_delta.function.arguments
 
-            # Capture provider-specific reasoning deltas when enabled.
-            # These aren't on the typed OpenAI SDK delta surface; the
-            # SDK exposes unknown response fields via ``model_extra``.
+            # Stateful reasoning fields arrive through the SDK's untyped extra surface.
             if self.echo_reasoning:
                 if delta_field_present(delta, "reasoning_content"):
                     reasoning_text_seen = True
@@ -552,17 +482,11 @@ class OpenAIProvider(BaseLLMProvider):
                     reasoning_details_seen = True
                 rd_piece = delta_field(delta, "reasoning_details")
                 if isinstance(rd_piece, list):
-                    # Merge by (type, index) so streaming text chunks +
-                    # final signature entry collapse into ONE logical
-                    # reasoning block. ``list.extend`` here is what
-                    # was breaking the Anthropic round-trip — see
-                    # :func:`merge_reasoning_detail_stream`.
+                    # Merge by identity so streamed fragments round-trip as one block.
                     for entry in rd_piece:
                         if isinstance(entry, dict):
                             merge_reasoning_detail_stream(reasoning_details, entry)
-                # OpenRouter also occasionally emits a plain "reasoning"
-                # string alongside ``reasoning_details`` — keep it when
-                # present, even if the provider emitted an empty value.
+                # Preserve the plain reasoning field independently of structured details.
                 if delta_field_present(delta, "reasoning"):
                     r_piece = delta_field(delta, "reasoning")
                     if isinstance(r_piece, str):
@@ -570,11 +494,9 @@ class OpenAIProvider(BaseLLMProvider):
                             reasoning_extra.get("reasoning", "") + r_piece
                         )
 
-            # Yield text content (sanitize surrogates from LLM output)
             if delta.content:
                 yield strip_surrogates(delta.content)
 
-        # Finalize tool calls
         if pending_calls:
             self._last_tool_calls = [
                 tool_call_from_pending(call)
@@ -608,10 +530,6 @@ class OpenAIProvider(BaseLLMProvider):
 
         log_token_usage(self._last_usage)
 
-    # ------------------------------------------------------------------
-    # Non-streaming
-    # ------------------------------------------------------------------
-
     async def _complete_chat(
         self,
         messages: list[dict[str, Any]],
@@ -621,27 +539,22 @@ class OpenAIProvider(BaseLLMProvider):
         current = messages
         attempt = 0
         api_key_failures = 0
-        overflow_recovered = False
+        overflow_state = OverflowRecoveryState()
         while True:
             try:
                 return await self._raw_complete_chat(current, **kwargs)
             except Exception as exc:
                 cls = classify_openai_error(exc)
-                if cls is ErrorClass.OVERFLOW and not overflow_recovered:
-                    dropped, recovered = drop_last_tool_round(current)
-                    if dropped:
-                        overflow_recovered = True
-                        current = recovered
-                        self._notify_emergency_drop(recovered)
-                        logger.warning(
-                            "provider_emergency_drop",
-                            dropped=dropped,
-                            recovered_messages=len(recovered),
-                        )
+                if cls is ErrorClass.OVERFLOW:
+                    replacement = await self._recover_from_overflow(
+                        current, overflow_state
+                    )
+                    if replacement is not None:
+                        current = replacement
                         continue
-                if cls is not ErrorClass.OVERFLOW:
+                if cls in {ErrorClass.USER_ERROR, ErrorClass.RATE_LIMIT}:
                     api_key_failures += 1
-                    if self._should_failover_api_key(cls, api_key_failures - 1):
+                    if self._should_failover_api_key(cls, api_key_failures):
                         self._log_api_key_failover(cls, api_key_failures, exc)
                         continue
                     if self._api_key_failover_limit() > 1:
@@ -671,6 +584,9 @@ class OpenAIProvider(BaseLLMProvider):
         """Non-streaming chat completion via the OpenAI SDK."""
         self._last_tool_calls = []
         self._last_assistant_extra_fields = {}
+        # A Chat Completions turn advances past the WS-side cache.
+        if self._ws_session is not None:
+            self._ws_session.invalidate()
 
         create_kwargs: dict[str, Any] = {
             "model": kwargs.get("model", self.config.model),
@@ -715,7 +631,6 @@ class OpenAIProvider(BaseLLMProvider):
         choice = response.choices[0]
         message = choice.message
 
-        # Extract native tool calls
         if message.tool_calls:
             self._last_tool_calls = tool_calls_from_message(message.tool_calls)
             logger.debug(
@@ -724,7 +639,6 @@ class OpenAIProvider(BaseLLMProvider):
                 tools=[tc.name for tc in self._last_tool_calls],
             )
 
-        # Capture reasoning fields off the complete assistant message.
         if self.echo_reasoning:
             rc = delta_field(message, "reasoning_content")
             rd = delta_field(message, "reasoning_details")
@@ -757,10 +671,6 @@ class OpenAIProvider(BaseLLMProvider):
             usage=self._last_usage,
             model=response.model,
         )
-
-    # ------------------------------------------------------------------
-    # Context manager
-    # ------------------------------------------------------------------
 
     async def __aenter__(self) -> "OpenAIProvider":
         return self

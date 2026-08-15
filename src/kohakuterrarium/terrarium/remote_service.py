@@ -30,16 +30,28 @@ explicit admin tooling, not the standard service surface.
 from collections.abc import AsyncIterator
 from typing import Any
 
+from kohakuterrarium.errors import ConflictError, InvalidRequestError
 from kohakuterrarium.laboratory.protocols import LabSender
+from kohakuterrarium.laboratory._internal.client import (
+    RequestAbortedError,
+    RequestTimeoutError,
+)
 from kohakuterrarium.laboratory.streams import RemoteStream, StreamDemux
+from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.terrarium.creature_host import Creature
+from kohakuterrarium.terrarium.drive.remote_ops import RemoteDriveServiceMixin
+from kohakuterrarium.terrarium.drive.service_protocol import (
+    DriveServiceUnsupportedMixin,
+)
 from kohakuterrarium.terrarium.events import (
     ConnectionResult,
     DisconnectionResult,
     EngineEvent,
     EventFilter,
 )
+from kohakuterrarium.terrarium.remote_recipe import RemoteRecipeServiceMixin
 from kohakuterrarium.terrarium.service import CreatureInfo
+from kohakuterrarium.terrarium.service_dto import BranchMutationResult
 from kohakuterrarium.terrarium.topology import (
     ChannelInfo,
     GraphTopology,
@@ -57,6 +69,14 @@ from kohakuterrarium.terrarium.wire import (
     unpack_graph_topology,
     unpack_topology_delta,
 )
+from kohakuterrarium.utils.logging import get_logger
+
+logger = get_logger(__name__)
+
+# ``regenerate`` / ``edit_message`` block through an entire LLM turn on
+# the worker — they need a far larger ceiling than the 30s
+# control-plane default.
+TURN_REQUEST_TIMEOUT = 3600.0
 
 
 class RemoteEngineError(RuntimeError):
@@ -93,18 +113,66 @@ def _maybe_raise(body: Any) -> dict[str, Any]:
             raise CreatureNotHostedHere(message)
         if kind == "not_found":
             raise KeyError(message)
+        if kind == "conflict":
+            raise ConflictError(message)
         if kind == "invalid":
-            raise ValueError(message)
+            raise InvalidRequestError(message)
         raise RemoteEngineError(kind, message)
     return body
 
 
-class RemoteTerrariumService:
+def _branch_mutation_result(body: dict[str, Any]) -> BranchMutationResult:
+    """Validate the worker response against the public mutation DTO."""
+    required = {"status", "turn_index", "branch_id", "parent_branch_path"}
+    missing = required.difference(body)
+    if missing:
+        names = ", ".join(sorted(missing))
+        raise RemoteEngineError(
+            "invalid_response", f"branch mutation response is missing: {names}"
+        )
+    if body["status"] != "completed":
+        raise RemoteEngineError(
+            "invalid_response",
+            f"unexpected branch mutation status: {body['status']!r}",
+        )
+    parent_path = body["parent_branch_path"]
+    if not isinstance(parent_path, (list, tuple)):
+        raise RemoteEngineError(
+            "invalid_response", "parent_branch_path must be a sequence"
+        )
+    try:
+        return {
+            "status": "completed",
+            "request_id": (
+                str(body["request_id"]) if body.get("request_id") is not None else None
+            ),
+            "turn_index": int(body["turn_index"]),
+            "branch_id": int(body["branch_id"]),
+            "parent_branch_path": [
+                [int(pair[0]), int(pair[1])] for pair in parent_path
+            ],
+        }
+    except (IndexError, TypeError, ValueError) as exc:
+        raise RemoteEngineError(
+            "invalid_response", "invalid branch mutation response"
+        ) from exc
+
+
+class RemoteTerrariumService(
+    RemoteRecipeServiceMixin,
+    RemoteDriveServiceMixin,
+    DriveServiceUnsupportedMixin,
+):
     """Controller-side proxy for a worker node's Terrarium engine.
 
     Implements the :class:`TerrariumService` Protocol over Lab APP
     requests.  Construct one per remote node the controller knows
     about; typically managed by :class:`MultiNodeTerrariumService`.
+
+    The Drive surface comes from
+    :class:`~kohakuterrarium.terrarium.drive.remote_ops.RemoteDriveServiceMixin`,
+    which routes every ``drive_*`` op to this worker's ``terrarium.runtime``
+    adapter; the unsupported stubs remain a defensive MRO floor.
     """
 
     def __init__(
@@ -234,9 +302,6 @@ class RemoteTerrariumService:
     async def remove_creature(self, creature_id: str) -> None:
         _maybe_raise(await self._req("remove_creature", {"creature_id": creature_id}))
 
-    async def remove_graph(self, graph_id: str) -> None:
-        _maybe_raise(await self._req("remove_graph", {"graph_id": graph_id}))
-
     async def start_creature(self, creature_id: str) -> None:
         _maybe_raise(await self._req("start_creature", {"creature_id": creature_id}))
 
@@ -253,7 +318,7 @@ class RemoteTerrariumService:
         return None
 
     # ------------------------------------------------------------------
-    # Per-creature control (per ``api-lab-design.md`` §2)
+    # Per-creature control
     # ------------------------------------------------------------------
 
     async def interrupt(self, creature_id: str) -> None:
@@ -299,18 +364,30 @@ class RemoteTerrariumService:
         *,
         turn_index: int | None = None,
         branch_view: dict[int, int] | None = None,
-    ) -> dict[str, Any]:
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> BranchMutationResult:
         body = _maybe_raise(
-            await self._req(
+            await self._req_turn_mutation(
                 "regenerate",
                 {
                     "creature_id": creature_id,
                     "turn_index": turn_index,
                     "branch_view": branch_view,
+                    "request_id": request_id,
+                    "target": (
+                        {
+                            "event_id": target.event_id,
+                            "turn_index": target.turn_index,
+                            "branch_id": target.branch_id,
+                        }
+                        if target is not None
+                        else None
+                    ),
                 },
             )
         )
-        return body
+        return _branch_mutation_result(body)
 
     async def edit_message(
         self,
@@ -321,9 +398,11 @@ class RemoteTerrariumService:
         turn_index: int | None = None,
         user_position: int | None = None,
         branch_view: dict[int, int] | None = None,
-    ) -> bool | dict[str, Any]:
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> BranchMutationResult:
         body = _maybe_raise(
-            await self._req(
+            await self._req_turn_mutation(
                 "edit_message",
                 {
                     "creature_id": creature_id,
@@ -332,22 +411,20 @@ class RemoteTerrariumService:
                     "turn_index": turn_index,
                     "user_position": user_position,
                     "branch_view": branch_view,
+                    "request_id": request_id,
+                    "target": (
+                        {
+                            "event_id": target.event_id,
+                            "turn_index": target.turn_index,
+                            "branch_id": target.branch_id,
+                        }
+                        if target is not None
+                        else None
+                    ),
                 },
             )
         )
-        # Newer workers return the freshly-opened branch_id in the
-        # body so callers can promote their navigator immediately.
-        # Legacy workers only set ``edited`` — fall back to that.
-        if not bool(body.get("edited", False)):
-            return False
-        result_keys = ("status", "turn_index", "branch_id", "user_position")
-        out: dict[str, Any] = {
-            k: body[k] for k in result_keys if body.get(k) is not None
-        }
-        if not out:
-            return True
-        out.setdefault("status", "edited")
-        return out
+        return _branch_mutation_result(body)
 
     async def rewind(self, creature_id: str, msg_idx: int) -> None:
         _maybe_raise(
@@ -538,13 +615,27 @@ class RemoteTerrariumService:
         )
         return body
 
+    async def command_inventory(self, creature_id: str) -> dict[str, Any]:
+        body = _maybe_raise(
+            await self._req(
+                "command_inventory",
+                {"creature_id": creature_id},
+            )
+        )
+        return body
+
     async def execute_command(
         self,
         creature_id: str,
         command: str,
         args: dict[str, Any] | str | None = None,
+        *,
+        principal: str = "user:local",
+        is_operator: bool = False,
     ) -> dict[str, Any]:
-        # Args is conventionally a string; accept dict for forward-compat.
+        # Args is conventionally a string; accept dict for forward compatibility.
+        # The host-authorized principal/operator travel over the trusted
+        # host-to-worker link, and the worker rejects non-host origins.
         body = _maybe_raise(
             await self._req(
                 "execute_command",
@@ -552,6 +643,8 @@ class RemoteTerrariumService:
                     "creature_id": creature_id,
                     "command": command,
                     "args": args if args is not None else "",
+                    "principal": principal,
+                    "is_operator": is_operator,
                 },
             )
         )
@@ -637,17 +730,13 @@ class RemoteTerrariumService:
     async def runtime_graph_snapshot(self) -> dict[str, Any]:
         body = _maybe_raise(await self._req("runtime_graph_snapshot", {}))
         snap = body.get("snapshot", {"graphs": [], "version": 0})
-        # The worker's own snapshot reports ``node_id="_host"`` for each
-        # graph because, on its side, IT *is* the host of its engine.
-        # Rewrite to OUR ``node_id`` so the host-side aggregator and the
-        # graph editor render worker graphs with the correct site chip
-        # (user-reported "graphs show as host" bug stems from this
-        # missing rewrite — cluster linkage also keys on this id).
+        # A worker reports ``node_id="_host"`` because it hosts its own engine.
+        # Rewrite that local identity to the controller's node id so aggregation,
+        # cluster linkage, and graph rendering identify the worker correctly.
         for graph in snap.get("graphs", []):
             graph["node_id"] = self._target_node
-            # Stamp each creature's home site so the graph editor can
-            # render the per-creature worker chip (BUG #147: worker
-            # creatures previously surfaced as ``_host``).
+            # Stamp each creature's home site for the same reason; otherwise
+            # worker-hosted creatures appear to belong to ``_host``.
             for creature in graph.get("creatures", []) or []:
                 if isinstance(creature, dict):
                     creature["home_node"] = self._target_node
@@ -833,14 +922,51 @@ class RemoteTerrariumService:
     # Internal
     # ------------------------------------------------------------------
 
-    async def _req(self, type_: str, body: dict[str, Any]) -> Any:
+    async def _req(
+        self,
+        type_: str,
+        body: dict[str, Any],
+        *,
+        timeout: float | None = None,
+    ) -> Any:
         return await self._sender.request(
             to_node=self._target_node,
             namespace="terrarium.runtime",
             type=type_,
             body=body,
-            timeout=self._timeout,
+            timeout=timeout if timeout is not None else self._timeout,
         )
+
+    async def _checked_req(self, type_: str, body: dict[str, Any]) -> dict[str, Any]:
+        return _maybe_raise(await self._req(type_, body))
+
+    async def _req_turn_mutation(self, type_: str, body: dict[str, Any]) -> Any:
+        """Turn-length branch mutation (regenerate / edit_message).
+
+        On deadline expiry the worker-side handler task keeps running
+        and would commit the branch long after the caller saw the
+        failure (and possibly retried) — best-effort interrupt the
+        creature so the orphaned mutation cannot land. A dead link
+        (``RequestAbortedError``) skips the interrupt: nothing to send
+        it over.
+        """
+        try:
+            return await self._req(type_, body, timeout=TURN_REQUEST_TIMEOUT)
+        except RequestAbortedError:
+            raise
+        except RequestTimeoutError:
+            creature_id = body.get("creature_id")
+            if creature_id:
+                try:
+                    await self.interrupt(creature_id)
+                except Exception as exc:
+                    logger.warning(
+                        "Post-timeout interrupt of remote creature failed",
+                        creature_id=creature_id,
+                        op=type_,
+                        error=str(exc),
+                    )
+            raise
 
 
 __all__ = [

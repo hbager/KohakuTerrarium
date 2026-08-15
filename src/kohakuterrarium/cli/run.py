@@ -20,7 +20,7 @@ import kohakuterrarium.terrarium.topology as _topo
 from kohakuterrarium.cli.picker import pick_runnable
 from kohakuterrarium.packages.resolve import resolve_any_path
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.studio.persistence import session_index
+from kohakuterrarium.studio.identity import drive_settings as _drive_settings
 from kohakuterrarium.terrarium.config import load_terrarium_config
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.terrarium.engine_cli import run_engine_with_tui
@@ -61,8 +61,8 @@ def run_agent_cli(
     - ``"none"``: explicit "don't override anything" — same as
       omitting ``--mode``.
 
-    **When ``io_mode`` is omitted, the creature's configured IO
-    modules drive the run.** This is the path long-running headless
+    When ``io_mode`` is omitted, the creature's configured IO
+    modules drive the run. This is the path long-running headless
     background agents (Discord bot, webhook listener, custom polling
     input, etc.) depend on — overriding their IO with a TUI breaks
     them. Don't pass ``--mode`` and the engine just lets them run.
@@ -176,15 +176,17 @@ async def _run(
     pwd = str(Path.cwd())
     is_recipe = _looks_like_recipe(agent_path)
 
-    async with Terrarium(pwd=pwd) as engine:
+    # Resolve node-local Drive settings once; absent or disabled settings keep
+    # the engine Drive-free.
+    drive_kwargs = _drive_settings.resolve_drive_kwargs()
+    async with Terrarium(pwd=pwd, **drive_kwargs) as engine:
         store: SessionStore | None = None
         focus_creature_id = ""
 
         if is_recipe:
             cfg = load_terrarium_config(agent_path)
-            # ``strict=False``: the interactive run keeps the
-            # degrade-and-continue behavior — a missing model key
-            # defers and the user rebinds via ``/model``.
+            # Interactive runs defer missing model credentials so the user can
+            # rebind the model from the active surface.
             graph = await engine.apply_recipe(cfg, pwd=pwd, llm=llm, strict=False)
             focus_creature_id = _pick_focus_creature(engine, graph.graph_id)
             graph_id = graph.graph_id
@@ -202,21 +204,11 @@ async def _run(
                 llm=llm,
                 pwd=pwd,
                 is_privileged=True,
-                # Interactive run: degrade-and-continue (user can fix
-                # the model binding at runtime via ``/model``).
+                # Interactive runs allow model binding repair at runtime.
                 strict=False,
-                # ``--mode cli`` AND ``--mode tui`` both mount their own
-                # terminal-owning surface (prompt_toolkit Application for
-                # cli, Textual App for tui). If the configured input is
-                # ``CLIInput`` (the default) starting the creature here
-                # would spawn a blocking ``sys.stdin.readline`` in an
-                # executor thread that races the terminal surface for
-                # every byte — Textual + CLIInput both consuming stdin
-                # produced the user-visible "TUI fully non-functional"
-                # freeze. Defer start so ``run_engine_with_rich_cli`` /
-                # ``run_engine_with_tui`` can swap the input first.
-                # Every other mode (configured IO) needs the creature
-                # already running on entry, so default ``True``.
+                # Terminal-owning surfaces must replace CLIInput before startup;
+                # otherwise both consumers race for stdin. Configured I/O modes
+                # require the creature to start immediately.
                 start=(io_mode not in ("cli", "tui")),
             )
             focus_creature_id = creature.creature_id
@@ -245,12 +237,8 @@ async def _run(
             elif io_mode == "tui":
                 await run_engine_with_tui(engine, focus_creature_id, store)
             else:
-                # No override — the creature's configured input/output
-                # modules drive the run. The engine has already started
-                # them via ``creature.start``; we just keep the asyncio
-                # loop alive until the creature stops or the user hits
-                # Ctrl+C. This is the path background agents (Discord,
-                # webhook, custom polling input, …) depend on.
+                # Configured I/O owns the lifecycle; keep the event loop alive
+                # until the creature stops or the process is interrupted.
                 creature = engine.get_creature(focus_creature_id)
                 logger.info(
                     "kt run — creature using configured IO",
@@ -264,21 +252,7 @@ async def _run(
                 if session is not None:
                     print(f"\nSession saved. To resume:")
                     print(f"  kt resume {Path(store.path).stem}")
-                try:
-                    store.update_status("paused")
-                    session_file = Path(store.path)
-                    session_index.upsert_session_meta(
-                        session_file,
-                        session_index.snapshot_store_meta(store),
-                        session_dir=session_file.parent,
-                    )
-                except Exception as e:
-                    logger.debug(
-                        "Saved-session index update skipped before CLI close",
-                        error=str(e),
-                        exc_info=True,
-                    )
-                store.close(update_status=False)
+                store.close()
         return 0
 
 
@@ -361,6 +335,7 @@ async def _apply_cli_topology(
 
 
 def _looks_like_recipe(path: str) -> bool:
+    """Return whether a path appears to describe a terrarium recipe."""
     p = Path(path)
     candidates = (
         p / "terrarium.yaml",
@@ -413,11 +388,9 @@ async def _attach_session_store(
 ) -> SessionStore:
     """Attach a session store to ``graph_id`` and return it.
 
-    Dogfoods the engine's mint-mode ``attach_session`` (E2) — the old
-    hand-rolled ``SessionStore`` + ``init_meta`` ceremony lives in the
-    engine now.  ``config_type`` is folded into the minted meta after
-    attach (the engine types by graph shape; a 1-creature recipe still
-    needs ``"terrarium"`` for topology resume).
+    ``config_type`` is written after attachment because graph shape alone
+    cannot distinguish a one-creature recipe from a solo creature, while resume
+    still needs the recipe type to rebuild topology.
     """
     if session == "__auto__":
         _SESSION_DIR.mkdir(parents=True, exist_ok=True)
@@ -431,18 +404,6 @@ async def _attach_session_store(
         store.meta["config_path"] = config_path
     if config_type in ("agent", "terrarium"):
         store.meta["config_type"] = config_type
-    try:
-        session_index.upsert_session_meta(
-            session_file,
-            session_index.snapshot_store_meta(store),
-            session_dir=session_file.parent,
-        )
-    except Exception as e:  # pragma: no cover - index must not break CLI runs
-        logger.debug(
-            "Saved-session index update skipped after CLI attach",
-            error=str(e),
-            exc_info=True,
-        )
     return store
 
 
@@ -465,16 +426,9 @@ def _resolve_session(query: str | None, last: bool = False) -> Path | None:
         return None
 
     sessions = sorted(
-        _SESSION_DIR.glob("*.kohakutr"),
+        [*_SESSION_DIR.glob("*.kohakutr"), *_SESSION_DIR.glob("*.kt")],
         key=lambda p: p.stat().st_mtime,
         reverse=True,
-    )
-    sessions.extend(
-        sorted(
-            _SESSION_DIR.glob("*.kt"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
     )
 
     if not sessions:

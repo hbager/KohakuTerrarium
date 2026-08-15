@@ -9,6 +9,7 @@ identity no-op when nothing needs resolving (the common hot path).
 
 import base64
 
+from kohakuterrarium.llm import artifact_resolve
 from kohakuterrarium.llm.artifact_resolve import (
     resolve_artifact_url,
     resolve_message_image_urls,
@@ -16,15 +17,13 @@ from kohakuterrarium.llm.artifact_resolve import (
 
 
 def _lay_artifact(tmp_path, monkeypatch, sid="sid123", rel="pic.png", data=b"PNGDATA"):
-    """Create a session-local artifact and return its trusted store."""
-    from kohakuterrarium.session.store import SessionStore
-
+    """Create ``<session_dir>/<sid>.artifacts/<rel>`` and point the resolver at it."""
     session_dir = tmp_path / "sessions"
-    session_dir.mkdir(parents=True)
-    store = SessionStore(session_dir / f"{sid}.kohakutr")
-    store.init_meta(sid, "agent", "", str(tmp_path), ["agent"])
-    (store.artifacts_dir / rel).write_bytes(data)
-    return store
+    artifacts = session_dir / f"{sid}.artifacts"
+    artifacts.mkdir(parents=True)
+    (artifacts / rel).write_bytes(data)
+    monkeypatch.setattr(artifact_resolve, "_session_dir", lambda: session_dir)
+    return session_dir
 
 
 class TestResolveArtifactUrl:
@@ -43,26 +42,14 @@ class TestResolveArtifactUrl:
         assert resolve_artifact_url("/api/sessions/onlysid") == "/api/sessions/onlysid"
 
     def test_resolved_to_data_url(self, tmp_path, monkeypatch):
-        store = _lay_artifact(tmp_path, monkeypatch)
-        try:
-            out = resolve_artifact_url("/api/sessions/sid123/artifacts/pic.png", store)
-            assert (
-                out == "data:image/png;base64," + base64.b64encode(b"PNGDATA").decode()
-            )
-        finally:
-            store.close(update_status=False)
-
-    def test_rejects_artifact_from_another_session(self, tmp_path, monkeypatch):
-        store = _lay_artifact(tmp_path, monkeypatch)
-        try:
-            url = "/api/sessions/other-session/artifacts/pic.png"
-            assert resolve_artifact_url(url, store) == url
-        finally:
-            store.close(update_status=False)
+        _lay_artifact(tmp_path, monkeypatch)
+        out = resolve_artifact_url("/api/sessions/sid123/artifacts/pic.png")
+        assert out == "data:image/png;base64," + base64.b64encode(b"PNGDATA").decode()
 
     def test_missing_file_falls_back_to_original(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(artifact_resolve, "_session_dir", lambda: tmp_path)
         url = "/api/sessions/sid/artifacts/nope.png"
-        assert resolve_artifact_url(url, None) == url
+        assert resolve_artifact_url(url) == url
 
 
 class TestResolveMessageImageUrls:
@@ -84,7 +71,7 @@ class TestResolveMessageImageUrls:
         assert resolve_message_image_urls(msgs) is msgs
 
     def test_resolves_local_artifact_part(self, tmp_path, monkeypatch):
-        store = _lay_artifact(tmp_path, monkeypatch)
+        _lay_artifact(tmp_path, monkeypatch)
         msgs = [
             {
                 "role": "user",
@@ -100,10 +87,7 @@ class TestResolveMessageImageUrls:
                 ],
             }
         ]
-        try:
-            out = resolve_message_image_urls(msgs, store)
-        finally:
-            store.close(update_status=False)
+        out = resolve_message_image_urls(msgs)
         assert out is not msgs  # changed -> new list
         part = out[0]["content"][1]
         assert part["image_url"]["url"].startswith("data:image/png;base64,")

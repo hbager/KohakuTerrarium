@@ -24,6 +24,10 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import kohakuterrarium.terrarium.drive.topology as _drive_topology
+import kohakuterrarium.terrarium.topology_leftovers as _topo_leftovers
+from kohakuterrarium.errors import SessionNotResumableError
+from kohakuterrarium.session.identity import new_conversation_id
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.utils.logging import get_logger
 
@@ -32,11 +36,6 @@ if TYPE_CHECKING:
     from kohakuterrarium.terrarium.topology import TopologyDelta
 
 logger = get_logger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# low-level copy primitives (testable without the engine)
-# ---------------------------------------------------------------------------
 
 
 def copy_events_into(src: SessionStore, dst: SessionStore) -> int:
@@ -90,7 +89,6 @@ _RESUMABLE_META_KEYS: tuple[str, ...] = (
     "terrarium_channels",
     "terrarium_creatures",
     "viewer_default_agent",
-    "runtime_creatures",
 )
 
 
@@ -112,30 +110,25 @@ def _inherit_resumable_meta(src_meta: dict, dst_store: SessionStore) -> None:
             logger.warning("split/merge: meta key %r write failed", key, exc_info=True)
 
 
-def _merge_runtime_creature_meta(
-    stores: list[SessionStore], destination: SessionStore
+def _inherit_conversation_lifecycle(
+    src_meta: dict,
+    dst_store: SessionStore,
+    *,
+    new_identity: bool,
 ) -> None:
-    agents: list[str] = []
-    descriptors: dict[str, dict] = {}
-    for store in stores:
-        try:
-            meta = store.load_meta()
-        except Exception:
-            continue
-        for name in meta.get("agents") or []:
-            if name not in agents:
-                agents.append(name)
-        for item in meta.get("runtime_creatures") or []:
-            if not isinstance(item, dict):
-                continue
-            key = item.get("creature_id") or item.get("name")
-            if key:
-                descriptors[str(key)] = item
-    if not descriptors:
-        return
-    destination.meta["agents"] = agents
-    destination.meta["config_type"] = "terrarium" if len(agents) > 1 else "agent"
-    destination.meta["runtime_creatures"] = list(descriptors.values())
+    """Carry open/closed state while assigning the correct logical identity."""
+    is_open = bool(src_meta.get("conversation_open", False))
+    dst_store.meta["conversation_open"] = is_open
+    existing_id = str(src_meta.get("conversation_id") or "")
+    if new_identity and is_open:
+        dst_store.meta["conversation_id"] = new_conversation_id()
+    elif existing_id:
+        dst_store.meta["conversation_id"] = existing_id
+    elif is_open:
+        dst_store.meta["conversation_id"] = new_conversation_id()
+    dst_store.meta["status"] = str(src_meta.get("status") or "running")
+    if src_meta.get("last_active"):
+        dst_store.meta["last_active"] = src_meta["last_active"]
 
 
 def merge_session_stores(
@@ -169,7 +162,11 @@ def merge_session_stores(
         new_store.meta["parent_session_ids"] = parents
         new_store.meta["merged_at"] = time.time()
         _inherit_resumable_meta(inherited_meta, new_store)
-        _merge_runtime_creature_meta(old_stores, new_store)
+        _inherit_conversation_lifecycle(
+            inherited_meta,
+            new_store,
+            new_identity=False,
+        )
     except Exception:
         logger.warning("merge: meta write failed", exc_info=True)
     logger.info(
@@ -204,6 +201,11 @@ def split_session_store(
             new_store.meta["parent_session_ids"] = [str(parent_id)] if parent_id else []
             new_store.meta["split_at"] = time.time()
             _inherit_resumable_meta(full_old_meta, new_store)
+            _inherit_conversation_lifecycle(
+                full_old_meta,
+                new_store,
+                new_identity=True,
+            )
         except Exception:
             logger.warning("split: meta write failed", exc_info=True)
         new_stores.append(new_store)
@@ -213,6 +215,27 @@ def split_session_store(
         new_paths=[str(p) for p in new_paths],
     )
     return new_stores
+
+
+def _stamp_split_meta(store: SessionStore) -> None:
+    """Stamp split lineage onto a store reused in place for a split child.
+
+    Mirrors what :func:`split_session_store` writes on a fresh duplicate so the
+    reused store carries the same ``parent_session_ids`` / ``split_at`` lineage
+    (the child that keeps the parent's graph_id descends from the same session).
+    """
+    try:
+        meta = store.load_meta()
+    except Exception:
+        meta = {}
+        logger.warning("split: reused-store load_meta failed", exc_info=True)
+    parent_id = meta.get("session_id", "")
+    try:
+        store.meta["parent_session_ids"] = [str(parent_id)] if parent_id else []
+        store.meta["split_at"] = time.time()
+        _inherit_resumable_meta(meta, store)
+    except Exception:
+        logger.warning("split: reused-store meta write failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +258,30 @@ def _store_path_for(engine: "Terrarium", graph_id: str) -> Path | None:
     return Path(base) / f"{graph_id}.kohakutr"
 
 
+def _close_superseded(store: SessionStore) -> None:
+    """Close a store that merge/split has replaced.
+
+    ``update_status=False``: the history moved to the survivor, so the
+    superseded file must not flip to ``paused`` and reappear as a
+    resumable ghost.
+    """
+    try:
+        store.set_conversation_open(False)
+        store.update_status("completed")
+        store.checkpoint()
+    except Exception:
+        logger.warning(
+            "session merge/split: superseded lifecycle update failed",
+            exc_info=True,
+        )
+    try:
+        store.close(update_status=False)
+    except Exception:
+        logger.warning(
+            "session merge/split: superseded store close failed", exc_info=True
+        )
+
+
 def apply_merge(
     engine: "Terrarium",
     delta: "TopologyDelta",
@@ -244,20 +291,53 @@ def apply_merge(
         return
     keep_gid = delta.new_graph_ids[0]
     drop_gids = [g for g in delta.old_graph_ids if g != keep_gid]
-    old_stores: list[SessionStore] = []
-    for gid in (keep_gid, *drop_gids):
+    keep_graph = engine._topology.graphs.get(keep_gid)
+    if keep_graph is not None and any(
+        graph_id in engine._session_stores for graph_id in delta.old_graph_ids
+    ):
+        merged_names = [
+            creature.name
+            for cid in keep_graph.creature_ids
+            if (creature := engine._creatures.get(cid)) is not None
+            and hasattr(creature, "name")
+        ]
+        duplicates = sorted(
+            {name for name in merged_names if merged_names.count(name) > 1}
+        )
+        if duplicates:
+            raise SessionNotResumableError(
+                "Cannot merge persisted graphs with duplicate creature names: "
+                + ", ".join(duplicates)
+            )
+    # Capture every source graph's Drive rows synchronously before any store
+    # closes, so the async topology drain can move them into the survivor's
+    # repository. This is a no-op on a Drive-disabled engine.
+    _drive_topology.stash_merge(engine, keep_gid, list(delta.old_graph_ids))
+    source_gids = [keep_gid, *drop_gids]
+    # Snapshot each source graph's store + ownership BEFORE remapping —
+    # the survivor is reused, but every other owned store is superseded
+    # and must be closed (else its handle/writer-lock leaks forever).
+    source_stores: dict[str, SessionStore] = {}
+    for gid in source_gids:
         s = engine._session_stores.get(gid)
         if s is not None:
-            old_stores.append(s)
-    if not old_stores:
+            source_stores[gid] = s
+    if not source_stores:
         return
+    old_stores = list(source_stores.values())
+    owned = getattr(engine, "_owned_sessions", None)
+    owned_source_gids = {
+        gid for gid in source_gids if owned is not None and gid in owned
+    }
     new_path = _store_path_for(engine, keep_gid)
     if new_path is None:
         # No persistence configured — keep the first store as the
         # "merged" one; later writes simply land in it.  Drop the others'
         # references from the engine.
         kept = old_stores[0]
-        _merge_runtime_creature_meta(old_stores, kept)
+        first_source_gid = next(iter(source_stores))
+        kept_owned = first_source_gid in owned_source_gids
+        _merge_into_existing_store(kept, old_stores[1:])
     else:
         kept_store = engine._session_stores.get(keep_gid)
         kept_path = (
@@ -290,14 +370,33 @@ def apply_merge(
             try:
                 kept.meta["parent_session_ids"] = parents
                 kept.meta["merged_at"] = time.time()
-                _merge_runtime_creature_meta(old_stores, kept)
             except Exception:
                 logger.warning("merge: meta write failed", exc_info=True)
+            kept_owned = keep_gid in owned_source_gids
         else:
+            # A brand-new file is minted here; the engine now holds its
+            # handle, so it is engine-owned regardless of the sources.
             kept = merge_session_stores(old_stores, new_path)
+            kept_owned = True
     engine._session_stores[keep_gid] = kept
     for gid in drop_gids:
         engine._session_stores.pop(gid, None)
+    # Close every superseded store the engine owned; the survivor stays
+    # open (it now backs the merged graph).
+    for gid, store in source_stores.items():
+        if store is kept:
+            continue
+        if gid in owned_source_gids:
+            _close_superseded(store)
+    if owned is not None:
+        for gid in source_gids:
+            owned.discard(gid)
+        if kept_owned:
+            owned.add(keep_gid)
+    # Unresolved replay remnants follow the surviving graph — the
+    # post-merge snapshot would otherwise erase them.
+    _topo_leftovers.transfer_leftovers(engine, source_gids, keep_gid)
+    _refresh_graph_meta(engine, keep_gid, kept)
     _attach_store_to_graph(engine, keep_gid, kept)
 
 
@@ -309,25 +408,111 @@ def apply_split(
     if delta.kind != "split" or not delta.old_graph_ids:
         return
     parent_gid = delta.old_graph_ids[0]
+    # Capture the parent graph's Drive rows synchronously before its store
+    # closes, so the async drain can redistribute them according to the child
+    # graph placement policy. This is a no-op on a Drive-disabled engine.
+    _drive_topology.stash_split(engine, parent_gid, list(delta.new_graph_ids))
     parent = engine._session_stores.get(parent_gid)
     if parent is None:
         return
+    owned = getattr(engine, "_owned_sessions", None)
+    parent_owned = owned is not None and parent_gid in owned
     new_paths = [_store_path_for(engine, gid) for gid in delta.new_graph_ids]
     if any(p is None for p in new_paths):
         # No session_dir — keep the parent on the largest new graph
         # (the kept one, which by topology convention is
         # ``new_graph_ids[0]``) and copy nothing onto the others.
-        engine._session_stores[delta.new_graph_ids[0]] = parent
-        _refresh_meta_for_split_graph(engine, delta.new_graph_ids[0], parent)
+        keep_gid = delta.new_graph_ids[0]
+        engine._session_stores[keep_gid] = parent
+        _refresh_meta_for_split_graph(engine, keep_gid, parent)
+        if owned is not None:
+            for gid in delta.old_graph_ids:
+                owned.discard(gid)
+            if parent_owned:
+                owned.add(keep_gid)
+        _topo_leftovers.distribute_leftovers(engine, parent_gid, [keep_gid])
         return
-    new_stores = split_session_store(parent, new_paths)
-    for gid, store in zip(delta.new_graph_ids, new_stores):
+    # The largest child keeps the original graph_id, so when the parent's own
+    # file IS ``<parent_gid>.kohakutr`` one child's target path equals the
+    # parent's still-open path. Opening a second ``SessionStore`` there would
+    # duplicate every event and race the parent's live connection (surfacing as
+    # ``SQLite error: disk I/O error`` under WAL); reuse the live parent store
+    # for that child instead. Only the OTHER children get a fresh duplicate.
+    # Mirrors the same-path reuse ``apply_merge`` already performs.
+    parent_path = Path(getattr(parent, "_path", "")).resolve()
+    reuse_gid = next(
+        (
+            gid
+            for gid, p in zip(delta.new_graph_ids, new_paths)
+            if Path(p).resolve() == parent_path
+        ),
+        None,
+    )
+    fresh = [
+        (gid, p) for gid, p in zip(delta.new_graph_ids, new_paths) if gid != reuse_gid
+    ]
+    new_stores = split_session_store(parent, [p for _, p in fresh]) if fresh else []
+    for (gid, _), store in zip(fresh, new_stores):
         engine._session_stores[gid] = store
         _attach_store_to_graph(engine, gid, store)
         _refresh_meta_for_split_graph(engine, gid, store)
+    if reuse_gid is not None:
+        _stamp_split_meta(parent)
+        engine._session_stores[reuse_gid] = parent
+        _attach_store_to_graph(engine, reuse_gid, parent)
+        _refresh_meta_for_split_graph(engine, reuse_gid, parent)
+    elif parent_gid not in delta.new_graph_ids:
+        # The parent's graph_id is not among the children (defensive — the
+        # largest child normally keeps it); drop its stale map entry.
+        engine._session_stores.pop(parent_gid, None)
+    # The parent is superseded ONLY when no child reused its live store; the
+    # fresh children each got their own duplicate. Hand ownership to the
+    # children (the reused store keeps the parent's ownership state).
+    if reuse_gid is None and parent_owned:
+        _close_superseded(parent)
+    if owned is not None:
+        for gid in delta.old_graph_ids:
+            owned.discard(gid)
+        for gid, _ in fresh:
+            owned.add(gid)
+        if reuse_gid is not None and parent_owned:
+            owned.add(reuse_gid)
+    _topo_leftovers.distribute_leftovers(engine, parent_gid, list(delta.new_graph_ids))
 
 
-def _refresh_meta_for_split_graph(
+def _merge_into_existing_store(
+    destination: SessionStore, sources: list[SessionStore]
+) -> None:
+    """Preserve source histories when a merge reuses an attached store."""
+    destination_id = destination.meta.get("session_id", "")
+    parent_ids = set(destination.meta.get("parent_session_ids", []))
+    if destination_id:
+        parent_ids.add(destination_id)
+    for source in sources:
+        source_id = source.meta.get("session_id", "")
+        parent_ids.update(source.meta.get("parent_session_ids", []))
+        if source_id:
+            parent_ids.add(source_id)
+        copy_events_into(source, destination)
+    destination.meta["parent_session_ids"] = sorted(parent_ids)
+    destination.meta["merged_at"] = time.time()
+    destination.flush()
+
+
+def _delete_meta(store: SessionStore, key: str) -> None:
+    """Remove inherited reconstruction metadata from the store."""
+    meta = store.meta
+    if hasattr(meta, "exists") and hasattr(meta, "delete"):
+        if meta.exists(key):
+            meta.delete(key)
+        return
+    try:
+        del meta[key]
+    except (KeyError, TypeError):
+        pass
+
+
+def _refresh_graph_meta(
     engine: "Terrarium", graph_id: str, store: SessionStore
 ) -> None:
     """Update ``store.meta`` so it reflects the post-split graph membership.
@@ -350,17 +535,20 @@ def _refresh_meta_for_split_graph(
         if c is None:
             continue
         agents.append(getattr(c.agent.config, "name", cid))
+    store.meta["agents"] = agents
+    store.meta["config_type"] = "agent" if len(agents) <= 1 else "terrarium"
+    store.meta["config_path"] = None
+    _delete_meta(store, "config_snapshot")
+    _delete_meta(store, "runtime_topology")
+    store.flush()
+
+
+def _refresh_meta_for_split_graph(
+    engine: "Terrarium", graph_id: str, store: SessionStore
+) -> None:
+    """Compatibility wrapper for callers of the former split-only helper."""
     try:
-        store.meta["agents"] = agents
-        store.meta["config_type"] = "agent" if len(agents) <= 1 else "terrarium"
-        descriptors = list(store.meta.get("runtime_creatures") or [])
-        if descriptors:
-            member_ids = set(creatures)
-            store.meta["runtime_creatures"] = [
-                item
-                for item in descriptors
-                if isinstance(item, dict) and item.get("creature_id") in member_ids
-            ]
+        _refresh_graph_meta(engine, graph_id, store)
     except Exception:
         logger.warning("split: meta refresh failed", exc_info=True)
 

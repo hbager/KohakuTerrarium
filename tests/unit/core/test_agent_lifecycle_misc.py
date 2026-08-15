@@ -144,6 +144,59 @@ class TestAgentLifecycle:
         assert t.cancelled() or t.done()
 
 
+# ── agent_lifecycle warm pause/resume ────────────────────────────
+
+
+class TestPauseResumeMixin:
+    def _agent(self):
+        class _Agent(AgentLifecycleMixin):
+            pass
+
+        a = _Agent()
+        a.config = types.SimpleNamespace(name="alice")
+        a._paused = False
+        a._running = True
+        a._suspended = []
+        a._resumed = []
+        a._gate_calls = []
+        a._woke = []
+        a.trigger_manager = types.SimpleNamespace(
+            suspend_all=lambda: a._suspended.append(True),
+            resume_all=lambda: a._resumed.append(True),
+        )
+        a._consumer_resume = types.SimpleNamespace(
+            clear=lambda: a._gate_calls.append("clear"),
+            set=lambda: a._gate_calls.append("set"),
+        )
+        a._event_inbox = types.SimpleNamespace(wake=lambda: a._woke.append(True))
+        return a
+
+    def test_pause_sets_flag_and_suspends_triggers(self):
+        a = self._agent()
+        a.pause()
+        assert a.paused is True
+        assert a._suspended == [True]
+        # Consumer gate cleared so the consumer parks.
+        assert a._gate_calls == ["clear"]
+        # Idempotent — a second pause does not re-suspend.
+        a.pause()
+        assert a._suspended == [True]
+
+    def test_resume_clears_flag_resumes_and_drains(self):
+        a = self._agent()
+        a.pause()
+        a.resume()
+        assert a.paused is False
+        assert a._resumed == [True]
+        # Resume releases the consumer gate and wakes the inbox so the
+        # consumer drains everything queued while paused.
+        assert a._gate_calls == ["clear", "set"]
+        assert a._woke == [True]
+        # Idempotent — resume when not paused is a no-op.
+        a.resume()
+        assert a._resumed == [True]
+
+
 # ── agent_budget_recovery ────────────────────────────────────────
 
 
@@ -245,6 +298,79 @@ class TestRestoreCompactState:
         store = types.SimpleNamespace(state={"alice:compact_count": "not-a-num"})
         restore_compact_state_from_session(mgr, store, "alice")
         assert not hasattr(mgr, "_compact_count")
+
+
+class TestCompactOverflowRescue:
+    def _agent(self):
+        class _Agent(AgentCompactMixin):
+            pass
+
+        a = _Agent()
+        a.config = types.SimpleNamespace(name="alice")
+        return a
+
+    async def test_returns_none_when_no_compact_running(self):
+        a = self._agent()
+        a.compact_manager = types.SimpleNamespace(is_compacting=False)
+        assert await a._compact_overflow_rescue() is None
+
+    async def test_rescue_from_inside_compact_task_returns_none(self):
+        # Compactor fell back to the ACTIVE provider: the overflow hook
+        # fires from within the compact task — waiting on ourselves
+        # deadlocks. The drop path must run instead.
+        import asyncio
+
+        a = self._agent()
+
+        async def probe():
+            a.compact_manager = types.SimpleNamespace(
+                is_compacting=True,
+                _compact_task=asyncio.current_task(),
+                wait_for_current=None,
+            )
+            return await a._compact_overflow_rescue()
+
+        assert await asyncio.wait_for(asyncio.ensure_future(probe()), 2) is None
+
+    async def test_waits_for_compact_and_returns_spliced_messages(self):
+        a = self._agent()
+        waited = []
+
+        async def wait():
+            waited.append(True)
+
+        spliced = [{"role": "system", "content": "s"}]
+        a.compact_manager = types.SimpleNamespace(
+            is_compacting=True, wait_for_current=wait
+        )
+        a.controller = types.SimpleNamespace(
+            conversation=types.SimpleNamespace(to_messages=lambda: spliced)
+        )
+        assert await a._compact_overflow_rescue() == spliced
+        assert waited == [True]
+
+    def test_wire_overflow_rescue_attaches_hook(self):
+        a = self._agent()
+        a.llm = types.SimpleNamespace()
+        a.compact_manager = types.SimpleNamespace()
+        a._wire_overflow_rescue()
+        assert a.llm._overflow_rescue == a._compact_overflow_rescue
+
+    def test_wire_overflow_rescue_tolerates_slotted_provider(self):
+        # The injected-LLM contract is the LLMProvider protocol, which
+        # does not guarantee writable attributes — a __slots__ provider
+        # must not blow up Agent.start().
+        class _SlottedLLM:
+            __slots__ = ("config",)
+
+            async def chat(self, messages, **kwargs):
+                yield "x"
+
+        a = self._agent()
+        a.llm = _SlottedLLM()
+        a.compact_manager = types.SimpleNamespace()
+        a._wire_overflow_rescue()
+        assert not hasattr(a.llm, "_overflow_rescue")
 
 
 class TestBuildCompactLLM:

@@ -1,12 +1,6 @@
-"""Engine-owned session persistence (E2).
+"""Manage engine-owned session stores and their metadata.
 
-Before this module, persisting a session programmatically meant
-hand-copying a 3-step ceremony out of ``cli/run.py`` internals
-(``SessionStore(path)`` + ``store.init_meta(<magic strings>)`` +
-``engine.attach_session(...)``) — and a typo in ``config_type``
-silently produced an unresumable file.
-
-Now the engine owns the whole flow:
+The engine owns session-store creation and metadata initialization:
 
 - ``Terrarium(session_dir=...)`` → autosession: every new graph gets
   ``<session_dir>/<graph_id>.kohakutr`` automatically.
@@ -88,91 +82,25 @@ def mint_store(
         path.parent.mkdir(parents=True, exist_ok=True)
 
     store = SessionStore(path, writer_lock=True)
-    try:
-        existing = store.load_meta()
-        if not existing.get("session_id"):
-            store.init_meta(
-                session_id=session_id or graph_id,
-                config_type=config_type,
-                config_path=config_path,
-                pwd=pwd or str(getattr(engine, "_pwd", None) or Path.cwd()),
-                agents=list(agents or []),
-                config_snapshot=config_snapshot,
-            )
-        elif agents:
-            register_agents_in_meta(store, agents)
-        logger.info(
-            "Session store minted",
-            graph_id=graph_id,
-            path=str(path),
-            fresh=not existing.get("session_id"),
+    existing = store.load_meta()
+    if not existing.get("session_id"):
+        store.init_meta(
+            session_id=session_id or graph_id,
+            config_type=config_type,
+            config_path=config_path,
+            pwd=pwd or str(getattr(engine, "_pwd", None) or Path.cwd()),
+            agents=list(agents or []),
+            config_snapshot=config_snapshot,
         )
-        return store
-    except BaseException:
-        store.close()
-        raise
-
-
-def register_creature_in_meta(
-    store: SessionStore,
-    creature: "Creature",
-    config: Any = None,
-) -> None:
-    """Persist one runtime creature's resumable build description."""
-    config_obj = getattr(getattr(creature, "agent", None), "config", None)
-    name = (
-        getattr(creature, "name", None)
-        or getattr(config_obj, "name", None)
-        or creature.creature_id
+    elif agents:
+        register_agents_in_meta(store, agents)
+    logger.info(
+        "Session store minted",
+        graph_id=graph_id,
+        path=str(path),
+        fresh=not existing.get("session_id"),
     )
-    current = list(store.meta.get("agents") or [])
-    if name not in current:
-        current.append(name)
-        store.meta["agents"] = current
-    if len(current) > 1 and store.meta.get("config_type") == "agent":
-        store.meta["config_type"] = "terrarium"
-
-    config_path, snapshot = describe_build_input(config)
-    if config_obj is not None:
-        _, live_snapshot = describe_build_input(config_obj)
-        snapshot = live_snapshot or snapshot
-    working_dir = getattr(
-        getattr(creature.agent, "executor", None), "_working_dir", None
-    )
-    descriptor = {
-        "creature_id": creature.creature_id,
-        "name": name,
-        "config_path": config_path,
-        "config_snapshot": snapshot or {},
-        "pwd": str(working_dir) if working_dir is not None else "",
-        "parent_creature_id": getattr(creature, "parent_creature_id", None),
-        "is_privileged": bool(getattr(creature, "is_privileged", False)),
-    }
-    descriptors = list(store.meta.get("runtime_creatures") or [])
-    descriptors = [
-        item for item in descriptors if item.get("creature_id") != creature.creature_id
-    ]
-    descriptors.append(descriptor)
-    store.meta["runtime_creatures"] = descriptors
-
-
-def refresh_runtime_group_meta(
-    store: SessionStore, creatures: list["Creature"]
-) -> None:
-    """Replace a runtime group's descriptors with its current live members."""
-    previous = {
-        item.get("creature_id"): item
-        for item in (store.meta.get("runtime_creatures") or [])
-        if isinstance(item, dict) and item.get("creature_id")
-    }
-    if not previous:
-        return
-    store.meta["runtime_creatures"] = []
-    store.meta["agents"] = []
-    store.meta["config_type"] = "agent"
-    for creature in creatures:
-        config_path = previous.get(creature.creature_id, {}).get("config_path", "")
-        register_creature_in_meta(store, creature, config_path or None)
+    return store
 
 
 def register_agents_in_meta(store: SessionStore, names: list[str]) -> None:
@@ -239,16 +167,25 @@ async def attach_for_new_creature(
     if session is False:
         return existing
     if isinstance(session, SessionStore):
-        register_creature_in_meta(session, creature, config)
+        register_agents_in_meta(session, [creature.name])
         await engine.attach_session(gid, session)
         return session
 
     if session is None and existing is not None:
         # Joining a graph that already persists — fold this creature in.
-        register_creature_in_meta(existing, creature, config)
-        if hasattr(creature.agent, "attach_session_store"):
-            creature.agent.attach_session_store(existing)
-        return existing
+        if getattr(existing, "_closed", False):
+            # Defensive: never attach a closed store (e.g. after a merge
+            # replaced the graph store); treat it as absent and rebuild.
+            logger.warning(
+                "engine session store is closed; rebuilding",
+                graph_id=gid,
+            )
+            existing = None
+        else:
+            register_agents_in_meta(existing, [creature.name])
+            if hasattr(creature.agent, "attach_session_store"):
+                creature.agent.attach_session_store(existing)
+            return existing
 
     path: "str | Path | None"
     if isinstance(session, (str, Path)):
@@ -266,9 +203,6 @@ async def attach_for_new_creature(
         )
 
     config_path, snapshot = describe_build_input(config)
-    working_dir = getattr(
-        getattr(creature.agent, "executor", None), "_working_dir", None
-    )
     if path is None:
         # Default file name carries the creature id (``alice_3f2a...``)
         # — the saved-session list shows the stem, and ``alice_...`` is
@@ -286,9 +220,7 @@ async def attach_for_new_creature(
         config_snapshot=snapshot,
         agents=[creature.name],
         session_id=creature.creature_id,
-        pwd=str(working_dir) if working_dir is not None else None,
     )
-    register_creature_in_meta(store, creature, config)
     engine._owned_sessions.add(gid)
     await engine.attach_session(gid, store)
     return store
@@ -302,13 +234,26 @@ async def attach_for_recipe(
     session: SessionArg = None,
 ) -> SessionStore | None:
     """Autosession for ``apply_recipe`` — one terrarium-typed store."""
+    existing = engine._session_stores.get(graph_id)
     if session is False:
-        return engine._session_stores.get(graph_id)
+        return existing
+
+    names = [
+        engine.get_creature(cid).name
+        for cid in sorted(engine.get_graph(graph_id).creature_ids)
+        if cid in engine._creatures
+    ]
     if isinstance(session, SessionStore):
+        register_agents_in_meta(session, names)
         await engine.attach_session(graph_id, session)
         return session
-    if session is None and engine._session_stores.get(graph_id) is not None:
-        return engine._session_stores[graph_id]
+    if existing is not None and recipe_session_reuses_store(existing, session):
+        register_agents_in_meta(existing, names)
+        # The recipe may have just added graph members. Reattaching the same
+        # store wires persistence into every member without replacing the
+        # existing writer.
+        await engine.attach_session(graph_id, existing)
+        return existing
 
     if isinstance(session, (str, Path)):
         path: "str | Path | None" = session
@@ -319,11 +264,6 @@ async def attach_for_recipe(
             return None
         path = None
 
-    names = [
-        engine.get_creature(cid).name
-        for cid in sorted(engine.get_graph(graph_id).creature_ids)
-        if cid in engine._creatures
-    ]
     store = mint_store(
         engine,
         graph_id,
@@ -337,8 +277,29 @@ async def attach_for_recipe(
     return store
 
 
+def recipe_session_reuses_store(
+    existing: SessionStore,
+    session: SessionArg,
+) -> bool:
+    """Return whether recipe persistence should retain ``existing``.
+
+    ``None`` and ``True`` mean "use persistence for this graph", so an
+    already-attached store satisfies both. An explicit path naming that same
+    file must also reuse the live writer rather than acquire a second writer
+    lock for it.
+    """
+    if session is None or session is True or session is existing:
+        return True
+    if not isinstance(session, (str, Path)):
+        return False
+    try:
+        return Path(existing.path).resolve() == Path(session).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
 def close_owned_stores(engine: "Terrarium") -> None:
-    """Close every store owned by ``engine``. Called from ``shutdown``."""
+    """Close every store the engine minted.  Called from ``shutdown``."""
     for gid in list(engine._owned_sessions):
         store = engine._session_stores.get(gid)
         if store is None:
@@ -352,3 +313,4 @@ def close_owned_stores(engine: "Terrarium") -> None:
                 error=str(exc),
             )
     engine._owned_sessions.clear()
+    engine._session_stores.clear()

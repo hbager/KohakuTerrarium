@@ -1,10 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { mount } from "@vue/test-utils"
+import { flushPromises, mount } from "@vue/test-utils"
 import { createPinia, setActivePinia } from "pinia"
 import { createRouter, createMemoryHistory } from "vue-router"
 
 vi.mock("@/utils/api", () => ({
   attachAPI: { getCreaturePolicies: vi.fn(), getSessionPolicies: vi.fn() },
+  sessionAPI: {
+    listActive: vi.fn().mockResolvedValue([]),
+    listOpen: vi.fn().mockResolvedValue([]),
+  },
   configAPI: { listCreatures: vi.fn(), listTerrariums: vi.fn(), getServerInfo: vi.fn() },
   settingsAPI: {
     getBackends: vi.fn().mockResolvedValue([]),
@@ -27,12 +31,16 @@ vi.mock("@/utils/api", () => ({
 import MacroShell from "./MacroShell.vue"
 import RailItem from "./RailItem.vue"
 import { useTabsStore } from "@/stores/tabs"
-import { useInstancesStore } from "@/stores/instances"
+import { useConversationsStore } from "@/stores/conversations"
+import { sessionAPI } from "@/utils/api"
 import { tabKinds, inspectorInnerTabs, railGroups } from "@/stores/tabKindRegistry"
 
 let storage
 
 beforeEach(() => {
+  vi.clearAllMocks()
+  sessionAPI.listActive.mockResolvedValue([])
+  sessionAPI.listOpen.mockResolvedValue([])
   storage = new Map()
   vi.stubGlobal("localStorage", {
     getItem: (k) => (storage.has(k) ? storage.get(k) : null),
@@ -91,31 +99,38 @@ describe("MacroShell — render", () => {
     expect(tabs.tabs.some((t) => t.kind === "dashboard")).toBe(true)
   })
 
-  it("renders one RailItem per running instance", async () => {
+  it("renders only live conversations in the rail", async () => {
     const router = makeRouter()
-    const instances = useInstancesStore()
-    instances.list = [
+    const conversations = useConversationsStore()
+    const rows = [
       {
         id: "agent-1",
+        runtime_id: "agent-1",
+        is_live: true,
         config_name: "alice",
         type: "creature",
         status: "running",
       },
       {
         id: "graph-1",
+        runtime_id: null,
+        saved_name: "graph-1",
+        is_live: false,
         config_name: "swe-graph",
         type: "terrarium",
-        status: "running",
+        status: "paused",
       },
     ]
+    conversations.rows = rows
+    sessionAPI.listOpen.mockResolvedValue(rows)
     const wrapper = mount(MacroShell, {
       global: { plugins: [router] },
     })
     await router.isReady()
     const items = wrapper.findAllComponents(RailItem)
-    expect(items).toHaveLength(2)
+    expect(items).toHaveLength(1)
     expect(wrapper.text()).toContain("alice")
-    expect(wrapper.text()).toContain("swe-graph")
+    expect(wrapper.text()).not.toContain("swe-graph")
   })
 })
 
@@ -158,15 +173,19 @@ describe("MacroShell — density branch", () => {
 describe("MacroShell — surface indicators", () => {
   it("rail [C] click opens an attach tab; second click closes", async () => {
     const router = makeRouter()
-    const instances = useInstancesStore()
-    instances.list = [
+    const conversations = useConversationsStore()
+    const rows = [
       {
         id: "agent-1",
+        runtime_id: "agent-1",
+        is_live: true,
         config_name: "alice",
         type: "creature",
         status: "running",
       },
     ]
+    conversations.rows = rows
+    sessionAPI.listOpen.mockResolvedValue(rows)
     const wrapper = mount(MacroShell, {
       global: { plugins: [router] },
     })
@@ -177,6 +196,7 @@ describe("MacroShell — surface indicators", () => {
     const buttons = railItem.findAll("button")
     const cBtn = buttons.find((b) => b.text() === "C")
     expect(cBtn).toBeDefined()
+    expect(cBtn.attributes("title")).toBe("Open chat")
     await cBtn.trigger("click")
     expect(tabs.surfaceTabsForTarget("agent-1").chat).toBeDefined()
     await cBtn.trigger("click")
@@ -185,15 +205,19 @@ describe("MacroShell — surface indicators", () => {
 
   it("rail [I] click opens an inspector tab", async () => {
     const router = makeRouter()
-    const instances = useInstancesStore()
-    instances.list = [
+    const conversations = useConversationsStore()
+    const rows = [
       {
         id: "agent-1",
+        runtime_id: "agent-1",
+        is_live: true,
         config_name: "alice",
         type: "creature",
         status: "running",
       },
     ]
+    conversations.rows = rows
+    sessionAPI.listOpen.mockResolvedValue(rows)
     const wrapper = mount(MacroShell, {
       global: { plugins: [router] },
     })
@@ -204,5 +228,35 @@ describe("MacroShell — surface indicators", () => {
     expect(iBtn).toBeDefined()
     await iBtn.trigger("click")
     expect(tabs.surfaceTabsForTarget("agent-1").inspector).toBeDefined()
+  })
+
+  it("does not render dormant conversations in the rail", async () => {
+    const router = makeRouter()
+    const conversations = useConversationsStore()
+    const rows = [
+      {
+        id: "saved-one",
+        runtime_id: null,
+        saved_name: "saved-one",
+        is_live: false,
+        config_name: "Pvpn",
+        type: "terrarium",
+        status: "paused",
+      },
+    ]
+    conversations.rows = rows
+    sessionAPI.listOpen.mockResolvedValue(rows)
+    const tabs = useTabsStore()
+    const createSession = vi.spyOn(tabs, "createSession").mockResolvedValue("runtime-one")
+
+    const wrapper = mount(MacroShell, {
+      global: { plugins: [router] },
+    })
+    await router.isReady()
+    await flushPromises()
+
+    expect(createSession).not.toHaveBeenCalled()
+    expect(wrapper.findComponent(RailItem).exists()).toBe(false)
+    expect(wrapper.text()).not.toContain("Pvpn")
   })
 })

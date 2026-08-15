@@ -77,17 +77,9 @@ class TestLlmBackendsRoutes:
 
         monkeypatch.setattr(llm_mod, "save_backend_record", fake_save)
         client = TestClient(_app(llm_mod.router))
-        resp = client.post(
-            "/backends",
-            json={
-                "name": "my",
-                "backend_type": "openai",
-                "auth_mode": "none",
-            },
-        )
+        resp = client.post("/backends", json={"name": "my", "backend_type": "openai"})
         assert resp.status_code == 200
         assert captured["name"] == "my"
-        assert captured["auth_mode"] == "none"
 
     def test_create_backend_validation_error(self, monkeypatch):
         def boom(**k):

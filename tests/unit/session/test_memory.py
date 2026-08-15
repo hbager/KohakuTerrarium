@@ -187,6 +187,24 @@ class TestExtractBlocks:
         assert "user" in types
         assert "text" in types
 
+    def test_coalesced_segment_indexes_as_one_whole_block(self):
+        # UXI-02: streamed text is now stored as ONE text_chunk per
+        # segment, so a whole assistant reply embeds as a single block
+        # instead of one fragment per streamed chunk (which fractured
+        # embeddings across former chunk boundaries).
+        events = [
+            {"type": "user_input", "content": "q", "event_id": 1},
+            {
+                "type": "text_chunk",
+                "content": "Hello, world! Here is the complete answer.",
+                "event_id": 2,
+            },
+        ]
+        blocks = _extract_blocks("alice", events)
+        text_blocks = [b for b in blocks if b.block_type == "text"]
+        assert len(text_blocks) == 1
+        assert text_blocks[0].content == "Hello, world! Here is the complete answer."
+
     def test_long_text_splits_on_double_newline(self):
         long_text = "para1\n\n" + ("y" * 350) + "\n\n" + "para3"
         events = [
@@ -242,6 +260,30 @@ class TestExtractBlocks:
         # Tool result content "[result:x] ok" is <=20 chars → skipped.
         tool_blocks = [b for b in blocks if b.block_type == "tool"]
         assert tool_blocks == []
+
+    def test_large_tool_result_indexed_beyond_old_2000_cap(self):
+        # Elided tool results (≤256KB) must stay recoverable: the index cap
+        # covers far more than the historical 2000-char truncation.
+        from kohakuterrarium.session.memory import TOOL_RESULT_INDEX_CHARS
+
+        big = (
+            "needle-at-tail "
+            + "z" * (TOOL_RESULT_INDEX_CHARS - 50)
+            + " unique-tail-marker"
+        )
+        events = [
+            {"type": "user_input", "content": "q", "event_id": 1},
+            {
+                "type": "tool_result",
+                "name": "bash",
+                "output": big,
+                "event_id": 2,
+            },
+        ]
+        blocks = _extract_blocks("alice", events)
+        tool_blocks = [b for b in blocks if b.block_type == "tool"]
+        assert len(tool_blocks) == 1
+        assert "unique-tail-marker" in tool_blocks[0].content
 
     def test_processing_end_ends_round(self):
         events = [

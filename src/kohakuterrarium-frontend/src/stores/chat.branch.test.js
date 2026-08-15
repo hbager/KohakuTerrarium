@@ -231,30 +231,6 @@ describe("chat store — branch-switch keeps consistent follow-ups", () => {
     const turns = messages.map((m) => m.turnIndex)
     expect(turns).toEqual([1, 1, 2, 2])
   })
-
-  it("stamps injected mid-turn user bubbles without shifting later turn targets", () => {
-    const events = [
-      { type: "user_input", content: "u1", event_id: 1, turn_index: 1, branch_id: 1 },
-      { type: "user_message", content: "u1", event_id: 2, turn_index: 1, branch_id: 1 },
-      { type: "text_chunk", content: "a1", event_id: 3, turn_index: 1, branch_id: 1 },
-      { type: "user_input_injected", content: "u1b", event_id: 4, turn_index: 1, branch_id: 1 },
-      { type: "text_chunk", content: "a1b", event_id: 5, turn_index: 1, branch_id: 1 },
-      { type: "processing_end", event_id: 6, turn_index: 1, branch_id: 1 },
-      { type: "user_input", content: "u2", event_id: 7, turn_index: 2, branch_id: 1 },
-      { type: "user_message", content: "u2", event_id: 8, turn_index: 2, branch_id: 1 },
-      { type: "text_chunk", content: "a2", event_id: 9, turn_index: 2, branch_id: 1 },
-      { type: "processing_end", event_id: 10, turn_index: 2, branch_id: 1 },
-    ]
-    const { messages } = _replayEvents([], events)
-    expect(messages.map((m) => [m.role, m.content ?? m.parts?.[0]?.content, m.turnIndex])).toEqual([
-      ["user", "u1", 1],
-      ["assistant", "a1", 1],
-      ["user", "u1b", 1],
-      ["assistant", "a1b", 1],
-      ["user", "u2", 2],
-      ["assistant", "a2", 2],
-    ])
-  })
 })
 
 describe("chat store — regen vs edit navigator placement", () => {

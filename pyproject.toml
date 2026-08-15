@@ -73,7 +73,7 @@ dependencies = [
     "pymupdf>=1.24.0",
     # >=11 floor for Chaquopy (Android) compat; the Image API we use is stable.
     "Pillow>=11.0.0",
-    # MCP client
+    # MCP 2.x removed APIs used by the current client integration.
     "mcp>=1.0.0,<2",
     # Direct dep for the Android wheel URL ref (transitive via mcp).
     "rpds-py>=0.30.0",
@@ -150,6 +150,8 @@ dev = [
     "pytest>=9.0.0",
     "pytest-asyncio>=1.3.0",
     "pytest-timeout>=2.3.0",
+    # Starlette 1.2+ uses HTTPX2 for TestClient and deprecates the HTTPX fallback.
+    "httpx2>=2.0.0",
     "black>=26.3.0",
     "isort>=8.0.0",
     "ruff>=0.9.0",

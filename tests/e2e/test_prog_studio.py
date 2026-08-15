@@ -318,7 +318,7 @@ class TestProgStudioJourney:
             assert out1 == "First reply."
             out2 = await _drain_chat(studio, session_id, creature_id, "ping two")
             assert out2 == "Second reply."
-            history = studio.sessions.chat.history(session_id, creature_id)
+            history = await studio.sessions.chat.history(session_id, creature_id)
             user_msgs = [
                 m["content"] for m in history["messages"] if m["role"] == "user"
             ]
@@ -330,7 +330,7 @@ class TestProgStudioJourney:
 
             # --- sessions.chat: regenerate replaces the tail reply ------
             await studio.sessions.chat.regenerate(session_id, creature_id)
-            regen_history = studio.sessions.chat.history(session_id, creature_id)
+            regen_history = await studio.sessions.chat.history(session_id, creature_id)
             # The tail assistant message is now the regenerated text;
             # the user turns are untouched.
             assert "Regenerated reply." in regen_history["messages"][-1]["content"]
@@ -339,10 +339,10 @@ class TestProgStudioJourney:
             ] == ["ping one", "ping two"]
             # Per-turn branch metadata now records two branches on the
             # last turn (the original + the regeneration).
-            br = studio.sessions.chat.branches(session_id, creature_id)
-            last_turn = br["turns"][-1]
-            assert last_turn["branches"] == [1, 2]
-            assert last_turn["latest_branch"] == 2
+            br = await studio.sessions.chat.branches(session_id, creature_id)
+            last_turn = br[-1]
+            assert [branch["branch_id"] for branch in last_turn["branches"]] == [1, 2]
+            assert last_turn["latest"] == 2
 
             # --- sessions.state: scratchpad + read-only runtime panes ---
             patched = studio.sessions.state.patch_scratchpad(
@@ -431,7 +431,15 @@ class TestProgStudioJourney:
             # --- sessions.plugins: toggle a plugin on then off ----------
             plugins = studio.sessions.plugins.list(session_id, creature_id)
             assert any(p["name"] == "sandbox" for p in plugins)
-            assert all(p["enabled"] is False for p in plugins)
+            # A Drive-enabled Terrarium turns on its always-on Drive plugins on
+            # every creature (the ``goal`` composition + the ``drive_runtime``
+            # prompt contributor); every other builtin stays off until toggled.
+            terrarium_defaults = {"goal", "drive_runtime"}
+            assert all(
+                p["enabled"] is False
+                for p in plugins
+                if p["name"] not in terrarium_defaults
+            )
             toggled_on = await studio.sessions.plugins.toggle(
                 session_id, creature_id, "sandbox"
             )
@@ -533,7 +541,7 @@ class TestProgStudioJourney:
             resumed = await studio.persistence.resume(saved_path)
             assert len(resumed.creatures) == 1
             resumed_cid = resumed.creatures[0]["creature_id"]
-            resumed_history = studio.sessions.chat.history(
+            resumed_history = await studio.sessions.chat.history(
                 resumed.session_id, resumed_cid
             )
             resumed_users = [
@@ -812,7 +820,7 @@ class TestProgStudioJourney:
             team_out = await _drain_chat(studio, team_sid, alpha_id, "team status?")
             assert team_out == "Acknowledged."
             # The turn is reflected in alpha's history.
-            alpha_history = studio.sessions.chat.history(team_sid, alpha_id)
+            alpha_history = await studio.sessions.chat.history(team_sid, alpha_id)
             assert [
                 m["content"] for m in alpha_history["messages"] if m["role"] == "user"
             ] == ["team status?"]

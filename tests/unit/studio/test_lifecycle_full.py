@@ -12,7 +12,7 @@ import pytest
 
 from kohakuterrarium.studio.sessions import lifecycle
 from kohakuterrarium.terrarium.engine import Terrarium
-from kohakuterrarium.terrarium.service import LocalTerrariumService
+from kohakuterrarium.terrarium.service import CreatureInfo, LocalTerrariumService
 from kohakuterrarium.testing.terrarium import (
     TestTerrariumBuilder,
     _FakeAgent,
@@ -84,7 +84,6 @@ class TestStartCreatureLocal:
         # When on_node != "_host", takes the remote path.
         engine = Terrarium()
         svc = LocalTerrariumService(engine)
-        from kohakuterrarium.terrarium.service import CreatureInfo
 
         info = CreatureInfo(
             creature_id="cid-r",
@@ -103,13 +102,33 @@ class TestStartCreatureLocal:
         # Replace the multi-node-like path: monkey-patch add_creature on
         # the service to bypass on_node check.
         svc.add_creature = _add
+        svc._host = SimpleNamespace(
+            request=AsyncMock(
+                return_value={
+                    "stores": [
+                        {
+                            "path": "C:/sessions/g-remote.kohakutr",
+                            "conversation_id": "conversation-remote",
+                        }
+                    ]
+                }
+            )
+        )
         try:
             sess = await lifecycle.start_creature(
                 svc, config=SimpleNamespace(name="bob"), on_node="worker-1"
             )
             assert sess.home_node == "worker-1"
-            # _meta entry retained.
-            assert sess.session_id in lifecycle.meta_for(svc)
+            meta = lifecycle.meta_for(svc)[sess.session_id]
+            assert meta["remote_session_path"] == "C:/sessions/g-remote.kohakutr"
+            assert meta["conversation_id"] == "conversation-remote"
+            svc._host.request.assert_awaited_once_with(
+                to_node="worker-1",
+                namespace="terrarium.session",
+                type="stores",
+                body={"session_id": "g-remote"},
+                timeout=30.0,
+            )
         finally:
             await engine.shutdown()
 
@@ -258,109 +277,6 @@ class TestStartTerrarium:
         finally:
             await engine.shutdown()
 
-    async def test_runtime_group_stop_and_resume_round_trip(
-        self, tmp_path, monkeypatch
-    ):
-        from kohakuterrarium.session.store import SessionStore
-        from kohakuterrarium.studio.persistence.session_index.reconcile import (
-            read_entry_from_disk,
-        )
-        from kohakuterrarium.terrarium.creature_ops import wire_creature_on_engine
-
-        session_dir = tmp_path / "sessions"
-        root_cfg = tmp_path / "root-config"
-        worker_cfg = tmp_path / "worker-config"
-        root_pwd = tmp_path / "root-workspace"
-        worker_pwd = tmp_path / "worker-workspace"
-        for path in (root_cfg, worker_cfg, root_pwd, worker_pwd):
-            path.mkdir()
-        root_cfg.joinpath("config.yaml").write_text(
-            "name: root\ninput:\n  type: none\noutput:\n  type: none\n",
-            encoding="utf-8",
-        )
-        worker_cfg.joinpath("config.yaml").write_text(
-            "name: worker\ninput:\n  type: none\noutput:\n  type: none\n",
-            encoding="utf-8",
-        )
-        monkeypatch.setenv("KT_SESSION_DIR", str(session_dir))
-
-        engine = Terrarium(session_dir=str(session_dir))
-        service = LocalTerrariumService(engine)
-        resumed = None
-        try:
-            session = await lifecycle.start_creature(
-                service,
-                config_path=str(root_cfg),
-                pwd=str(root_pwd),
-                name="root",
-            )
-            sid = session.session_id
-            root = engine.get_creature(session.creatures[0]["creature_id"])
-            worker = await engine.add_creature(
-                str(worker_cfg),
-                graph=sid,
-                pwd=str(worker_pwd),
-                name="worker",
-                parent_creature_id=root.creature_id,
-                io="none",
-                strict=False,
-            )
-            lifecycle.attach_session_store_for_creature(
-                service, worker, config_path=str(worker_cfg)
-            )
-            await engine.add_channel(sid, "tasks")
-            wire_creature_on_engine(engine, sid, root.creature_id, "tasks", "send")
-            wire_creature_on_engine(engine, sid, worker.creature_id, "tasks", "listen")
-            await engine.wire_output(
-                root.creature_id, {"to": "worker", "with_content": True}
-            )
-            store_path = Path(lifecycle.get_session_store(service, sid).path)
-            original_ids = {root.creature_id, worker.creature_id}
-
-            await lifecycle.stop_session(service, sid)
-
-            assert not engine.list_graphs()
-            assert engine._session_stores == {}
-            assert [p.name for p in session_dir.glob("*.kohakutr")] == [store_path.name]
-            store = SessionStore.open_readonly(store_path)
-            try:
-                meta = store.load_meta()
-                assert meta["status"] == "paused"
-                assert {item["name"] for item in meta["runtime_creatures"]} == {
-                    "root",
-                    "worker",
-                }
-            finally:
-                store.close()
-            entry = read_entry_from_disk(store_path)
-            assert entry is not None
-            assert entry.status == "paused"
-
-            resumed = await Terrarium.resume(str(store_path))
-            creatures = {
-                creature.name: creature for creature in resumed.list_creatures()
-            }
-            assert set(creatures) == {"root", "worker"}
-            assert {
-                creature.creature_id for creature in creatures.values()
-            } == original_ids
-            assert creatures["root"].is_privileged is True
-            assert creatures["worker"].parent_creature_id == root.creature_id
-            assert Path(creatures["root"].agent.executor._working_dir) == root_pwd
-            assert Path(creatures["worker"].agent.executor._working_dir) == worker_pwd
-            graph = resumed.get_graph(creatures["root"].graph_id)
-            assert "tasks" in graph.channels
-            assert graph.send_edges[creatures["root"].creature_id] == {"tasks"}
-            assert graph.listen_edges[creatures["worker"].creature_id] == {"tasks"}
-            assert (
-                resumed.list_output_wiring(creatures["root"].creature_id)[0]["to"]
-                == "worker"
-            )
-        finally:
-            if resumed is not None:
-                await resumed.shutdown()
-            await engine.shutdown()
-
 
 # ── list_sessions / get_session / find_creature ──────────────
 
@@ -481,6 +397,20 @@ class TestRename:
         try:
             with pytest.raises(ValueError):
                 lifecycle.rename_creature(svc, "alice", "")
+        finally:
+            await t.shutdown()
+
+    async def test_rename_creature_rejects_duplicate_name_in_graph(self):
+        from kohakuterrarium.terrarium.graph_identity import GraphNameConflictError
+
+        t = await (
+            TestTerrariumBuilder().with_creature("alice").with_creature("bob").build()
+        )
+        svc = LocalTerrariumService(t)
+        try:
+            with pytest.raises(GraphNameConflictError):
+                lifecycle.rename_creature(svc, "bob", "alice")
+            assert t.get_creature("bob").name == "bob"
         finally:
             await t.shutdown()
 

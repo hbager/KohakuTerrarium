@@ -24,8 +24,7 @@ KohakuTerrarium 隨附的所有內建工具、子代理、輸入、輸出、使�
 
 ### Shell 與腳本
 
-**`bash`**：執行 shell 命令。會在 `bash`、`zsh`、`sh`、`fish`、`pwsh`
-之中選擇第一個可用者。遵守 `KT_SHELL_PATH`。會擷取 stdout 與 stderr，並在達到上限時截斷。直接執行。
+**`bash`**：執行 shell 命令。所有平台預設使用 `bash`（Windows 上使用 Git Bash）。可透過 `type="..."` 選擇其他 shell：`bash`、`zsh`、`sh`、`fish`、`pwsh` 或 `powershell`。會擷取 stdout 與 stderr，並在達到上限時截斷。直接執行。
 
 - 參數：`command`（str）、`working_dir`（str，可選）、
   `timeout`（float，可選）。
@@ -92,7 +91,9 @@ KohakuTerrarium 隨附的所有內建工具、子代理、輸入、輸出、使�
 
 - 參數：`url`。
 
-**`web_search`**：使用 DuckDuckGo 搜尋，回傳 markdown 格式結果。直接執行。
+**`web_search`**：預設使用 DuckDuckGo，也可選擇 DeepSeek Responses
+搜尋後端。DeepSeek 需先執行 `kt config key set deepseek`，再透過
+`/module set web_search backend deepseek` 為目前 Creature 啟用。直接執行。
 
 - 參數：`query`、`max_results`（int）、`region`（str）。
 

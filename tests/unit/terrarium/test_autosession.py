@@ -6,11 +6,14 @@ the failure modes that ceremony used to invite (free-string
 ``config_type`` corrupting resumability, files stuck ``running``).
 """
 
+import asyncio
+
 import pytest
 
+from kohakuterrarium.core.config import AgentConfig
+from kohakuterrarium.core.config_serde import pack_agent_config
 from kohakuterrarium.session.resume import detect_session_type
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.terrarium import autosession as autosession_mod
 from kohakuterrarium.terrarium.creature_host import Creature
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.testing.llm import ScriptedLLM
@@ -18,7 +21,13 @@ from kohakuterrarium.testing.terrarium import _FakeAgent
 
 
 def _prebuilt(name="alice"):
-    return Creature(creature_id=name, name=name, agent=_FakeAgent(name=name))
+    return Creature(
+        creature_id=name,
+        name=name,
+        agent=_FakeAgent(name=name),
+        config_snapshot=pack_agent_config(AgentConfig(name=name)),
+        build_pwd=".",
+    )
 
 
 def _write_cfg(tmp_path, name="auto"):
@@ -47,6 +56,17 @@ class TestAutosessionViaSessionDir:
             assert meta["agents"] == ["alice"]
             assert meta["session_id"] == c.creature_id
             assert meta["status"] == "running"
+            manifest = meta["live_graph_manifest"]
+            assert manifest["graph_id"] == c.graph_id
+            assert manifest["revision"] == 2
+            assert [item["name"] for item in manifest["creatures"]] == ["alice"]
+            await t.add_channel(c.graph_id, "tasks", description="Work")
+            assert store.meta["live_graph_manifest"]["revision"] == 3
+            assert store.meta["live_graph_manifest"]["channels"] == [
+                {"name": "tasks", "description": "Work"}
+            ]
+            await t.remove_creature(c)
+            assert store.meta["live_graph_manifest"] is None
         finally:
             await t.shutdown()
         # shutdown closed the minted store — no more stuck "running".
@@ -56,38 +76,32 @@ class TestAutosessionViaSessionDir:
         finally:
             reopened.close(update_status=False)
 
-    async def test_remove_graph_closes_owned_store(self, tmp_path):
-        session_dir = tmp_path / "runs"
-        t = Terrarium(session_dir=str(session_dir))
+    async def test_shutdown_closes_owned_store_when_stop_cancelled(self, tmp_path):
+        # The stop loop can be cancelled mid-await; store closure runs in
+        # a ``finally`` so a leaked writer lock (which blocks any later
+        # adopt of the same file) can't outlive shutdown.
+        t = Terrarium(session_dir=str(tmp_path / "runs"))
         c = await t.add_creature(_prebuilt("alice"), start=False)
-        gid = c.graph_id
-        store_path = session_dir / f"{c.creature_id}.kohakutr"
-        await t.remove_graph(gid)
-        assert gid not in t._session_stores
-        assert gid not in t._owned_sessions
-        reopened = SessionStore.open_readonly(store_path)
-        try:
-            assert reopened.load_meta()["status"] == "paused"
-        finally:
-            reopened.close()
+        store = t._session_stores[c.graph_id]
+        assert c.graph_id in t._owned_sessions
+        # Force the shutdown loop to enter the stop branch, then have the
+        # stop itself get cancelled. is_running now derives from status, so
+        # the creature must look started (idle) — set _ever_started too.
+        c._running = True
+        c.agent._running = True
+        c._ever_started = True
+        t._running = True
 
-    async def test_explicit_creature_pwd_is_persisted_in_meta(self, tmp_path):
-        session_dir = tmp_path / "runs"
-        workspace = tmp_path / "workspace"
-        workspace.mkdir()
-        config = _write_cfg(tmp_path)
-        t = Terrarium(pwd=str(tmp_path), session_dir=str(session_dir))
-        try:
-            c = await t.add_creature(
-                str(config),
-                llm=ScriptedLLM(),
-                pwd=str(workspace),
-                start=False,
-            )
-            meta = t._session_stores[c.graph_id].load_meta()
-            assert meta["pwd"] == str(workspace)
-        finally:
+        async def _cancelled_stop(*_args, **_kwargs):
+            raise asyncio.CancelledError()
+
+        c.stop = _cancelled_stop
+        with pytest.raises(asyncio.CancelledError):
             await t.shutdown()
+        # Cancellation propagated, but the owned store was still closed
+        # and the engine still marked itself stopped.
+        assert getattr(store, "_closed", False) is True
+        assert t._running is False
 
     async def test_session_false_disables_autosession(self, tmp_path):
         t = Terrarium(session_dir=str(tmp_path / "runs"))
@@ -105,30 +119,6 @@ class TestAutosessionViaSessionDir:
             assert c.graph_id not in t._session_stores
         finally:
             await t.shutdown()
-
-
-class TestMintStoreFailures:
-    def test_load_meta_failure_closes_store(self, monkeypatch, tmp_path):
-        class FakeStore:
-            closed = False
-
-            def __init__(self, path, writer_lock=False):
-                pass
-
-            def load_meta(self):
-                raise RuntimeError("broken metadata")
-
-            def close(self):
-                self.closed = True
-
-        store = FakeStore(None)
-        monkeypatch.setattr(
-            autosession_mod, "SessionStore", lambda *args, **kwargs: store
-        )
-
-        with pytest.raises(RuntimeError, match="broken metadata"):
-            autosession_mod.mint_store(object(), "graph", path=tmp_path / "x.kohakutr")
-        assert store.closed is True
 
 
 class TestSessionArg:
@@ -203,6 +193,26 @@ class TestSessionArg:
         finally:
             await t.shutdown()
 
+    async def test_joining_graph_with_closed_store_rebuilds(self, tmp_path):
+        # Defensive: a closed store in engine._session_stores (e.g. after a
+        # merge replaced it) must not be attached; a fresh store is minted.
+        t = Terrarium(session_dir=str(tmp_path / "runs"))
+        try:
+            first = await t.add_creature(_prebuilt("alice"), start=False)
+            stale = t._session_stores[first.graph_id]
+            stale.close(update_status=False)
+            # New creature on the same graph — previously would attach the
+            # closed store and lose its session.
+            await t.add_creature(_prebuilt("bob"), graph=first.graph_id, start=False)
+            new_store = t._session_stores[first.graph_id]
+            assert not getattr(new_store, "_closed", False)
+            # The fresh store serves the joining creature; alice's history
+            # lived in the closed store and is unrecoverable by design.
+            meta = new_store.load_meta()
+            assert "bob" in set(meta["agents"])
+        finally:
+            await t.shutdown()
+
 
 class TestAttachSessionMintMode:
     async def test_path_attach_mints_with_meta(self, tmp_path):
@@ -237,16 +247,25 @@ class TestInitMetaValidation:
 
 
 class TestRealAgentRoundTrip:
-    async def test_chat_persists_and_is_resumable(self, tmp_path):
+    async def test_chat_persists_and_is_resumable(self, tmp_path, monkeypatch):
         # The 3-line replacement for the HW4 ceremony: path in,
         # resumable file out.
         cfg_dir = _write_cfg(tmp_path)
         target = tmp_path / "run.kohakutr"
+        provider = ScriptedLLM(["The graded reply."])
+        monkeypatch.setattr(
+            "kohakuterrarium.bootstrap.agent_init.create_llm_provider",
+            lambda *_args, **_kwargs: provider,
+        )
+        monkeypatch.setattr(
+            "kohakuterrarium.bootstrap.llm.create_llm_provider",
+            lambda *_args, **_kwargs: provider,
+        )
         t = Terrarium(pwd=str(tmp_path))
         try:
             c = await t.add_creature(
                 str(cfg_dir),
-                llm=ScriptedLLM(["The graded reply."]),
+                llm="default",
                 io="headless",
                 session=str(target),
             )

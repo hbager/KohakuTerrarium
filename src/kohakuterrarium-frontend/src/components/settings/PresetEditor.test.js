@@ -60,28 +60,15 @@ describe("PresetEditor default selector", () => {
 
     await selects.at(-2).setValue("xhigh")
     await selects.at(-1).setValue("fast")
-    await nextTick()
-    await wrapper.findAll("button")[1].trigger("click")
-
-    expect(wrapper.emitted("set-default")?.[0]?.[0]).toMatchObject({
-      provider: "openrouter",
-      name: "mimo-v2-pro",
-      selected_variations: { reasoning: "xhigh", speed: "fast" },
-    })
+    expect(wrapper.text()).toContain('"reasoning_effort": "xhigh"')
+    expect(wrapper.text()).toContain('"service_tier": "fast"')
   })
 
-  it("keeps default variation selections after the model list reloads", async () => {
-    const wrapper = mountEditor({
-      is_default: true,
-      selected_variations: { reasoning: "xhigh", speed: "fast" },
-    })
+  it("shows the default badge without exposing a set-default action", async () => {
+    const wrapper = mountEditor({ is_default: true })
+    await nextTick()
 
-    await wrapper.findAll("button")[1].trigger("click")
-
-    expect(wrapper.emitted("set-default")?.[0]?.[0]).toMatchObject({
-      provider: "openrouter",
-      name: "mimo-v2-pro",
-      selected_variations: { reasoning: "xhigh", speed: "fast" },
-    })
+    expect(wrapper.text()).toContain("settings.models.isDefault")
+    expect(wrapper.text()).not.toContain("settings.models.setAsDefault")
   })
 })

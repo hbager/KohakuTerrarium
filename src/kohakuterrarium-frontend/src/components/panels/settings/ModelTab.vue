@@ -34,12 +34,11 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from "vue"
+import { computed, onMounted, ref } from "vue"
 
 import ModelSwitcher from "@/components/chrome/ModelSwitcher.vue"
 import { useChatStore } from "@/stores/chat"
 import { configAPI } from "@/utils/api"
-import { LAYOUT_EVENTS, onLayoutEvent } from "@/utils/layoutEvents"
 
 const props = defineProps({
   instance: { type: Object, default: null },
@@ -64,20 +63,13 @@ async function loadProfile() {
     const wantProvider = slash >= 0 ? base.slice(0, slash) : ""
     const wantName = slash >= 0 ? base.slice(slash + 1) : base
     const entries = Array.isArray(models) ? models : []
-    profile.value = wantProvider ? entries.find((m) => m.name === wantName && (m.provider || m.login_provider) === wantProvider) || null : entries.find((m) => m.name === wantName) || null
+    profile.value = entries.find((m) => m.name === wantName && (!wantProvider || (m.provider || m.login_provider) === wantProvider)) || entries.find((m) => m.name === wantName) || null
   } catch {
     profile.value = null
   }
 }
 
-let cleanupModelCatalog = null
-onMounted(() => {
-  loadProfile()
-  cleanupModelCatalog = onLayoutEvent(LAYOUT_EVENTS.MODEL_CATALOG_CHANGED, loadProfile)
-})
-onUnmounted(() => {
-  if (cleanupModelCatalog) cleanupModelCatalog()
-})
+onMounted(loadProfile)
 
 function formatTokens(n) {
   if (!n) return "—"

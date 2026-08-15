@@ -10,24 +10,39 @@ both ``AgentConfig`` (file path or object) and ``CreatureConfig``
 """
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from kohakuterrarium.builtins.inputs.none import NoneInput
 from kohakuterrarium.builtins.outputs.none import NoneOutput
 from kohakuterrarium.core.agent import Agent
-from kohakuterrarium.core.config import AgentConfig, build_agent_config
+from kohakuterrarium.core.config import (
+    AgentConfig,
+    build_agent_config,
+    load_agent_config,
+)
+from kohakuterrarium.core.config_serde import pack_agent_config
 from kohakuterrarium.core.environment import Environment
-from kohakuterrarium.core.turn import AgentEventStream
+from kohakuterrarium.core.events import TriggerEvent
+from kohakuterrarium.core.turn import AgentEventStream, TurnResult
 from kohakuterrarium.llm.profiles import _login_provider_for
 from kohakuterrarium.terrarium.config import CreatureConfig
+from kohakuterrarium.terrarium.creature_ids import _safe_creature_id
 from kohakuterrarium.terrarium.output_log import LogEntry, OutputLogCapture
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Engine bookkeeping that prevents Drive delivery until startup has settled;
+# this state is not part of the agent's cognitive state.
+RESTORATION_ADDED = "added"
+RESTORATION_RESTORING = "restoring"
+RESTORATION_STARTED = "started"
+RESTORATION_STARTUP_SETTLED = "startup_settled"
+RESTORATION_READY = "restoration_ready"
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +72,10 @@ class Creature:
     agent: Agent
     graph_id: str = ""
     config: Any = None
+    config_snapshot: dict[str, Any] | None = None
+    source_ref: str | None = None
+    build_pwd: str = ""
+    injected_runtime: tuple[str, ...] = ()
     listen_channels: list[str] = field(default_factory=list)
     send_channels: list[str] = field(default_factory=list)
     output_log: OutputLogCapture | None = None
@@ -77,6 +96,8 @@ class Creature:
     # the dataclass stays trivially constructible.
     _output_queue: "asyncio.Queue[str | None] | None" = None
     _running: bool = False
+    _stop_requested: bool = True
+    _lifecycle_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _chat_handler_installed: bool = False
     # Background task driving the agent's configured input module.
     # Spawned in ``start`` and reaped in ``stop`` — see ``start`` for
@@ -90,12 +111,21 @@ class Creature:
     # is captured here so :attr:`status` can report ``"error"`` until
     # the next ``start()`` clears it.
     _input_loop_error: BaseException | None = None
+    # Force-stop marker distinguishes a creature that was killed from one
+    # plainly stopped. Cleared on the next start().
+    _killed: bool = False
+    # The restoration barrier is runtime-only readiness state that the engine's
+    # Drive runtime gates reconciliation on. Transitions:
+    # added -> restoring -> started -> startup_settled -> restoration_ready.
+    _restoration_state: str = RESTORATION_ADDED
+    _restoration_ready_event: "asyncio.Event | None" = None
+    _restoration_task: "asyncio.Task[None] | None" = None
 
     # ------------------------------------------------------------------
     # lifecycle
     # ------------------------------------------------------------------
 
-    async def start(self) -> None:
+    async def start(self, *, requested: bool = True) -> None:
         """Start the underlying agent.  Idempotent.
 
         Also spawns ``Agent._drive_input`` as a background task so the
@@ -111,26 +141,98 @@ class Creature:
         tests or specialized hosts that don't expose this hook simply
         skip the spawn (they're presumed to drive their own loop).
         """
-        if self._running:
-            return
-        self._ensure_chat_pipe()
-        await self.agent.start()
-        self._running = True
-        self._ever_started = True
-        self._input_loop_error = None
-        drive_input = getattr(self.agent, "_drive_input", None)
-        if callable(drive_input):
-            self._input_task = asyncio.create_task(
-                drive_input(),
-                name=f"creature-input-{self.creature_id}",
+        async with self._lifecycle_lock:
+            if self._running:
+                return
+            if requested:
+                self._stop_requested = False
+            elif self._stop_requested:
+                return
+            self._ensure_chat_pipe()
+            self._restoration_state = RESTORATION_RESTORING
+            try:
+                await self.agent.start()
+            except BaseException:
+                self._restoration_state = RESTORATION_ADDED
+                try:
+                    await self.agent.stop()
+                except Exception as cleanup_error:
+                    logger.error(
+                        "Creature startup rollback failed",
+                        creature_id=self.creature_id,
+                        creature_name=self.name,
+                        error=str(cleanup_error),
+                        exc_info=True,
+                    )
+                raise
+            self._running = True
+            self._ever_started = True
+            self._input_loop_error = None
+            self._killed = False
+            self._restoration_state = RESTORATION_STARTED
+            drive_input = getattr(self.agent, "_drive_input", None)
+            if callable(drive_input):
+                self._input_task = asyncio.create_task(
+                    drive_input(),
+                    name=f"creature-input-{self.creature_id}",
+                )
+                self._input_task.add_done_callback(self._on_input_task_done)
+            self._arm_restoration_barrier()
+            logger.info(
+                "Creature started",
+                creature_id=self.creature_id,
+                creature_name=self.name,
             )
-            self._input_task.add_done_callback(self._on_input_task_done)
-        logger.info(
-            "Creature started", creature_id=self.creature_id, creature_name=self.name
+
+    def _ensure_restoration_event(self) -> "asyncio.Event":
+        if self._restoration_ready_event is None:
+            self._restoration_ready_event = asyncio.Event()
+        return self._restoration_ready_event
+
+    def _arm_restoration_barrier(self) -> None:
+        """Spawn the task that waits for the agent's startup trigger to
+        settle, then flips the creature to ``restoration_ready``."""
+        self._ensure_restoration_event().clear()
+        self._restoration_task = asyncio.create_task(
+            self._run_restoration_barrier(),
+            name=f"creature-barrier-{self.creature_id}",
         )
 
+    async def _run_restoration_barrier(self) -> None:
+        """Await startup-trigger settlement, then mark restoration-ready.
+
+        An agent-like without the ``_startup_settled`` observable (test
+        fakes) is treated as settled immediately — there is no startup
+        turn to wait for."""
+        settled = getattr(self.agent, "_startup_settled", None)
+        if settled is not None and hasattr(settled, "wait"):
+            try:
+                await settled.wait()
+            except asyncio.CancelledError:
+                return
+        self._restoration_state = RESTORATION_STARTUP_SETTLED
+        self._restoration_state = RESTORATION_READY
+        self._ensure_restoration_event().set()
+
+    @property
+    def restoration_state(self) -> str:
+        """Current restoration-barrier state."""
+        return self._restoration_state
+
+    @property
+    def restoration_ready(self) -> bool:
+        """Whether the restoration barrier has been crossed — Drive
+        reconciliation for this creature is gated on it."""
+        return self._restoration_state == RESTORATION_READY
+
+    async def wait_restoration_ready(self) -> None:
+        """Await restoration unless lifecycle stop intent supersedes it."""
+        if self.restoration_ready or self._stop_requested:
+            return
+        await self._ensure_restoration_event().wait()
+
     def _on_input_task_done(self, task: "asyncio.Task[None]") -> None:
-        """Mark the creature stopped once its input loop exits.
+        """Mark the creature host stopped once its input loop exits.
 
         The loop ends naturally when the input module signals
         ``exit_requested``, when ``Agent.stop`` flips ``_running``, or
@@ -152,21 +254,37 @@ class Creature:
             self._input_loop_error = exc
         self._running = False
 
-    async def stop(self) -> None:
+    async def stop(self, *, requested: bool = True) -> None:
         """Stop the underlying agent and close the chat pipe."""
-        if not self._running and self._input_task is None:
-            return
-        self._running = False
-        if self._output_queue is not None:
-            self._output_queue.put_nowait(None)
-        # Stopping the agent flips ``Agent._running`` and stops the
-        # input module, which unblocks ``get_input`` and lets the
-        # background loop exit on its own.
-        await self.agent.stop()
-        await self._reap_input_task()
-        logger.info(
-            "Creature stopped", creature_id=self.creature_id, creature_name=self.name
-        )
+        if requested:
+            self._stop_requested = True
+        async with self._lifecycle_lock:
+            if not self._running and self._input_task is None:
+                return
+            self._running = False
+            self._restoration_state = RESTORATION_ADDED
+            self._teardown_restoration_barrier()
+            if self._output_queue is not None:
+                self._output_queue.put_nowait(None)
+            # Stopping the agent flips ``Agent._running`` and stops the
+            # input module, which unblocks ``get_input`` and lets the
+            # background loop exit on its own.
+            await self.agent.stop()
+            await self._reap_input_task()
+            logger.info(
+                "Creature stopped",
+                creature_id=self.creature_id,
+                creature_name=self.name,
+            )
+
+    def _teardown_restoration_barrier(self) -> None:
+        """Cancel restoration and release waiters superseded by stop."""
+        task = self._restoration_task
+        self._restoration_task = None
+        if task is not None and not task.done():
+            task.cancel()
+        if self._restoration_ready_event is not None:
+            self._restoration_ready_event.set()
 
     async def _reap_input_task(self) -> None:
         """Wait for the input-driver task to exit, cancelling on timeout."""
@@ -182,7 +300,9 @@ class Creature:
             task.cancel()
             try:
                 await task
-            except (asyncio.CancelledError, Exception) as e:
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
                 logger.warning(
                     "input task cancel ended with exception",
                     creature_id=self.creature_id,
@@ -201,7 +321,43 @@ class Creature:
 
     @property
     def is_running(self) -> bool:
-        return self._running and self.agent.is_running
+        """Convenience shortcut over the ground-truth :attr:`status`: the
+        creature is alive and message-eligible (``status`` is ``"idle"`` or
+        ``"busy"``).  ``status`` is authoritative; this is derived from it."""
+        return self.status in ("idle", "busy")
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_requested
+
+    def is_naturally_idle(self) -> bool:
+        if self._stop_requested or self.agent.is_running:
+            return False
+        if self._turn_work_pending():
+            return False
+        return not self._background_work_pending()
+
+    def _turn_work_pending(self) -> bool:
+        turn_lock = getattr(self.agent, "_turn_lock", None)
+        if turn_lock is not None and turn_lock.locked():
+            return True
+        processing = getattr(self.agent, "_processing_task", None)
+        if processing is not None and not processing.done():
+            return True
+        active_turn = getattr(self.agent, "_active_turn_task", None)
+        if active_turn is not None and not active_turn.done():
+            return True
+        inbox = getattr(self.agent, "_event_inbox", None)
+        return inbox is not None and not inbox.empty()
+
+    def _background_work_pending(self) -> bool:
+        if getattr(self.agent, "_active_handles", None):
+            return True
+        executor = getattr(self.agent, "executor", None)
+        if executor is not None and executor.get_running_jobs():
+            return True
+        manager = getattr(self.agent, "subagent_manager", None)
+        return manager is not None and bool(manager.get_running_jobs())
 
     @property
     def status(self) -> str:
@@ -223,8 +379,12 @@ class Creature:
           live ``_processing_task``).
         - ``"idle"``: the agent is alive and waiting for input / a
           trigger / a channel message.
-        - ``"stopped"``: ``stop()`` was called or the input loop
-          finished naturally; the agent is no longer servicing events.
+        - ``"stopped"``: the agent is no longer running (``stop()`` was
+          called, or a standalone ``run_forever`` loop finished); it is no
+          longer servicing events. NOTE: an engine worker whose ``_drive_input``
+          task idles out keeps a live agent (``agent.is_running`` stays True),
+          so it stays ``"idle"`` — still able to receive channel / group_send
+          messages — not ``"stopped"``.
         """
         if not self._ever_started:
             return "not_started"
@@ -237,8 +397,31 @@ class Creature:
             return "busy"
         return "idle"
 
+    @property
+    def paused(self) -> bool:
+        """Whether the creature is warm-paused. Orthogonal to
+        :attr:`status`/:attr:`is_running` — a paused creature stays alive
+        and warm, it just admits no new turns until resumed."""
+        return bool(getattr(self.agent, "_paused", False))
+
+    @property
+    def killed(self) -> bool:
+        """Whether this creature was force-stopped via a kill operation.
+        Cleared on the next :meth:`start`."""
+        return self._killed
+
+    def pause(self) -> None:
+        """Warm-pause the underlying agent (thin delegate — see
+        :meth:`Agent.pause`)."""
+        self.agent.pause()
+
+    def resume(self) -> None:
+        """Resume the underlying agent from a warm pause (thin delegate —
+        see :meth:`Agent.resume`)."""
+        self.agent.resume()
+
     # ------------------------------------------------------------------
-    # typed turn drivers (E3) — the programmatic chat surface
+    # typed turn drivers — the programmatic chat surface
     # ------------------------------------------------------------------
 
     async def run(self, content, **kwargs):
@@ -286,6 +469,32 @@ class Creature:
     ) -> None:
         """Push input into the agent without consuming output."""
         await self.agent.inject_input(message, source=source)
+
+    async def inject_event(
+        self,
+        event: TriggerEvent,
+        *,
+        correlation_id: str | None = None,
+        timeout: float | None = None,
+        raise_on_error: bool = False,
+    ) -> TurnResult:
+        """Drive a pre-built :class:`TriggerEvent` and return its correlated
+        :class:`TurnResult` through the public creature ingress.
+
+        This is the seam the Terrarium Drive dispatcher delivers over. It
+        distinguishes *rejected-because-stopped* (``status="rejected"``,
+        never silent) from an admitted turn that settled
+        ``ok``/``error``/``timeout``/``interrupted``; ``correlation_id``
+        (the delivery id) rides ``event.context`` to turn finalization and
+        back onto the result.  No private ``Agent._process_event`` call.
+        """
+        if correlation_id is not None:
+            if event.context is None:
+                event.context = {}
+            event.context.setdefault("correlation_id", correlation_id)
+        return await self.agent.run_event(
+            event, timeout=timeout, raise_on_error=raise_on_error
+        )
 
     async def chat(self, message: str | list[dict]) -> AsyncIterator[str]:
         """Inject ``message`` and stream the agent's text response.
@@ -408,6 +617,8 @@ class Creature:
             "max_context": max_context,
             "compact_threshold": compact_threshold,
             "running": self.is_running,
+            "paused": self.paused,
+            "killed": self._killed,
             "is_processing": bool(getattr(agent, "_processing_task", None)),
             "tools": agent.tools,
             "subagents": agent.subagents,
@@ -439,6 +650,49 @@ class Creature:
 
 
 CreatureBuildInput = AgentConfig | CreatureConfig | str | Path
+
+
+def _with_terrarium_plugin_defaults(config: AgentConfig) -> AgentConfig:
+    """Enable Terrarium-wide plugin defaults without importing implementations."""
+    defaults = list(config.default_plugins)
+    if "goal" not in defaults:
+        defaults.append("goal")
+    config.default_plugins = defaults
+    return config
+
+
+def _runtime_injection_labels(llm, tools, plugins) -> tuple[str, ...]:
+    return tuple(
+        label
+        for label, value in (
+            ("llm_provider", llm if not isinstance(llm, (str, type(None))) else None),
+            ("tools", tools),
+            ("plugins", plugins),
+        )
+        if value
+    )
+
+
+def _build_provenance(
+    agent: Agent,
+    *,
+    source_ref: str | None,
+    injected_runtime: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """Capture the resolved declarative inputs needed to rebuild a creature."""
+    try:
+        config_snapshot = pack_agent_config(agent.config)
+    except TypeError:
+        config_snapshot = None
+    return {
+        "config_snapshot": config_snapshot,
+        "source_ref": source_ref,
+        "build_pwd": str(
+            getattr(getattr(agent, "executor", None), "_working_dir", None)
+            or os.getcwd()
+        ),
+        "injected_runtime": injected_runtime,
+    }
 
 
 def apply_creature_name(creature: "Creature", name: str) -> None:
@@ -533,8 +787,9 @@ def build_creature(
     _io_override = NoneInput() if io in ("none", "headless") else None
     _out_override = NoneOutput() if io == "headless" else None
     if isinstance(config, (str, Path)):
-        agent = Agent.from_path(
-            str(config),
+        agent_config = _with_terrarium_plugin_defaults(load_agent_config(config))
+        agent = Agent(
+            agent_config,
             input_module=_io_override,
             output_module=_out_override,
             session=(
@@ -556,9 +811,15 @@ def build_creature(
             agent=agent,
             graph_id=graph_id,
             config=agent.config,
+            **_build_provenance(
+                agent,
+                source_ref=str(config),
+                injected_runtime=_runtime_injection_labels(llm, tools, plugins),
+            ),
         )
 
     if isinstance(config, AgentConfig):
+        config = _with_terrarium_plugin_defaults(config)
         session = (
             environment.get_session(creature_id or config.name) if environment else None
         )
@@ -581,10 +842,17 @@ def build_creature(
             agent=agent,
             graph_id=graph_id,
             config=config,
+            **_build_provenance(
+                agent,
+                source_ref=None,
+                injected_runtime=_runtime_injection_labels(llm, tools, plugins),
+            ),
         )
 
     if isinstance(config, CreatureConfig):
-        agent_config = build_agent_config(config.config_data, config.base_dir)
+        agent_config = _with_terrarium_plugin_defaults(
+            build_agent_config(config.config_data, config.base_dir)
+        )
         # CreatureConfig (in-recipe / hot-plug) is always engine-managed
         # and channel-driven — its input is suppressed unconditionally;
         # ``io="headless"`` additionally silences the default output.
@@ -607,6 +875,15 @@ def build_creature(
             agent=agent,
             graph_id=graph_id,
             config=config,
+            **_build_provenance(
+                agent,
+                source_ref=(
+                    str(config.config_data.get("base_config"))
+                    if config.config_data.get("base_config")
+                    else None
+                ),
+                injected_runtime=_runtime_injection_labels(llm, tools, plugins),
+            ),
             listen_channels=list(config.listen_channels),
             send_channels=list(config.send_channels),
         )
@@ -616,13 +893,7 @@ def build_creature(
     )
 
 
-def _safe_creature_id(name: str) -> str:
-    """Mint a unique creature id from a config name.
-
-    Names from a recipe are usually meaningful and unique within the
-    recipe, but the engine namespace is process-wide — append a short
-    random suffix so two recipes with the same creature name don't
-    collide.
-    """
-    cleaned = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in name)
-    return f"{cleaned or 'creature'}_{uuid4().hex[:8]}"
+# ``_safe_creature_id`` / ``_clean_creature_name`` / ``_decode_creature_name``
+# live in the leaf :mod:`terrarium.creature_ids` (shared with the Drive resume
+# remap without cross-importing the heavy Agent graph); re-exported here for
+# existing callers (``resume.py`` imports ``_safe_creature_id`` from here).

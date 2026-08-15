@@ -3,6 +3,9 @@
 import json as _json
 from typing import Any
 
+from kohakuterrarium.llm.artifact_resolve import (
+    resolve_artifact_url as _resolve_artifact_url,
+)
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -60,7 +63,7 @@ def fix_tool_call_pairing(api_input: list[dict[str, Any]]) -> list[dict[str, Any
 def maybe_capture_stream_rate_limit(
     event: Any, parse_rate_limit_event, usage_snapshot_cls, set_cached
 ) -> None:
-    """Capture a codex.rate_limits event if the SDK surfaces one."""
+    """Cache a rate-limit event when it appears on the SDK's generic surface."""
     try:
         payload: Any = (
             getattr(event, "data", None)
@@ -82,7 +85,7 @@ def maybe_capture_stream_rate_limit(
         snap = parse_rate_limit_event(_json.dumps(payload_dict))
         if snap is not None and snap.has_data():
             set_cached(usage_snapshot_cls(snapshots=[snap]))
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover - telemetry must not break streaming
         logger.warning(
             "Codex rate-limit event capture failed",
             error=str(exc),
@@ -106,7 +109,9 @@ def _user_item(content: Any) -> dict[str, Any] | None:
             url = _image_url_value(part.get("image_url"))
             if not url:
                 continue
-            input_content.append({"type": "input_image", "image_url": url})
+            input_content.append(
+                {"type": "input_image", "image_url": _resolve_artifact_url(url)}
+            )
     return {"role": "user", "content": input_content} if input_content else None
 
 
@@ -133,17 +138,7 @@ def _assistant_items(
 
 
 def _tool_item(content: Any, call_id: str) -> dict[str, Any]:
-    """Build a Responses-API ``function_call_output`` item.
-
-    Responses API accepts ``output`` as either a string OR an array of
-    input parts (``input_text`` / ``input_image``) — we use the array
-    form when any image is present so the model receives the image
-    alongside its tool call, keeping the string form for text-only
-    results so the historical wire shape is preserved.
-
-    Controller resolves current-session artifact URLs to ``data:`` URLs before
-    this format conversion runs.
-    """
+    """Build a tool output, using multimodal parts only when images are present."""
     parts = _tool_output_parts(content)
     if parts is not None:
         return {
@@ -159,12 +154,7 @@ def _tool_item(content: Any, call_id: str) -> dict[str, Any]:
 
 
 def _tool_output_parts(content: Any) -> list[dict[str, Any]] | None:
-    """Convert a multimodal tool-result body to Responses-API input parts.
-
-    Returns ``None`` for plain string / text-only content so callers
-    fall back to the simpler string ``output`` form. Otherwise returns
-    a list of ``{type: input_text|input_image, ...}`` parts.
-    """
+    """Convert image-bearing tool results to Responses input parts."""
     if not isinstance(content, list):
         return None
     if not any(isinstance(p, dict) and p.get("type") == "image_url" for p in content):
@@ -182,12 +172,14 @@ def _tool_output_parts(content: Any) -> list[dict[str, Any]] | None:
             url = _image_url_value(part.get("image_url"))
             if not url:
                 continue
-            parts.append({"type": "input_image", "image_url": url})
+            parts.append(
+                {"type": "input_image", "image_url": _resolve_artifact_url(url)}
+            )
     return parts or None
 
 
 def _image_url_value(image_url: Any) -> str:
-    """Pull the URL string out of an ``image_url`` part value."""
+    """Extract a URL from either supported ``image_url`` representation."""
     if isinstance(image_url, str):
         return image_url
     if isinstance(image_url, dict):

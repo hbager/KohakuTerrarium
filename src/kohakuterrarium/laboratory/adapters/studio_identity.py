@@ -1,31 +1,4 @@
-"""APP extension adapter for ``studio.identity``.
-
-Host-side handler that lets workers fetch the controller's identity
-state: API keys, LLM profile bodies, MCP server configs.  Clients
-query the host; the host responds with the requested record (or
-``not_found``).
-
-This is the foundation for the hybrid identity model
-(``management-wiring.md``).  The host is the source of truth; workers
-may cache via :class:`IdentityCache` for hot-path performance.
-Invalidation broadcasts and push-at-spawn are layered on top in
-follow-up units.
-
-Wire types:
-
-| type              | body              | response                           |
-|-------------------|-------------------|------------------------------------|
-| ``get_api_key``   | ``{provider}``    | ``{key}``                          |
-| ``get_profile``   | ``{name}``        | ``{profile}``                      |
-| ``list_profiles`` | ``{}``            | ``{profiles}``                     |
-| ``get_mcp_server``| ``{name}``        | ``{server}``                       |
-| ``list_mcp_servers`` | ``{}``         | ``{servers}``                      |
-
-Errors translate to the standard envelope (``not_found`` /
-``invalid`` / ``identity``).  An empty API key from the store is
-treated as ``not_found`` — workers calling ``get_api_key`` get a
-clear signal rather than a silently-empty string.
-"""
+"""Expose host identity records and Codex operations to laboratory workers."""
 
 from typing import Any
 
@@ -39,7 +12,9 @@ from kohakuterrarium.studio.identity.api_keys import (
     set_key,
 )
 from kohakuterrarium.studio.identity.codex_oauth import (
+    consume_reset_credit_async as codex_consume_reset_credit,
     get_status as codex_get_status,
+    get_usage_async as codex_get_usage,
     login_async as codex_login_async,
 )
 from kohakuterrarium.studio.identity.llm_profiles import list_profiles_payload
@@ -50,12 +25,7 @@ logger = get_logger(__name__)
 
 
 class StudioIdentityAdapter:
-    """Host-side ``studio.identity`` APP extension.
-
-    Install once on the host; workers issue APP requests against
-    ``studio.identity`` and the handler reads from the controller's
-    local identity files (``~/.kohakuterrarium/api_keys.json`` etc.).
-    """
+    """Serve controller-local identity state through ``studio.identity``."""
 
     NAMESPACE = "studio.identity"
 
@@ -105,6 +75,10 @@ class StudioIdentityAdapter:
                 return await self._op_codex_login()
             case "codex_status":
                 return codex_get_status()
+            case "codex_usage":
+                return await codex_get_usage()
+            case "codex_reset_consume":
+                return await self._op_codex_reset_consume(msg.body)
             case _:
                 return {
                     "error": {
@@ -112,10 +86,6 @@ class StudioIdentityAdapter:
                         "message": f"unsupported studio.identity type: {msg.type!r}",
                     }
                 }
-
-    # ------------------------------------------------------------------
-    # Ops
-    # ------------------------------------------------------------------
 
     def _op_get_api_key(self, body: dict[str, Any]) -> dict[str, Any]:
         provider = body.get("provider")
@@ -127,7 +97,7 @@ class StudioIdentityAdapter:
         return {"key": key}
 
     def _op_get_codex_token(self) -> dict[str, Any]:
-        """Return the host's stored Codex OAuth tokens (or 404)."""
+        """Return stored Codex OAuth tokens or report them as missing."""
         tokens = CodexTokens.load()
         if tokens is None or not tokens.access_token:
             raise KeyError("no Codex tokens configured on the host")
@@ -168,17 +138,16 @@ class StudioIdentityAdapter:
         return {"status": "removed", "provider": provider}
 
     async def _op_codex_login(self) -> dict[str, Any]:
-        """Run the Codex OAuth flow on THIS node.
-
-        On a worker, this opens a browser on the worker's machine (or
-        prints a device-code URL) so the user can authenticate the
-        worker process directly.  Process-local tokens are saved to the
-        worker's ``<config_dir>/codex-auth.json``.  This is the only
-        sound way to use Codex from a worker — the host's token is
-        process-bound and cannot be reused remotely.
-        """
+        """Authenticate Codex on this node because its tokens are process-bound."""
         result = await codex_login_async()
         return result
+
+    async def _op_codex_reset_consume(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Redeem a reset credit using this node's process-bound Codex account."""
+        return await codex_consume_reset_credit(
+            idempotency_key=body.get("idempotency_key") or None,
+            credit_id=body.get("credit_id") or None,
+        )
 
     def _op_get_mcp_server(self, body: dict[str, Any]) -> dict[str, Any]:
         name = body.get("name")

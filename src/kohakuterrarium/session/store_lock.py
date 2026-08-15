@@ -1,27 +1,24 @@
-"""Cross-process writer lock for :class:`~kohakuterrarium.session.store.SessionStore`.
+"""Enforce single-writer session access across processes.
 
-Extracted from ``store.py`` (which sits at the file-size cap) so the
-writer-exclusivity policy is one cohesive unit.
-
-A live engine opens its session with ``writer_lock=True`` so a second
-writer — another process, or a second engine in this one — is refused
-with :class:`SessionLockedError` rather than silently corrupting the
-session (overlapping conversation-snapshot writes + colliding event
-counters). Read-only / viewer / listing opens never take the lock, so a
-running session stays viewable. The OS frees the lock when the holder
-exits or crashes, so a killed process never wedges the next opener.
+Read-only consumers remain lock-free, and operating-system lock ownership is
+released automatically when a process exits.
 """
 
+from collections.abc import Callable, Iterable
+
 from kohakuterrarium.errors import SessionLockedError
+from kohakuterrarium.session.vault_handles import close_and_release_vault
 from kohakuterrarium.utils.file_lock import FileLock, FileLockBusy
+from kohakuterrarium.utils.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 def acquire_writer_lock(path: str) -> FileLock:
     """Acquire the writer lock for session ``path``.
 
-    Returns the held :class:`FileLock` (release it on store close). Raises
-    :class:`SessionLockedError` — annotated with the holder pid — when the
-    lock is already held by another writer.
+    Return the held lock for release at store close. If another writer owns it,
+    raise :class:`SessionLockedError` with the holder process identifier.
     """
     lock = FileLock(path + ".lock")
     try:
@@ -42,27 +39,26 @@ def release_writer_lock(lock: "FileLock | None") -> None:
         lock.release()
 
 
-def close_tables(tables, fts, lock: "FileLock | None") -> None:
+def close_tables(
+    tables,
+    fts,
+    lock: "FileLock | None",
+    companion_closers: Iterable[Callable[[], None]] = (),
+) -> None:
     """Close every KVault table, drop native handles, release the lock.
 
-    The lock release runs in ``finally`` so a failing ``table.close()``
-    can never strand the writer lock. Dropping the native ``_KVault`` /
-    ``_vault`` handles is required on Windows: ``KVault.close()`` leaves
-    the SQLite handle open until GC (and ``TextVault`` has no ``close()``
-    at all), which keeps the ``.kohakutr`` locked so a later delete /
-    rename fails with WinError 32.
+    Companion resources close first in LIFO order. Native vault handles are
+    explicitly dropped because their public close paths can retain SQLite file
+    handles on Windows. The writer lock is released even if cleanup fails.
     """
     try:
-        for table in tables:
-            table.close()
-        for table in tables:
+        for closer in reversed(list(companion_closers)):
             try:
-                del table._inner
-            except AttributeError:
-                pass
-        try:
-            del fts._vault
-        except AttributeError:
-            pass
+                closer()
+            except Exception:
+                logger.warning("Companion closer failed at close", exc_info=True)
+        for table in tables:
+            close_and_release_vault(table)
+        close_and_release_vault(fts)
     finally:
         release_writer_lock(lock)

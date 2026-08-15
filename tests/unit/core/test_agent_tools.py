@@ -9,6 +9,7 @@ import pytest
 from kohakuterrarium.core.agent_tools import AgentToolsMixin, _TurnResult
 from kohakuterrarium.core.backgroundify import BackgroundifyHandle, PromotionResult
 from kohakuterrarium.core.conversation import Conversation
+from kohakuterrarium.core.event_inbox import EventInbox
 from kohakuterrarium.core.job import JobResult
 from kohakuterrarium.parsing import ToolCallEvent
 
@@ -58,6 +59,7 @@ class _FakeAgent(AgentToolsMixin):
         self.subagent_manager = _SubAgentManager()
         self.executor = _FakeExecutor()
         self.controller = _Controller()
+        self._event_inbox = EventInbox()
         self._direct_job_meta = {}
         self._active_handles = {}
         self._bg_controller_notify = {}
@@ -161,6 +163,46 @@ class TestEmitDirectCompletion:
         agent._emit_direct_completion_activity("bash_x", result)
         kinds = [c[0] for c in agent.output_router.activity_calls]
         assert "tool_done" in kinds
+
+    def test_tool_done_carries_full_output_and_preview(self, agent):
+        # The event log must keep the full tool output (recoverable via
+        # search_memory) while UI rendering keeps using the bounded preview.
+        agent._register_direct_job("bash_x", kind="tool", name="bash")
+        big = "x" * 12000
+        result = JobResult(job_id="bash_x", output=big, exit_code=0)
+        agent._emit_direct_completion_activity("bash_x", result)
+        meta = next(
+            c[2] for c in agent.output_router.activity_calls if c[0] == "tool_done"
+        )
+        assert meta["output"] == big
+        assert meta["output_preview"] == big[:5000]
+        assert len(meta["output_preview"]) == 5000
+
+    def test_tool_done_only_forwards_explicit_session_metadata(self, agent):
+        agent._register_direct_job("web_search_x", kind="tool", name="web_search")
+        result = JobResult(
+            job_id="web_search_x",
+            output="answer",
+            exit_code=0,
+            metadata={
+                "secret": "must-not-persist",
+                "session_metadata": {
+                    "backend": "deepseek",
+                    "citation_status": "verified",
+                },
+            },
+        )
+
+        agent._emit_direct_completion_activity("web_search_x", result)
+
+        meta = next(
+            c[2] for c in agent.output_router.activity_calls if c[0] == "tool_done"
+        )
+        assert meta["tool_metadata"] == {
+            "backend": "deepseek",
+            "citation_status": "verified",
+        }
+        assert "must-not-persist" not in repr(meta)
 
     def test_tool_error(self, agent):
         agent._register_direct_job("bash_x", kind="tool", name="bash")
@@ -841,7 +883,7 @@ class TestStartToolAsync:
 
         ex = Executor()
         ex.register_tool(_Echo())
-        ex._results["pre"] = JobResult(job_id="pre", output="cached")
+        ex.job_store.store_result(JobResult(job_id="pre", output="cached"))
 
         # Stub submit_from_event to return our pre-cached job id, with
         # no Task entry in ``_tasks`` — exercising the synthetic-task path.

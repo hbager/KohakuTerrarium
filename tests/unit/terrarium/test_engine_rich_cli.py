@@ -47,6 +47,7 @@ class _FocusCreature:
 class _FakeEngine:
     def __init__(self, creature: _FocusCreature) -> None:
         self._creature = creature
+        self.start_calls: list[str] = []
 
     def get_creature(self, creature_id: str) -> _FocusCreature:
         assert creature_id == self._creature.creature_id
@@ -54,6 +55,10 @@ class _FakeEngine:
 
     def list_creatures(self) -> list[_FocusCreature]:
         return [self._creature]
+
+    async def start(self, creature: _FocusCreature) -> None:
+        self.start_calls.append(creature.creature_id)
+        await creature.start()
 
 
 class TestInputConflictsWithTerminal:
@@ -125,3 +130,44 @@ class TestRunEngineWithRichCli:
         assert "clear" in during_run["commands"]
         assert "help" in during_run["commands"]
         assert isinstance(creature.agent.input, CLIInput)
+        assert engine.start_calls == [creature.creature_id]
+
+
+class TestSingleCreatureDriveWiring:
+    """R1-31: engine/service/focus must be injected for every engine-backed run.
+
+    Single-creature was the common mode where the wiring was missing, so bare
+    ``/drives`` and live settings apply could not resolve the runtime.
+    """
+
+    @pytest.mark.asyncio
+    async def test_single_creature_run_wires_engine_and_focus(
+        self, monkeypatch
+    ) -> None:
+        creature = _FocusCreature()
+        engine = _FakeEngine(creature)
+        captured: dict[str, object] = {}
+
+        async def _immediate_run(self) -> None:
+            captured["engine"] = self.engine
+            captured["drive_engine"] = self.drive_overlay._get_engine()
+            captured["settings_engine"] = (
+                self.settings_overlay.drive_section._get_engine()
+            )
+            captured["focus_id"] = self._drive_focus_id()
+
+        class _PassthroughOutput:
+            def __init__(self, app) -> None:
+                pass
+
+        monkeypatch.setattr(engine_rich_cli.RichCLIApp, "run", _immediate_run)
+        monkeypatch.setattr(engine_rich_cli, "RichCLIOutput", _PassthroughOutput)
+
+        await run_engine_with_rich_cli(engine, creature.creature_id)
+
+        # The Drive overlay + settings-Drives tab resolve the live engine, and
+        # the "assigned to me" scope resolves to the focus creature.
+        assert captured["engine"] is engine
+        assert captured["drive_engine"] is engine
+        assert captured["settings_engine"] is engine
+        assert captured["focus_id"] == "focus"

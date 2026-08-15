@@ -429,10 +429,54 @@ class TestMeta:
             assert meta["pwd"] == "/cwd"
             assert "alice" in meta["agents"]
             assert meta["status"] == "running"
+            assert bool(meta["conversation_open"]) is True
+            assert isinstance(meta["conversation_id"], str)
+            assert meta["conversation_id"]
             assert "hostname" in meta
             assert "python_version" in meta
+            s.set_conversation_open(False)
+            assert bool(s.load_meta()["conversation_open"]) is False
         finally:
             s.close()
+
+    def test_conversation_id_is_immutable_across_reinitialization(self, tmp_path):
+        s = _store(tmp_path)
+        try:
+            s.init_meta("runtime-1", "agent", "/p", "/w", ["a"])
+            conversation_id = s.load_meta()["conversation_id"]
+            s.init_meta("runtime-2", "agent", "/p", "/w", ["a"])
+            assert s.load_meta()["conversation_id"] == conversation_id
+        finally:
+            s.close()
+
+    def test_marked_legacy_session_gets_deterministic_persisted_identity(
+        self, tmp_path
+    ):
+        path = tmp_path / "legacy.kohakutr"
+        s = SessionStore(path)
+        try:
+            s.meta["session_id"] = "old-runtime"
+            s.meta["conversation_open"] = True
+            first = s.ensure_conversation_id()
+            assert first == s.ensure_conversation_id()
+            assert s.load_meta()["conversation_id"] == first
+        finally:
+            s.close(update_status=False)
+
+        reopened = SessionStore(path)
+        try:
+            assert reopened.ensure_conversation_id() == first
+        finally:
+            reopened.close(update_status=False)
+
+    def test_unmarked_legacy_session_is_not_backfilled(self, tmp_path):
+        s = _store(tmp_path)
+        try:
+            s.meta["session_id"] = "legacy"
+            assert s.ensure_conversation_id() is None
+            assert "conversation_id" not in s.meta
+        finally:
+            s.close(update_status=False)
 
     def test_update_status(self, tmp_path):
         s = _store(tmp_path)
@@ -597,7 +641,9 @@ class TestFlushClose:
         # Reopen and check status updated to paused.
         s2 = SessionStore(s._path)
         try:
-            assert s2.load_meta()["status"] == "paused"
+            meta = s2.load_meta()
+            assert meta["status"] == "paused"
+            assert bool(meta["conversation_open"]) is True
         finally:
             s2.close()
 
@@ -950,8 +996,10 @@ class TestResumableAndFork:
             _, eid = src.append_event("alice", "user_message", {"content": "shared"})
             src.flush()
             fork_path = tmp_path / "child.kohakutr"
+            parent_conversation_id = src.meta["conversation_id"]
             forked = src.fork(str(fork_path), at_event_id=eid)
             try:
+                assert forked.meta["conversation_id"] != parent_conversation_id
                 # The fork sees the parent's event.
                 fevents = forked.get_events("alice")
                 assert any(e.get("content") == "shared" for e in fevents)
@@ -1099,3 +1147,54 @@ class TestWriterLock:
         # Lock is free -> a fresh writer-locked open succeeds (no leak).
         w = SessionStore(p, writer_lock=True)
         w.close()
+
+
+# ── Companion closers (generic sidecar hook; no Drive knowledge) ───
+
+
+class TestCompanionCloser:
+    def test_registered_closer_runs_once_at_close(self, tmp_path):
+        s = _store(tmp_path)
+        calls = []
+        s.register_companion_closer(lambda: calls.append("x"))
+        s.close()
+        assert calls == ["x"]
+
+    def test_closers_run_lifo(self, tmp_path):
+        s = _store(tmp_path)
+        calls = []
+        s.register_companion_closer(lambda: calls.append("a"))
+        s.register_companion_closer(lambda: calls.append("b"))
+        s.close()
+        # last registered closes first (LIFO)
+        assert calls == ["b", "a"]
+
+    def test_register_is_idempotent(self, tmp_path):
+        s = _store(tmp_path)
+        calls = []
+
+        def closer():
+            calls.append("x")
+
+        s.register_companion_closer(closer)
+        s.register_companion_closer(closer)  # re-register is a no-op
+        s.close()
+        assert calls == ["x"]
+
+    def test_failing_closer_does_not_strand_the_store(self, tmp_path):
+        # One bad closer is logged, never fatal: tables still close and the
+        # writer lock still releases (a fresh writer-locked open succeeds).
+        path = tmp_path / "s.kohakutr"
+        s = SessionStore(path, writer_lock=True)
+
+        def boom():
+            raise RuntimeError("closer boom")
+
+        s.register_companion_closer(boom)
+        s.close()
+        w = SessionStore(path, writer_lock=True)
+        w.close()
+
+    def test_no_closers_is_noop(self, tmp_path):
+        s = _store(tmp_path)
+        s.close()  # empty companion list closes cleanly

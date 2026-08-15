@@ -21,32 +21,26 @@ import os
 import time
 from typing import Any
 
-from kohakuterrarium.builtins.user_commands import get_builtin_user_command
-from kohakuterrarium.core.scratchpad import is_reserved_scratchpad_key
-from kohakuterrarium.modules.user_command.base import UserCommandContext
 import kohakuterrarium.terrarium.channels as _terrarium_channels
 import kohakuterrarium.terrarium.topology as _terrarium_topology
 import kohakuterrarium.terrarium.topology_snapshot as _terrarium_topology_snap
+from kohakuterrarium.builtins.user_commands import get_builtin_user_command
+from kohakuterrarium.core.agent_selection import persist_plugin_selection
+from kohakuterrarium.core.agent_tool_options import (
+    agent_get_tool_options,
+    agent_set_tool_options,
+    agent_tool_inventory,
+)
+from kohakuterrarium.core.scratchpad import is_reserved_scratchpad_key
+from kohakuterrarium.modules.user_command.base import UserCommandContext
+from kohakuterrarium.session.history import project_branch_metadata
+from kohakuterrarium.terrarium.command_inventory import build_command_inventory
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.terrarium.events import EngineEvent, EventKind
 from kohakuterrarium.terrarium.topology import GraphTopology
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
-
-
-def branch_status_payload(agent: Any, status: str) -> dict[str, Any]:
-    """Status dict for ``regenerate`` / ``edit_message`` carrying the
-    agent's just-opened ``(turn_index, branch_id)`` so the frontend
-    navigator promotes without waiting for the post-turn resync.
-    """
-    out: dict[str, Any] = {"status": status}
-    ti, bi = getattr(agent, "_turn_index", None), getattr(agent, "_branch_id", None)
-    if isinstance(ti, int):
-        out["turn_index"] = ti
-    if isinstance(bi, int):
-        out["branch_id"] = bi
-    return out
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +293,12 @@ async def agent_toggle_plugin(
             await pm.load_pending()
     else:
         pm.disable(plugin_name)
+    # Persist the enabled set so a resume can restore it. Best-effort:
+    # persist_plugin_selection swallows persistence failures.
+    persist_plugin_selection(
+        agent,
+        [p["name"] for p in pm.list_plugins() if p.get("enabled")],
+    )
     return {"name": plugin_name, "enabled": target}
 
 
@@ -314,6 +314,7 @@ def agent_list_modules(agent: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     out.extend(_inventory_plugins(agent))
     out.extend(_inventory_native_tools(agent))
+    out.extend(_inventory_tools(agent))
     return out
 
 
@@ -336,6 +337,16 @@ def agent_get_module_options(agent: Any, module_type: str, name: str) -> dict[st
                     "options": entry.get("values", {}),
                 }
         raise KeyError(name)
+    if module_type == "tool":
+        for entry in agent_tool_inventory(agent):
+            if entry["name"] == name:
+                return {
+                    "type": "tool",
+                    "name": name,
+                    "schema": entry.get("option_schema", {}),
+                    "options": entry.get("values", {}),
+                }
+        raise KeyError(name)
     raise ValueError(f"Unknown module type: {module_type!r}")
 
 
@@ -349,6 +360,8 @@ def agent_set_module_options(
         return agent_set_plugin_options(agent, name, values or {})
     if module_type == "native_tool":
         return agent_set_native_tool_options(agent, name, values or {})
+    if module_type == "tool":
+        return agent_set_tool_options(agent, name, values or {})
     raise ValueError(f"Unknown module type: {module_type!r}")
 
 
@@ -357,7 +370,7 @@ async def agent_toggle_module(
 ) -> dict[str, Any]:
     if module_type == "plugin":
         return await agent_toggle_plugin(agent, name)
-    if module_type == "native_tool":
+    if module_type in {"native_tool", "tool"}:
         raise ValueError("Module type does not support toggle")
     raise ValueError(f"Unknown module type: {module_type!r}")
 
@@ -388,6 +401,20 @@ def _inventory_native_tools(agent: Any) -> list[dict[str, Any]]:
             "enabled": None,
         }
         for entry in agent_native_tool_inventory(agent)
+    ]
+
+
+def _inventory_tools(agent: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "type": "tool",
+            "name": entry["name"],
+            "description": entry.get("description", ""),
+            "schema": entry.get("option_schema", {}),
+            "options": entry.get("values", {}),
+            "enabled": None,
+        }
+        for entry in agent_tool_inventory(agent)
     ]
 
 
@@ -507,21 +534,58 @@ def wire_creature_on_engine(
     _terrarium_topology_snap.snapshot(engine, graph_id)
 
 
+def agent_command_inventory(agent: Any) -> dict[str, Any]:
+    """Return the live command and skill inventory for one agent."""
+    return build_command_inventory(agent).to_dict()
+
+
 async def agent_execute_command(
     agent: Any,
     command: str,
     args: str = "",
+    *,
+    service: Any = None,
+    engine: Any = None,
+    creature_id: str | None = None,
+    principal: str = "user:local",
+    is_operator: bool = False,
 ) -> dict[str, Any]:
-    """Run a built-in slash command against ``agent``.
+    """Run a slash command against ``agent`` with a trusted context.
 
-    Raises ``ValueError`` for an unknown command name; the
-    ``UserCommandResult`` is normalized to a plain dict suitable for
-    JSON response / Lab wire transit.
+    Resolves a built-in first, then the agent's LIVE aggregated registry so
+    plugin-contributed commands (e.g. ``/goal``) are reachable over web/Lab.
+    The trusted context DTO (service / engine / focused creature / principal /
+    operator) rides in ``UserCommandContext.extra`` so Drive-aware commands can
+    act; the caller derives ``principal`` / ``is_operator`` from its authenticated
+    context and MUST pass ``is_operator`` explicitly; omission means unprivileged.
+    Raises ``ValueError`` for an unknown command name.
     """
     cmd = get_builtin_user_command(command)
     if cmd is None:
+        lister = getattr(agent, "list_user_commands", None)
+        registry = lister() if callable(lister) else {}
+        cmd = registry.get(command)
+        if cmd is None:
+            cmd = next(
+                (
+                    candidate
+                    for candidate in registry.values()
+                    if command in (getattr(candidate, "aliases", None) or [])
+                ),
+                None,
+            )
+    if cmd is None:
         raise ValueError(f"Unknown command: /{command}")
-    ctx = UserCommandContext(agent=agent, session=getattr(agent, "session", None))
+    extra: dict[str, Any] = {"principal": principal, "is_operator": is_operator}
+    if service is not None:
+        extra["service"] = service
+    if engine is not None:
+        extra["engine"] = engine
+    if creature_id is not None:
+        extra["creature_id"] = creature_id
+    ctx = UserCommandContext(
+        agent=agent, session=getattr(agent, "session", None), extra=extra
+    )
     result = await cmd.execute(args, ctx)
     resp: dict[str, Any] = {
         "command": command,
@@ -613,10 +677,18 @@ def chat_history_for(engine: Terrarium, creature_id: str) -> dict[str, Any]:
 def chat_branches_for(engine: Terrarium, creature_id: str) -> list[dict[str, Any]]:
     creature = engine.get_creature(creature_id)
     agent = creature.agent
-    fn = getattr(agent, "list_branches", None)
-    if callable(fn):
-        return list(fn())
-    return []
+    live_jobs = agent_live_job_ids(agent)
+    events = _resumable_events(
+        getattr(agent, "session_store", None), creature.name, live_jobs
+    )
+    if not events:
+        fallback = engine._session_stores.get(creature.graph_id)
+        events = _resumable_events(fallback, creature.name, live_jobs)
+    projection = project_branch_metadata(events)
+    return [
+        {"turn_index": turn_index, **metadata}
+        for turn_index, metadata in projection.items()
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -864,6 +936,7 @@ __all__ = [
     "agent_get_module_options",
     "agent_get_native_tool_options",
     "agent_get_plugin_options",
+    "agent_get_tool_options",
     "agent_list_modules",
     "agent_list_plugins",
     "agent_native_tool_inventory",
@@ -873,10 +946,12 @@ __all__ = [
     "agent_set_module_options",
     "agent_set_native_tool_options",
     "agent_set_plugin_options",
+    "agent_set_tool_options",
     "agent_set_working_dir",
     "agent_system_prompt",
     "agent_toggle_module",
     "agent_toggle_plugin",
+    "agent_tool_inventory",
     "agent_triggers",
     "agent_working_dir",
     "attach_policies_for",

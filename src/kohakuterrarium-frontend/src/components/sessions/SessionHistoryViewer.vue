@@ -1,6 +1,6 @@
 <template>
-  <div class="h-full w-full min-h-0 flex flex-col overflow-hidden">
-    <div v-if="!embedded" class="container-page w-full max-w-6xl py-4 flex items-center gap-3 shrink-0">
+  <div class="h-full min-h-0 flex flex-col overflow-hidden">
+    <div v-if="!embedded" class="container-page max-w-6xl py-4 flex items-center gap-3 shrink-0">
       <button class="btn-secondary" @click="goBack"><span class="i-carbon-arrow-left mr-1" /> Back</button>
       <div class="min-w-0">
         <h1 class="text-xl font-bold text-warm-800 dark:text-warm-200 truncate">{{ sessionName }}</h1>
@@ -8,8 +8,8 @@
       </div>
     </div>
 
-    <div :class="embedded ? 'px-3 py-3' : 'container-page w-full max-w-6xl pb-4'" class="flex-1 w-full min-w-0 min-h-0 overflow-hidden">
-      <div class="h-full w-full min-w-0 min-h-0 flex flex-col gap-3 lg:gap-4">
+    <div :class="embedded ? 'px-3 py-3' : 'container-page max-w-6xl pb-4'" class="flex-1 min-h-0 overflow-hidden">
+      <div class="h-full min-h-0 flex flex-col gap-3 lg:gap-4">
         <div v-if="embedded" class="flex items-center gap-3 shrink-0">
           <button class="btn-secondary" @click="goBack"><span class="i-carbon-arrow-left mr-1" /> Back</button>
           <div class="min-w-0">
@@ -27,7 +27,7 @@
           </div>
         </div>
 
-        <div class="flex-1 w-full min-w-0 min-h-0 overflow-hidden">
+        <div class="flex-1 min-h-0 overflow-hidden">
           <div v-if="loading" class="card h-full flex items-center justify-center text-secondary">Loading history...</div>
           <div v-else-if="error" class="card h-full flex flex-col items-center justify-center text-center p-6">
             <div class="i-carbon-warning-alt text-2xl text-coral mb-3" />
@@ -35,7 +35,7 @@
             <div class="text-secondary text-xs mb-4">{{ error }}</div>
             <button class="btn-secondary" @click="loadSession">Retry</button>
           </div>
-          <div v-else class="h-full w-full min-w-0 min-h-0 overflow-hidden">
+          <div v-else class="h-full min-h-0 overflow-hidden">
             <ChatPanel :instance="viewerInstance" :read-only="true" empty-title="No saved messages" empty-subtitle="This target has no persisted history yet" />
           </div>
         </div>
@@ -45,10 +45,8 @@
 </template>
 
 <script setup>
-import { useRoute, useRouter } from "vue-router"
-import { useDensity } from "@/composables/useDensity"
-import { useVisibilityInterval } from "@/composables/useVisibilityInterval"
 import ChatPanel from "@/components/chat/ChatPanel.vue"
+import { useDensity } from "@/composables/useDensity"
 import { useChatStore, _convertHistory, _replayEvents } from "@/stores/chat"
 import { useSessionDetailStore } from "@/stores/sessionDetail"
 import { sessionAPI } from "@/utils/api"
@@ -116,8 +114,6 @@ const loading = ref(false)
 const error = ref("")
 const viewerMeta = ref(null)
 const historyTargets = ref([])
-const refreshingTarget = ref(false)
-const targetHistorySignatures = new Map()
 
 const viewerInstance = computed(() => {
   const meta = viewerMeta.value || {}
@@ -153,25 +149,6 @@ function resetViewer() {
     compactThreshold: 0,
     maxContext: 0,
   }
-  targetHistorySignatures.clear()
-}
-
-function normalizeHistoryPayload(value) {
-  if (Array.isArray(value)) return value.map(normalizeHistoryPayload)
-  if (!value || typeof value !== "object") return value
-  return Object.keys(value)
-    .sort()
-    .reduce((acc, key) => {
-      acc[key] = normalizeHistoryPayload(value[key])
-      return acc
-    }, {})
-}
-
-function historyPayloadSignature(data) {
-  return JSON.stringify({
-    events: normalizeHistoryPayload(data.events || []),
-    messages: normalizeHistoryPayload(data.messages || []),
-  })
 }
 
 function ensureTabs(tabs) {
@@ -183,14 +160,12 @@ function ensureTabs(tabs) {
 async function loadTarget(tab) {
   if (!tab) return
   const data = await sessionAPI.getHistory(sessionName.value, tab)
-  const signatureKey = `${sessionName.value}:${tab}`
-  const signature = historyPayloadSignature(data)
-  if (targetHistorySignatures.get(signatureKey) === signature) return
-  targetHistorySignatures.set(signatureKey, signature)
   if (data.events?.length) {
-    const { messages, pendingJobs } = _replayEvents(data.messages || [], data.events)
+    // Read-only saved history: never populate ``runningJobs`` — a frozen
+    // session has no live work, and its unfinished jobs already replay as
+    // ``interrupted`` via the backend's synthetic terminals (UXI-04).
+    const { messages } = _replayEvents(data.messages || [], data.events)
     chat.messagesByTab[tab] = messages
-    chat.runningJobs = pendingJobs || {}
   } else {
     chat.messagesByTab[tab] = _convertHistory(data.messages || [])
   }
@@ -242,19 +217,15 @@ watch(
   { immediate: true },
 )
 
-async function refreshActiveTarget() {
-  if (loading.value || refreshingTarget.value || !chat.activeTab || !sessionName.value) return
-  refreshingTarget.value = true
-  try {
-    await loadTarget(chat.activeTab)
-  } catch (err) {
-    error.value = err?.response?.data?.detail || err?.message || String(err)
-  } finally {
-    refreshingTarget.value = false
-  }
-}
-
-useVisibilityInterval(refreshActiveTarget, 2000)
+// Live-session refresh signal (UXI-01): repull the active target's
+// history so new conversation appears without a full reset. Only bumps
+// for a live inspector; a saved session never fires this.
+watch(
+  () => detail.reloadKey,
+  () => {
+    if (chat.activeTab) loadTarget(chat.activeTab).catch(() => {})
+  },
+)
 
 // The viewer borrows the live chat store as its render surface (it
 // writes saved-session events into ``messagesByTab`` / ``tabs`` and

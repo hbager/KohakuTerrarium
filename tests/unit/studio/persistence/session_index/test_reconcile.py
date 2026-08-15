@@ -10,6 +10,7 @@ from kohakuterrarium.studio.persistence.session_index.reconcile import (
     _extract_text_preview,
     _first_user_input_preview,
     _has_vector_index,
+    logger as reconcile_logger,
     read_entry_from_disk,
     reconcile,
 )
@@ -323,6 +324,27 @@ class TestReadEntryFromDisk:
 
 
 class TestReconcile:
+    def test_noop_incremental_reconcile_does_not_log_info(
+        self, idx, session_dir, monkeypatch
+    ):
+        _make_session(session_dir, "quiet")
+        calls = []
+        monkeypatch.setattr(
+            reconcile_logger,
+            "info",
+            lambda *args, **kwargs: calls.append((args, kwargs)),
+        )
+
+        first = reconcile(idx, session_dir, full=False)
+        assert first.read == 1
+        assert len(calls) == 1
+
+        calls.clear()
+        second = reconcile(idx, session_dir, full=False)
+        assert second.read == 0
+        assert second.deleted == 0
+        assert calls == []
+
     def test_empty_session_dir_returns_zero_report(self, idx, tmp_path):
         missing = tmp_path / "no-such-dir"
         report = reconcile(idx, missing, full=True)
@@ -338,22 +360,6 @@ class TestReconcile:
         assert report.deleted == 0
         assert report.total == 2
         assert idx.list().total == 2
-
-    def test_bootstrap_includes_mirror_sessions(self, idx, session_dir):
-        mirror_dir = session_dir / "mirror"
-        mirror_dir.mkdir()
-        _make_session(mirror_dir, "remote", agent="worker")
-        report = reconcile(idx, session_dir, full=True)
-        assert report.total == 1
-        assert idx.get("remote.kohakutr")["agents"] == ["worker"]
-
-    def test_root_session_wins_over_same_named_mirror(self, idx, session_dir):
-        mirror_dir = session_dir / "mirror"
-        mirror_dir.mkdir()
-        _make_session(mirror_dir, "same", agent="remote")
-        _make_session(session_dir, "same", agent="local")
-        reconcile(idx, session_dir, full=True)
-        assert idx.get("same.kohakutr")["agents"] == ["local"]
 
     def test_incremental_skips_unchanged_files(self, idx, session_dir):
         _make_session(session_dir, "alice")

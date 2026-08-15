@@ -1,9 +1,7 @@
 """Shared helpers for the group_* tool modules.
 
-Splitting the group tools across modules keeps each file under the
-project's 600-line per-file budget. This module owns the helpers
-every group tool wants: caller resolution, JSON-shaped result
-formatters, and channel-history serialization.
+Shared helpers provide caller resolution, JSON-shaped results, and channel-history
+serialization for the group tools.
 """
 
 import json
@@ -14,6 +12,7 @@ from kohakuterrarium.terrarium.group_tool_context import (
     GroupContext,
     GroupToolError,
     resolve_group_context,
+    resolve_group_target,
 )
 
 
@@ -42,16 +41,14 @@ def resolve_or_error(
         return None, err(str(exc))
 
 
-def creature_pwd(creature: Any) -> str:
-    agent = getattr(creature, "agent", None)
-    workspace = getattr(agent, "workspace", None)
-    if workspace is not None:
-        return workspace.get()
-    executor = getattr(agent, "executor", None)
-    working_dir = (
-        getattr(executor, "_working_dir", None) if executor is not None else None
-    )
-    return str(working_dir) if working_dir is not None else ""
+def resolve_target_or_error(
+    gctx: GroupContext, identifier: str
+) -> tuple[Any | None, ToolResult | None]:
+    """Resolve one caller-graph target while preserving safe resolver errors."""
+    try:
+        return resolve_group_target(gctx, identifier), None
+    except GroupToolError as exc:
+        return None, err(str(exc))
 
 
 def serialize_channel_history(channel: Any, limit: int) -> list[dict[str, Any]]:

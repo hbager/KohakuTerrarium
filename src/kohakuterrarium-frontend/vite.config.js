@@ -53,6 +53,7 @@ export default defineConfig({
           if (id.includes("highlight.js")) return "highlight"
           if (id.includes("element-plus")) return "element-plus"
           if (id.includes("vue-flow")) return "vue-flow"
+          if (id.includes("monaco-editor")) return "monaco-editor"
           if (
             id.includes("node_modules/vue") ||
             id.includes("node_modules/pinia") ||

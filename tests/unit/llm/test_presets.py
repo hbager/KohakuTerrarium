@@ -20,7 +20,10 @@ from kohakuterrarium.llm.presets import (
 )
 from kohakuterrarium.llm.presets import _canonical_entry
 from kohakuterrarium.llm.preset_aliases import _CANONICAL_NAMES, ALIASES
-from kohakuterrarium.llm.variations import _ALLOWED_VARIATION_ROOTS
+from kohakuterrarium.llm.variations import (
+    _ALLOWED_VARIATION_ROOTS,
+    apply_variation_groups,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -184,24 +187,93 @@ class TestPresetsDataIntegrity:
         assert PRESETS["gpt-5.5"]["provider"] == "codex"
         assert PRESETS["gpt-5.6-sol"]["provider"] == "codex"
 
-    def test_gpt56_effort_scales_match_codex_catalog(self):
-        # Codex catalog (models.json, 2026-07-10): Sol/Terra go up to
-        # ``ultra``; Luna stops at ``max``. ``ultra`` is Codex-only, so
-        # the direct-API (-api) variants must NOT expose it.
-        sol = PRESETS["gpt-5.6-sol"]["variation_groups"]["reasoning"]
-        terra = PRESETS["gpt-5.6-terra"]["variation_groups"]["reasoning"]
-        luna = PRESETS["gpt-5.6-luna"]["variation_groups"]["reasoning"]
-        assert "ultra" in sol and "max" in sol
-        assert "ultra" in terra
-        assert "ultra" not in luna and "max" in luna
-        # 'ultra' is not a wire value — the API rejects the literal string.
-        # Mirror the Codex CLI, which rewrites Ultra -> Max before sending.
-        assert sol["ultra"] == {"reasoning_effort": "max"}
-        assert terra["ultra"] == {"reasoning_effort": "max"}
-        for name in ("gpt-5.6-sol-api", "gpt-5.6-terra-api", "gpt-5.6-luna-api"):
-            api_group = PRESETS[name]["variation_groups"]["reasoning"]
-            assert "ultra" not in api_group
-            assert "max" in api_group
+    def test_gpt56_effort_scales_top_out_at_max(self):
+        # ``ultra`` is deliberately not exposed on any GPT-5.6 variant:
+        # it is not a wire value (the Codex CLI rewrites Ultra -> Max).
+        for name in (
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol-api",
+            "gpt-5.6-terra-api",
+            "gpt-5.6-luna-api",
+        ):
+            group = PRESETS[name]["variation_groups"]["reasoning"]
+            assert "ultra" not in group, name
+            assert "max" in group, name
+
+    def test_gpt56_mode_group_on_every_route(self):
+        # ``reasoning.mode`` (standard | pro) is exposed uniformly on the
+        # codex / -api / -or routes for the whole 5.6 family.
+        for name in (
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.6-sol-api",
+            "gpt-5.6-terra-api",
+            "gpt-5.6-luna-api",
+            "gpt-5.6-sol-or",
+            "gpt-5.6-terra-or",
+            "gpt-5.6-luna-or",
+        ):
+            group = PRESETS[name]["variation_groups"]["mode"]
+            assert set(group) == {"standard", "pro"}, name
+            assert group["standard"] == {}, name
+            assert group["pro"] == {"extra_body.reasoning.mode": "pro"}, name
+
+    def test_openai_direct_speed_group_mirrors_codex_fast_mode(self):
+        # -api GPT presets expose fast mode via the priority service tier;
+        # the mini/nano tiers do not support it (same rule as codex).
+        for name in (
+            "gpt-5.4-api",
+            "gpt-5.5-api",
+            "gpt-5.6-sol-api",
+            "gpt-5.6-terra-api",
+            "gpt-5.6-luna-api",
+        ):
+            group = PRESETS[name]["variation_groups"]["speed"]
+            assert group["normal"] == {}, name
+            assert group["fast"] == {"extra_body.service_tier": "priority"}, name
+        for name in ("gpt-5.4-mini-api", "gpt-5.4-nano-api"):
+            assert "speed" not in PRESETS[name]["variation_groups"], name
+
+    def test_websocket_mode_default_on_codex_and_openai_direct(self):
+        # Responses WebSocket mode is on for the routes that speak the
+        # Responses API natively; OpenRouter has no such transport.
+        ws_on = (
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.6-sol-api",
+            "gpt-5.6-terra-api",
+            "gpt-5.6-luna-api",
+            "gpt-5.5-api",
+            "gpt-5.4-api",
+        )
+        for name in ws_on:
+            assert PRESETS[name]["extra_body"]["websocket_mode"] is True, name
+        for name in ("gpt-5.6-sol-or", "gpt-5.5-or", "gpt-5.4-or"):
+            assert "websocket_mode" not in PRESETS[name].get("extra_body", {}), name
+
+    def test_gpt56_mode_composes_with_reasoning_selection(self):
+        # mode and effort patch sibling paths under extra_body.reasoning, so
+        # a combined selector must merge instead of colliding.
+        preset = PRESETS["gpt-5.6-sol-api"]
+        patched = apply_variation_groups(
+            preset,
+            preset["variation_groups"],
+            {"reasoning": "max", "mode": "pro"},
+        )
+        assert patched["extra_body"]["reasoning"]["mode"] == "pro"
+        assert patched["extra_body"]["reasoning"]["effort"] == "max"
+        # The default-mode option leaves the base preset byte-identical.
+        untouched = apply_variation_groups(
+            preset, preset["variation_groups"], {"mode": "standard"}
+        )
+        assert untouched == preset
 
     def test_anthropic_direct_presets_use_anthropic_provider(self):
         assert PRESETS["claude-opus-4.7"]["provider"] == "anthropic"

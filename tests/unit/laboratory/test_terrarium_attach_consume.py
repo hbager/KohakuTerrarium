@@ -77,13 +77,124 @@ class TestConsumeInputRouting:
                     if alice.agent.inject_input.await_count:
                         break
                     await asyncio.sleep(0.01)
-                alice.agent.inject_input.assert_awaited_with("hello", source="web")
+                pending_id = alice.agent.inject_input.await_args.kwargs["pending_id"]
+                alice.agent.inject_input.assert_awaited_with(
+                    "hello", source="web", pending_id=pending_id
+                )
                 frames = _drain(sink)
                 kinds = [f["type"] for f in frames]
                 assert "user_input" in kinds
                 user_in = next(f for f in frames if f["type"] == "user_input")
                 assert user_in["content"] == "hello"
                 assert user_in["source"] == "alice"
+                assert user_in["event_id"] == pending_id
+            finally:
+                consumer.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await consumer
+        finally:
+            adapter.detach()
+            await t.shutdown()
+
+    async def test_queued_input_preserves_id_and_emits_queued_ack(self):
+        t = await TestTerrariumBuilder().with_creature("alice").build()
+        try:
+            adapter, node = await _build_adapter(t)
+            alice = t.get_creature("alice")
+            alice.agent.inject_input = AsyncMock(return_value=False)
+            sink = _make_sink(node)
+            consumer = asyncio.create_task(
+                adapter._consume_input(sink, alice, alice.agent)
+            )
+            try:
+                await sink.inject_input(
+                    {
+                        "type": "input",
+                        "content": "later",
+                        "event_id": "pending-1",
+                    }
+                )
+                for _ in range(50):
+                    if alice.agent.inject_input.await_count:
+                        break
+                    await asyncio.sleep(0.01)
+                await asyncio.sleep(0)
+                alice.agent.inject_input.assert_awaited_once_with(
+                    "later", source="web", pending_id="pending-1"
+                )
+                frames = _drain(sink)
+                user_input = next(f for f in frames if f["type"] == "user_input")
+                assert user_input["event_id"] == "pending-1"
+                queued = next(f for f in frames if f["type"] == "input_queued")
+                assert queued["event_id"] == "pending-1"
+                assert not any(f["type"] == "idle" for f in frames)
+            finally:
+                consumer.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await consumer
+        finally:
+            adapter.detach()
+            await t.shutdown()
+
+    async def test_pending_edit_cancel_preserve_acknowledgements(self):
+        t = await TestTerrariumBuilder().with_creature("alice").build()
+        try:
+            adapter, node = await _build_adapter(t)
+            alice = t.get_creature("alice")
+            alice.agent.edit_pending = lambda event_id, content: (
+                event_id == "pending-1" and content == "updated"
+            )
+            alice.agent.cancel_pending = lambda event_id: event_id == "pending-2"
+            sink = _make_sink(node)
+            consumer = asyncio.create_task(
+                adapter._consume_input(sink, alice, alice.agent)
+            )
+            try:
+                await sink.inject_input(
+                    {
+                        "type": "input_edit",
+                        "event_id": "pending-1",
+                        "content": "updated",
+                    }
+                )
+                await sink.inject_input(
+                    {"type": "input_cancel", "event_id": "pending-2"}
+                )
+                for _ in range(50):
+                    frames = _drain(sink)
+                    if len(frames) == 2:
+                        break
+                    await asyncio.sleep(0.01)
+                assert frames == [
+                    {
+                        "type": "input_edit_ack",
+                        "source": "alice",
+                        "event_id": "pending-1",
+                        "status": "edited",
+                    },
+                    {
+                        "type": "input_cancel_ack",
+                        "source": "alice",
+                        "event_id": "pending-2",
+                        "status": "cancelled",
+                    },
+                ]
+                await sink.inject_input(
+                    {"type": "input_cancel", "event_id": "already-sent"}
+                )
+                for _ in range(50):
+                    frames = _drain(sink)
+                    if frames:
+                        break
+                    await asyncio.sleep(0.01)
+                assert frames == [
+                    {
+                        "type": "input_cancel_ack",
+                        "source": "alice",
+                        "event_id": "already-sent",
+                        "status": "already_sent",
+                    }
+                ]
             finally:
                 consumer.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -205,7 +316,10 @@ class TestConsumeInputRouting:
                     if alice.agent.inject_input.await_count:
                         break
                     await asyncio.sleep(0.01)
-                alice.agent.inject_input.assert_awaited_once_with("real", source="web")
+                pending_id = alice.agent.inject_input.await_args.kwargs["pending_id"]
+                alice.agent.inject_input.assert_awaited_once_with(
+                    "real", source="web", pending_id=pending_id
+                )
             finally:
                 consumer.cancel()
                 with pytest.raises(asyncio.CancelledError):
@@ -243,12 +357,62 @@ class TestConsumeInputTargetRouting:
                     if bob.agent.inject_input.await_count:
                         break
                     await asyncio.sleep(0.01)
-                bob.agent.inject_input.assert_awaited_with("for bob", source="web")
+                pending_id = bob.agent.inject_input.await_args.kwargs["pending_id"]
+                bob.agent.inject_input.assert_awaited_with(
+                    "for bob", source="web", pending_id=pending_id
+                )
                 alice.agent.inject_input.assert_not_awaited()
                 # The echoed user_input frame names the effective target.
                 frames = _drain(sink)
                 user_in = next(f for f in frames if f["type"] == "user_input")
                 assert user_in["source"] == "bob"
+            finally:
+                consumer.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await consumer
+        finally:
+            adapter.detach()
+            await t.shutdown()
+
+    async def test_ui_reply_targeting_sibling_routes_to_that_router(self):
+        # UXI-09 lab-path fix: a reply for a prompt a non-bound SIBLING
+        # raised must reach the SIBLING's router (else its interactive tool
+        # hangs), and the ack must be tagged with the sibling.
+        t = await (
+            TestTerrariumBuilder().with_creature("alice").with_creature("bob").build()
+        )
+        try:
+            adapter, node = await _build_adapter(t)
+            alice = t.get_creature("alice")
+            bob = t.get_creature("bob")
+            alice_received: list = []
+            bob_received: list = []
+            alice.agent.output_router = SimpleNamespace(
+                submit_reply_with_status=lambda r: alice_received.append(r)
+                or (True, "applied"),
+            )
+            bob.agent.output_router = SimpleNamespace(
+                submit_reply_with_status=lambda r: bob_received.append(r)
+                or (True, "applied"),
+            )
+            sink = _make_sink(node)
+            consumer = asyncio.create_task(
+                adapter._consume_input(sink, alice, alice.agent)
+            )
+            try:
+                await sink.inject_input(
+                    {"type": "ui_reply", "event_id": "e1", "target": "bob"}
+                )
+                for _ in range(50):
+                    if bob_received:
+                        break
+                    await asyncio.sleep(0.01)
+                # The reply reached bob's router, not the bound alice's.
+                assert bob_received and bob_received[0].event_id == "e1"
+                assert alice_received == []
+                frames = _drain(sink)
+                ack = next(f for f in frames if f["type"] == "ui_reply_ack")
+                assert ack["source"] == "bob"
             finally:
                 consumer.cancel()
                 with pytest.raises(asyncio.CancelledError):

@@ -1,15 +1,12 @@
 """Agent LLM-profile switching + canonical-identifier helpers.
 
-Split out of :mod:`agent` to keep that module under the 1000-line
-hard cap. Provides a mixin whose two methods, ``switch_model`` and
-``llm_identifier``, belong to the :class:`~kohakuterrarium.core.agent.Agent`
-public surface. The mixin has no state of its own — it reads and
-writes attributes owned by ``Agent.__init__``.
+Provide model switching and canonical LLM identifiers for agents.
 """
 
 from typing import Any
 
 from kohakuterrarium.bootstrap.llm import create_llm_from_profile_name
+from kohakuterrarium.core.agent_selection import persist_model_selection
 from kohakuterrarium.llm.profiles import profile_to_identifier, resolve_controller_llm
 from kohakuterrarium.utils.logging import get_logger
 
@@ -17,21 +14,10 @@ logger = get_logger(__name__)
 
 
 class AgentModelMixin:
-    """Mixin providing :meth:`switch_model` and :meth:`llm_identifier`.
+    """Switch an agent's model and report its canonical identifier."""
 
-    Both methods read/write attributes owned by the main ``Agent``
-    class (``self.llm``, ``self.controller``, ``self.compact_manager``,
-    ``self._llm_selector``, ``self._llm_identifier``, ``self.config``).
-    Kept as a mixin rather than free functions so callers can still
-    write ``agent.switch_model(...)`` / ``agent.llm_identifier()``.
-    """
-
-    # Declared for static type-checkers; populated by ``Agent.__init__``.
-    # ``_build_compact_llm`` is provided by ``AgentCompactMixin`` — do
-    # NOT add a stub here, it would shadow the real implementation via
-    # MRO. ``Agent`` is composed as ``AgentInitMixin, AgentHandlersMixin,
-    # AgentMessagesMixin, AgentModelMixin, AgentCompactMixin, …`` so a
-    # method declared on this mixin wins over ``AgentCompactMixin``'s.
+    # These annotations describe state supplied by ``Agent.__init__``. A stub
+    # for ``_build_compact_llm`` would shadow ``AgentCompactMixin`` through MRO.
     llm: Any
     controller: Any
     compact_manager: Any
@@ -63,6 +49,12 @@ class AgentModelMixin:
         self._llm_identifier = identifier
         self.llm = new_llm
         self.controller.llm = new_llm
+        # Fresh provider needs the same emergency-drop sync the boot
+        # provider got — without it a drop after a model switch leaves
+        # the controller holding the original oversized conversation.
+        drop_sync = getattr(self, "_on_provider_emergency_drop", None)
+        if drop_sync is not None and hasattr(new_llm, "on_emergency_drop"):
+            new_llm.on_emergency_drop(drop_sync)
         # Sub-agents resolve their LLM from the manager's ``llm`` at spawn
         # time — ``resolve_llm(self.subagent_manager.llm, config)`` for
         # task sub-agents, and ``llm=self.llm`` directly for interactive
@@ -71,9 +63,6 @@ class AgentModelMixin:
         subagent_manager = getattr(self, "subagent_manager", None)
         if subagent_manager is not None:
             subagent_manager.llm = new_llm
-            for subagent in getattr(subagent_manager, "_interactive", {}).values():
-                if hasattr(subagent, "llm"):
-                    subagent.llm = new_llm
         if self.compact_manager:
             compact_llm = self._build_compact_llm(self.compact_manager.config)
             self.compact_manager._llm = compact_llm
@@ -81,6 +70,7 @@ class AgentModelMixin:
             new_max = getattr(context_source, "_profile_max_context", 0)
             if new_max:
                 self.compact_manager.config.max_tokens = new_max
+            self._wire_overflow_rescue()
 
         model_name = getattr(new_llm, "model", profile_name)
         logger.info(
@@ -90,6 +80,13 @@ class AgentModelMixin:
             identifier=identifier,
             model=model_name,
         )
+
+        # Persist the canonical identifier (not the raw user input) so a
+        # resume can restore it — a bare alias the user typed may become
+        # ambiguous later, while ``provider/name[@variations]`` round-trips
+        # safely. Best-effort: persist_model_selection swallows failures
+        # (a detached agent has no store and simply skips).
+        persist_model_selection(self, identifier)
 
         # ``llm_name`` in the session_info metadata now carries the full
         # ``provider/name@variations`` form so every display surface can

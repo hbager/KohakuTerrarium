@@ -1,14 +1,8 @@
-"""Per-creature slash command execution.
+"""Execute slash commands against live Studio-managed creatures."""
 
-Replaces ``KohakuManager.agent_execute_command /
-creature_execute_command`` plus ``routes/agents.py:execute_command``
-and ``routes/creatures.py:execute_creature_command``.
-"""
-
-from kohakuterrarium.builtins.user_commands import get_builtin_user_command
-from kohakuterrarium.modules.user_command.base import UserCommandContext
 from kohakuterrarium.studio.sessions.lifecycle import find_creature
 from kohakuterrarium.terrarium import TerrariumService
+from kohakuterrarium.terrarium.creature_ops import agent_execute_command
 from kohakuterrarium.studio._runtime import as_engine
 
 
@@ -18,24 +12,26 @@ async def execute_command(
     creature_id: str,
     command: str,
     args: str = "",
+    *,
+    principal: str | None = None,
+    is_operator: bool = True,
 ) -> dict:
-    """Run a built-in slash command against a creature."""
+    """Run a slash command through the creature's live aggregated registry.
+
+    Plugin-contributed commands remain available, and the command receives the
+    service, engine, focused creature, principal, and operator context. This local
+    programmatic console defaults to operator access; HTTP derives authorization
+    independently.
+    """
     engine = as_engine(service)
     agent = find_creature(engine, session_id, creature_id).agent
-    cmd = get_builtin_user_command(command)
-    if cmd is None:
-        raise ValueError(f"Unknown command: /{command}")
-    context = UserCommandContext(
-        agent=agent,
-        session=getattr(agent, "session", None),
+    return await agent_execute_command(
+        agent,
+        command,
+        args,
+        service=service,
+        engine=engine,
+        creature_id=creature_id,
+        principal=principal or "user:local",
+        is_operator=is_operator,
     )
-    result = await cmd.execute(args, context)
-    resp: dict = {
-        "command": command,
-        "output": result.output,
-        "error": result.error,
-        "success": result.success,
-    }
-    if result.data is not None:
-        resp["data"] = result.data
-    return resp

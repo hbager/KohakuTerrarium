@@ -85,7 +85,7 @@ describe("layoutPanels — registerBuiltinPanels", () => {
       expect(p, `panel ${id} should be registered`).not.toBeNull()
       expect(p.component).toBeTruthy()
     }
-  }, 15_000)
+  })
 
   it("registers default presets with tree field", async () => {
     const { registerBuiltinPanels } = await import("./layoutPanels.js")

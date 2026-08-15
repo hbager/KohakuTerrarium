@@ -9,6 +9,7 @@ StreamDemux.
 
 import pytest
 
+from kohakuterrarium.terrarium.drive.multi_node import DriveRouteCache
 from kohakuterrarium.terrarium.events import (
     ConnectionResult,
     DisconnectionResult,
@@ -117,6 +118,10 @@ class _FakeService:
     async def inject_input(self, cid, msg, *, source="chat"):
         self.calls.append(("inject_input", cid, msg, source))
 
+    async def command_inventory(self, cid):
+        self.calls.append(("command_inventory", cid))
+        return {"commands": [], "skills": []}
+
     async def shutdown(self):
         self.calls.append(("shutdown",))
 
@@ -139,11 +144,30 @@ class _FakeService:
     async def chat_branches(self, cid):
         return [{"t": 1}]
 
-    async def regenerate(self, cid, *, turn_index=None, branch_view=None):
-        return {"ok": True}
+    async def regenerate(
+        self,
+        cid,
+        *,
+        turn_index=None,
+        branch_view=None,
+        request_id=None,
+    ):
+        return {
+            "status": "completed",
+            "request_id": request_id,
+            "turn_index": turn_index or 0,
+            "branch_id": 1,
+            "parent_branch_path": [],
+        }
 
     async def edit_message(self, cid, idx, content, **kw):
-        return True
+        return {
+            "status": "completed",
+            "request_id": kw.get("request_id"),
+            "turn_index": kw.get("turn_index") or 0,
+            "branch_id": 1,
+            "parent_branch_path": [],
+        }
 
     async def rewind(self, cid, idx):
         self.calls.append(("rewind", cid, idx))
@@ -217,6 +241,7 @@ def _make_service(remote_specs=None) -> MultiNodeTerrariumService:
     svc._cross_subs = {}
     svc._cluster_links = set()
     svc._runtime_graph_meta_lookup = None
+    svc._drive_routes = DriveRouteCache()
     for node_id, creatures in (remote_specs or {}).items():
         svc._remotes[node_id] = _FakeService(node_id=node_id, creatures=creatures)
     return svc
@@ -300,8 +325,9 @@ class TestListCreatures:
     async def test_populates_name_cache(self):
         svc = _make_service(remote_specs={"w1": [_info("c1", name="alice")]})
         await svc.list_creatures()
-        assert svc._creature_name_cache["alice"] == ("w1", "c1")
-        assert svc._creature_name_cache["c1"] == ("w1", "c1")
+        expected = {("g", "w1", "c1")}
+        assert svc._creature_name_cache["alice"] == expected
+        assert svc._creature_name_cache["c1"] == expected
 
     async def test_remote_failure_swallowed(self):
         svc = _make_service(remote_specs={"w1": []})
@@ -372,6 +398,15 @@ class TestPerCreatureReads:
         svc = _make_service()
         assert await svc.creature_status("ghost") is None
 
+    async def test_command_inventory_routes_to_home_worker(self):
+        svc = _make_service(remote_specs={"w1": [_info("c1")]})
+        await svc.list_creatures()
+
+        inventory = await svc.command_inventory("c1")
+
+        assert inventory == {"commands": [], "skills": []}
+        assert ("command_inventory", "c1") in svc._remotes["w1"].calls
+
 
 # ── lifecycle ──────────────────────────────────────────────────
 
@@ -381,8 +416,11 @@ class TestLifecycle:
         svc = _make_service(remote_specs={"w1": []})
         info = await svc.add_creature(None, on_node="w1")
         assert info.creature_id == "new-cid"
-        # Home is recorded.
+        # Home and exact graph-scoped aliases are recorded immediately.
         assert svc._home["new-cid"] == "w1"
+        expected = {("g", "w1", "new-cid")}
+        assert svc._creature_name_cache["new-cid"] == expected
+        assert svc._creature_name_cache["new"] == expected
 
     async def test_add_creature_default_host_rejected(self):
         # The default ``on_node="_host"`` is rejected — the host runs
@@ -508,8 +546,8 @@ class TestPerCreatureRoutes:
         assert await svc.promote_job("c1", "j1") is False
         assert (await svc.chat_history("c1"))["messages"] == []
         assert await svc.chat_branches("c1") == [{"t": 1}]
-        assert (await svc.regenerate("c1"))["ok"] is True
-        assert await svc.edit_message("c1", 0, "x") is True
+        assert (await svc.regenerate("c1"))["status"] == "completed"
+        assert (await svc.edit_message("c1", 0, "x"))["status"] == "completed"
         await svc.rewind("c1", 0)
         assert await svc.get_scratchpad("c1") == {"k": "v"}
         assert await svc.patch_scratchpad("c1", {"k": "v"}) == {"k": "v"}

@@ -5,14 +5,13 @@ populated via ``TestTerrariumBuilder``; the lab transport is replaced
 by a fake ``LabRegistrar`` so the test never touches a real socket.
 """
 
-from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.laboratory._internal.app import AppMessage
 from kohakuterrarium.laboratory.adapters.terrarium_runtime import (
     TerrariumRuntimeAdapter,
     _NotHostedHere,
 )
+from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder
-from kohakuterrarium.terrarium.wire import pack_creature_build_input
 
 
 class _FakeNode:
@@ -252,40 +251,35 @@ class TestTopologyReads:
 
 
 class TestLifecycleOps:
-    async def test_add_creature_prewarms_llm_override_before_build(self):
-        engine = await TestTerrariumBuilder().with_creature("spawned").build()
-        adapter = TerrariumRuntimeAdapter(engine, _FakeNode(), identity_cache=object())
+    async def test_apply_recipe_persistence_is_worker_owned(self):
+        adapter = await _make_adapter()
         calls = []
 
-        async def prewarm(selector):
-            calls.append(("prewarm", selector))
+        async def apply(recipe, **kwargs):
+            calls.append({"recipe": recipe, **kwargs})
+            return adapter._engine.list_graphs()[0]
 
-        async def add_creature(config, **kwargs):
-            calls.append(("add", kwargs["llm"]))
-            return engine.get_creature("spawned")
-
-        adapter._prewarm_profile_by_selector = prewarm
-        engine.add_creature = add_creature
+        adapter._engine.apply_recipe = apply
         try:
             out = await adapter._dispatch(
+                _msg("apply_recipe", {"recipe_path": "recipe.yaml", "persist": True})
+            )
+            assert out["graph"]["graph_id"]
+            assert calls[0]["session"] is True
+
+            rejected = await adapter._dispatch(
                 _msg(
-                    "add_creature",
+                    "apply_recipe",
                     {
-                        "config": pack_creature_build_input(
-                            AgentConfig(name="spawned")
-                        ),
-                        "llm": "opencode-zen/zen-free",
-                        "start": False,
+                        "recipe_path": "recipe.yaml",
+                        "session_path": "../../escape.kohakutr",
                     },
                 )
             )
-            assert "error" not in out
-            assert calls == [
-                ("prewarm", "opencode-zen/zen-free"),
-                ("add", "opencode-zen/zen-free"),
-            ]
+            assert rejected["error"]["kind"] == "invalid"
+            assert len(calls) == 1
         finally:
-            await engine.shutdown()
+            await adapter._engine.shutdown()
 
     async def test_remove_creature(self):
         adapter = await _make_adapter()
@@ -296,6 +290,33 @@ class TestLifecycleOps:
             assert out == {}
         finally:
             await adapter._engine.shutdown()
+
+    async def test_discard_recipe_removes_worker_store_and_releases_lock(
+        self, tmp_path
+    ):
+        adapter = await _make_adapter()
+        engine = adapter._engine
+        graph_id = engine.list_graphs()[0].graph_id
+        session_path = tmp_path / "recipe.kohakutr"
+        await engine.attach_session(graph_id, session_path)
+        try:
+            out = await adapter._dispatch(
+                _msg("discard_recipe", {"graph_id": graph_id})
+            )
+
+            assert out == {}
+            assert engine.list_creatures() == []
+            assert engine.list_graphs() == []
+            assert engine._session_stores == {}
+            assert engine._owned_sessions == set()
+            assert not session_path.exists()
+            assert not session_path.with_name(session_path.name + "-wal").exists()
+            assert not session_path.with_name(session_path.name + "-shm").exists()
+            assert not session_path.with_name(session_path.name + ".drives").exists()
+            reopened = SessionStore(session_path, writer_lock=True)
+            reopened.close(update_status=False)
+        finally:
+            await engine.shutdown()
 
     async def test_start_stop_creature(self):
         adapter = await _make_adapter()

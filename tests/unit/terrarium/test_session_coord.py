@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium import session_coord as sc
+from kohakuterrarium.terrarium.autosession import close_owned_stores
 from kohakuterrarium.terrarium.topology import TopologyDelta
 
 # ── copy_events_into ──────────────────────────────────────────
@@ -57,10 +58,6 @@ class TestMergeSessionStores:
         try:
             s1.init_meta("sid-a", "agent", "/p", "/w", ["alice"])
             s2.init_meta("sid-b", "agent", "/p", "/w", ["bob"])
-            s1.meta["runtime_creatures"] = [
-                {"creature_id": "alice-id", "name": "alice"}
-            ]
-            s2.meta["runtime_creatures"] = [{"creature_id": "bob-id", "name": "bob"}]
             s1.append_event("alice", "x", {"v": 1})
             s2.append_event("bob", "y", {"v": 2})
             s1.flush()
@@ -75,10 +72,8 @@ class TestMergeSessionStores:
                 assert "sid-b" in parents
                 assert merged.get_events("alice")
                 assert merged.get_events("bob")
-                assert merged.meta["agents"] == ["alice", "bob"]
-                assert {
-                    item["creature_id"] for item in merged.meta["runtime_creatures"]
-                } == {"alice-id", "bob-id"}
+                assert bool(merged.meta["conversation_open"]) is True
+                assert merged.meta["conversation_id"] == s1.meta["conversation_id"]
             finally:
                 merged.close()
         finally:
@@ -103,9 +98,14 @@ class TestSplitSessionStore:
             new_stores = sc.split_session_store(src, new_paths)
             try:
                 assert len(new_stores) == 2
+                child_conversation_ids = set()
                 for s in new_stores:
                     assert "parent-sid" in s.meta["parent_session_ids"]
                     assert s.get_events("alice")
+                    assert bool(s.meta["conversation_open"]) is True
+                    child_conversation_ids.add(s.meta["conversation_id"])
+                assert len(child_conversation_ids) == 2
+                assert src.meta["conversation_id"] not in child_conversation_ids
             finally:
                 for s in new_stores:
                     s.close()
@@ -154,6 +154,7 @@ def _make_engine(tmp_path, *, session_dir=True):
         _session_stores={},
         _topology=SimpleNamespace(graphs=graphs),
         _creatures=creatures,
+        _owned_sessions=set(),
     )
     if session_dir:
         eng._session_dir = str(tmp_path)
@@ -200,24 +201,137 @@ class TestApplyMerge:
                 s.close()
             s1.close()
 
-    def test_merge_without_persistence_keeps_first(self, tmp_path):
-        # No session_dir set on engine.
+    def test_merge_without_persistence_preserves_all_histories(self, tmp_path):
         eng = _make_engine(tmp_path, session_dir=False)
         s1 = SessionStore(str(tmp_path / "a.kohakutr"))
-        s1.init_meta("a", "agent", "/p", "/w", ["alice"])
-        eng._session_stores["g1"] = s1
+        s2 = SessionStore(str(tmp_path / "b.kohakutr"))
+        s1.init_meta("a", "agent", "/stale/a", "/w", ["alice"])
+        s2.init_meta("b", "agent", "/stale/b", "/w", ["bob"])
+        s1.meta["config_snapshot"] = {"name": "stale"}
+        s1.append_event("alice", "user_message", {"content": "left"})
+        s2.append_event("bob", "user_message", {"content": "right"})
+        eng._session_stores.update({"g1": s1, "g2": s2})
         try:
             sc.apply_merge(
                 eng,
                 TopologyDelta(
                     kind="merge",
-                    old_graph_ids=["g1"],
+                    old_graph_ids=["g1", "g2"],
                     new_graph_ids=["g1"],
                 ),
             )
             assert eng._session_stores["g1"] is s1
+            assert "g2" not in eng._session_stores
+            assert len(list(s1.events.keys())) == 2
+            assert s1.get_events("alice")[0]["content"] == "left"
+            assert s1.get_events("bob")[0]["content"] == "right"
+            assert set(s1.meta["parent_session_ids"]) == {"a", "b"}
+            assert s1.meta["config_path"] is None
+            assert not s1.meta.exists("config_snapshot")
         finally:
             s1.close()
+            s2.close()
+
+    def test_merge_transfers_ownership_and_closes_dropped(self, tmp_path):
+        # Two owned graphs merge. The survivor (kept graph's own file)
+        # stays open; the dropped graph's owned store is CLOSED, and
+        # ``_owned_sessions`` follows the merge to the surviving id so
+        # shutdown can still find + close the survivor.
+        eng = _make_engine(tmp_path)
+        eng._topology.graphs["g2"] = SimpleNamespace(graph_id="g2", creature_ids=set())
+        # ``g1`` file lives at the merge target path → the reuse branch,
+        # so ``s1`` is the survivor and ``s2`` is superseded.
+        s1 = SessionStore(str(tmp_path / "g1.kohakutr"))
+        s1.init_meta("s1", "agent", "/p", "/w", ["alice"])
+        s1.append_event("alice", "x", {"v": 1})
+        s1.flush()
+        s2 = SessionStore(str(tmp_path / "g2.kohakutr"))
+        s2.init_meta("s2", "agent", "/p", "/w", ["bob"])
+        s2.append_event("bob", "y", {"v": 2})
+        s2.flush()
+        eng._session_stores["g1"] = s1
+        eng._session_stores["g2"] = s2
+        eng._owned_sessions.update({"g1", "g2"})
+        try:
+            sc.apply_merge(
+                eng,
+                TopologyDelta(
+                    kind="merge",
+                    old_graph_ids=["g1", "g2"],
+                    new_graph_ids=["g1"],
+                ),
+            )
+            # Dropped store closed; survivor open + still mapped.
+            assert getattr(s2, "_closed", False) is True
+            assert getattr(s1, "_closed", False) is False
+            reopened_s2 = SessionStore.open_readonly(tmp_path / "g2.kohakutr")
+            try:
+                assert bool(reopened_s2.meta["conversation_open"]) is False
+                assert reopened_s2.meta["status"] == "completed"
+            finally:
+                reopened_s2.close(update_status=False)
+            assert eng._session_stores == {"g1": s1}
+            # Dropped graph's events landed on the survivor.
+            assert s1.get_events("bob")
+            # Ownership followed the merge to the surviving id only.
+            assert eng._owned_sessions == {"g1"}
+            # Shutdown-time closure can now find + close the survivor.
+            close_owned_stores(eng)
+            assert getattr(s1, "_closed", False) is True
+        finally:
+            s1.close()
+            s2.close()
+
+    def test_merge_carries_replay_leftovers_to_survivor(self, tmp_path):
+        # An unresolved replay remnant keyed under the dropped graph
+        # must follow the merge — the post-merge snapshot for the
+        # survivor otherwise erases the unresolved edge permanently.
+        import kohakuterrarium.terrarium.topology_snapshot as topo_snap
+
+        eng = _make_engine(tmp_path)
+        eng._topology.graphs["g2"] = SimpleNamespace(graph_id="g2", creature_ids=set())
+        s1 = SessionStore(str(tmp_path / "g1.kohakutr"))
+        s1.init_meta("s1", "agent", "/p", "/w", ["alice"])
+        s2 = SessionStore(str(tmp_path / "g2.kohakutr"))
+        s2.init_meta("s2", "agent", "/p", "/w", ["bob"])
+        eng._session_stores["g1"] = s1
+        eng._session_stores["g2"] = s2
+        eng._owned_sessions.update({"g1", "g2"})
+        eng._topology_replay_leftovers = {
+            "g2": {
+                "channels": [],
+                "listen_edges": {"missing": ["runtime_b"]},
+                "send_edges": {},
+            }
+        }
+        # Live graph g1 with empty topology (the merged graph).
+        eng._topology.graphs["g1"] = SimpleNamespace(
+            graph_id="g1",
+            creature_ids=set(),
+            channels={},
+            listen_edges={},
+            send_edges={},
+        )
+        try:
+            sc.apply_merge(
+                eng,
+                TopologyDelta(
+                    kind="merge",
+                    old_graph_ids=["g1", "g2"],
+                    new_graph_ids=["g1"],
+                ),
+            )
+            assert "g2" not in eng._topology_replay_leftovers
+            assert eng._topology_replay_leftovers["g1"]["listen_edges"] == {
+                "missing": ["runtime_b"]
+            }
+            # The post-merge snapshot for the survivor keeps the edge.
+            topo_snap.snapshot(eng, "g1")
+            saved = s1.meta[topo_snap.META_KEY]
+            assert saved["listen_edges"].get("missing") == ["runtime_b"]
+        finally:
+            s1.close()
+            s2.close()
 
 
 # ── apply_split ───────────────────────────────────────────────
@@ -284,6 +398,47 @@ class TestApplySplit:
         finally:
             parent.close()
 
+    def test_split_closes_owned_parent_and_owns_children(self, tmp_path):
+        # An owned parent splits into two children with fresh duplicated
+        # stores. The parent store is superseded → CLOSED; both children
+        # become owned so shutdown closes the stores that now hold the
+        # history (else they leak with the parent id stuck in the set).
+        eng = _make_engine(tmp_path)
+        eng._topology.graphs["a"] = SimpleNamespace(graph_id="a", creature_ids={"c1"})
+        eng._topology.graphs["b"] = SimpleNamespace(graph_id="b", creature_ids=set())
+        parent = SessionStore(str(tmp_path / "g1.kohakutr"))
+        parent.init_meta("p", "agent", "/p", "/w", ["alice"])
+        parent.append_event("alice", "x", {"v": 1})
+        parent.flush()
+        eng._session_stores["g1"] = parent
+        eng._owned_sessions.add("g1")
+        try:
+            sc.apply_split(
+                eng,
+                TopologyDelta(
+                    kind="split",
+                    old_graph_ids=["g1"],
+                    new_graph_ids=["a", "b"],
+                ),
+            )
+            # Parent superseded + closed + unmapped.
+            assert getattr(parent, "_closed", False) is True
+            assert "g1" not in eng._session_stores
+            # Children own fresh, still-open stores.
+            assert eng._owned_sessions == {"a", "b"}
+            sa = eng._session_stores["a"]
+            sb = eng._session_stores["b"]
+            assert getattr(sa, "_closed", False) is False
+            assert getattr(sb, "_closed", False) is False
+            # Shutdown-time closure reaches the children (not the parent).
+            close_owned_stores(eng)
+            assert getattr(sa, "_closed", False) is True
+            assert getattr(sb, "_closed", False) is True
+        finally:
+            parent.close()
+            for s in list(eng._session_stores.values()):
+                s.close()
+
 
 # ── _refresh_meta_for_split_graph + _attach_store_to_graph ───
 
@@ -297,13 +452,17 @@ class TestRefreshAndAttach:
         finally:
             store.close()
 
-    def test_refresh_writes_meta(self, tmp_path):
+    def test_refresh_writes_meta_and_clears_stale_reconstruction(self, tmp_path):
         eng = _make_engine(tmp_path)
         store = SessionStore(str(tmp_path / "s.kohakutr"))
         try:
+            store.meta["config_path"] = "/stale/recipe.yaml"
+            store.meta["config_snapshot"] = {"name": "wrong-agent"}
             sc._refresh_meta_for_split_graph(eng, "g1", store)
             assert store.meta["agents"] == ["alice"]
             assert store.meta["config_type"] == "agent"
+            assert store.meta["config_path"] is None
+            assert not store.meta.exists("config_snapshot")
         finally:
             store.close()
 

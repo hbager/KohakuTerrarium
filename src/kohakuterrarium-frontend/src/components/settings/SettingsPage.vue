@@ -96,13 +96,10 @@
                   <div class="text-[11px] text-warm-400 font-mono truncate">
                     {{ backend.base_url || "(no base_url)" }}
                   </div>
-                  <div v-if="backend.auth_mode !== 'none'" class="text-[11px] text-warm-400 font-mono truncate mt-1">
+                  <div class="text-[11px] text-warm-400 font-mono truncate mt-1">
                     <span v-if="backend.env_var">{{ backend.env_var }}</span>
                     <span v-if="backend.masked_key && !isOAuthCodex(backend)"> · {{ backend.masked_key }}</span>
                     <span v-if="isOAuthCodex(backend)">{{ t("settings.keys.oauthHint") }}</span>
-                  </div>
-                  <div v-else class="text-[11px] text-warm-400 font-mono truncate mt-1">
-                    {{ t("settings.backends.authNone") }}
                   </div>
                   <div v-if="backend.provider_name || backend.provider_native_tools?.length" class="text-[10px] text-warm-400 mt-1 flex items-center gap-2 flex-wrap">
                     <span v-if="backend.provider_name" class="font-mono">identity: {{ backend.provider_name }}</span>
@@ -110,7 +107,7 @@
                   </div>
                 </div>
                 <div class="flex flex-wrap items-center justify-end gap-2 shrink-0">
-                  <template v-if="!isOAuthCodex(backend) && backend.auth_mode !== 'none'">
+                  <template v-if="!isOAuthCodex(backend)">
                     <el-input v-if="editingKey === backend.name" v-model="keyInput" size="small" type="password" show-password :placeholder="t('settings.keys.enterKey')" class="!w-60" @keyup.enter="saveKey(backend.name)" />
                     <el-button v-if="editingKey === backend.name" size="small" type="primary" @click="saveKey(backend.name)">
                       {{ t("common.save") }}
@@ -129,7 +126,7 @@
                       </template>
                     </el-popconfirm>
                   </template>
-                  <template v-else-if="isOAuthCodex(backend)">
+                  <template v-else>
                     <el-button size="small" type="primary" :loading="codexLoggingIn" @click="runCodexLogin">
                       {{ backend.available ? t("common.refresh") : t("settings.keys.setKey") }}
                     </el-button>
@@ -345,8 +342,23 @@
               <div v-if="codexUsage.promo_message" class="card p-3 border-l-3 border-l-iolite text-xs text-warm-600 dark:text-warm-400">
                 {{ codexUsage.promo_message }}
               </div>
-              <div class="text-[11px] text-warm-400">{{ t("settings.account.refreshHint") }}</div>
             </template>
+
+            <!-- Redeemable rate-limit reset credits -->
+            <div v-if="resetCredits.length" class="card p-4 flex flex-col gap-3">
+              <div class="font-medium text-warm-700 dark:text-warm-300">{{ t("settings.account.resetCredits") }}</div>
+              <div v-for="credit in resetCredits" :key="credit.id" class="flex items-center justify-between gap-3 text-xs">
+                <div class="min-w-0">
+                  <div class="text-warm-700 dark:text-warm-300 truncate">{{ credit.title || credit.reset_type || t("settings.account.resetCredit") }}</div>
+                  <div v-if="credit.description" class="text-[11px] text-warm-400 truncate">{{ credit.description }}</div>
+                  <div v-if="credit.expires_at" class="text-[11px] text-warm-400">{{ t("settings.account.resetExpires", { value: credit.expires_at }) }}</div>
+                </div>
+                <el-button size="small" type="primary" plain :loading="redeemingCreditId === credit.id" :disabled="!!redeemingCreditId" @click="redeemResetCredit(credit)">
+                  {{ t("settings.account.resetRedeem") }}
+                </el-button>
+              </div>
+            </div>
+
             <el-button size="small" @click="loadCodexUsage">{{ t("common.refresh") }}</el-button>
           </template>
         </div>
@@ -355,6 +367,13 @@
       <!-- ════════════════════════ Sites (lab cluster) ════════════════════════ -->
       <el-tab-pane v-if="cluster.isCluster" :label="t('cluster.settings.title')" name="sites">
         <SitesPane />
+      </el-tab-pane>
+
+      <!-- ════════════════════════ Drives ════════════════════════ -->
+      <el-tab-pane label="Drives" name="drives">
+        <div class="settings-pane">
+          <DriveSettingsPanel @open-drives="onOpenDrives" />
+        </div>
       </el-tab-pane>
 
       <!-- ════════════════════════ Updates ════════════════════════ -->
@@ -434,6 +453,7 @@ import AboutPanel from "@/components/settings/AboutPanel.vue"
 import AdvancedPanel from "@/components/settings/AdvancedPanel.vue"
 import BackendForm from "@/components/settings/BackendForm.vue"
 import CodexLoginModal from "@/components/settings/CodexLoginModal.vue"
+import DriveSettingsPanel from "@/components/settings/DriveSettingsPanel.vue"
 import MCPServerEditModal from "@/components/settings/modals/MCPServerEditModal.vue"
 import PresetEditor from "@/components/settings/PresetEditor.vue"
 import SitesPane from "@/components/settings/SitesPane.vue"
@@ -574,9 +594,12 @@ async function onCodexLoginDone() {
 
 // Re-fetch keys whenever the user switches target node. Backends and
 // presets remain host-managed metadata; only the key + Codex-OAuth
-// state is per-node.
+// state is per-node. Codex usage is per-node too, so refresh it when the
+// Account tab is open (otherwise it shows the old node's usage until a
+// manual Refresh) — UXI-13.
 watch(providerNode, () => {
   loadKeys()
+  if (activeTab.value === "account") loadCodexUsage()
 })
 
 // ───────── Backends / providers ─────────
@@ -588,7 +611,6 @@ const backendForm = reactive({
   name: "",
   backend_type: "openai",
   base_url: "",
-  auth_mode: "api_key",
   provider_name: "",
   provider_native_tools: [],
 })
@@ -596,7 +618,8 @@ const nativeToolCatalog = ref([])
 
 const backendsWithAuth = computed(() => {
   const keyMetaByProvider = new Map(providerKeys.value.map((provider) => [provider.provider, provider]))
-  return backends.value.map((backend) => {
+  const backendNames = new Set(backends.value.map((backend) => backend.name))
+  const configuredBackends = backends.value.map((backend) => {
     const keyMeta = keyMetaByProvider.get(backend.name) || {}
     return {
       ...backend,
@@ -605,6 +628,20 @@ const backendsWithAuth = computed(() => {
       masked_key: keyMeta.masked_key || "",
     }
   })
+  const credentialOnlyProviders = providerKeys.value
+    .filter((provider) => !backendNames.has(provider.provider))
+    .map((provider) => ({
+      name: provider.provider,
+      backend_type: provider.backend_type || "credential",
+      base_url: "",
+      available: provider.available === true,
+      built_in: provider.built_in === true,
+      env_var: provider.env_var || "",
+      has_key: provider.has_key === true,
+      masked_key: provider.masked_key || "",
+      credential_only: true,
+    }))
+  return [...configuredBackends, ...credentialOnlyProviders]
 })
 
 const builtInBackends = computed(() => backendsWithAuth.value.filter((b) => b.built_in))
@@ -633,7 +670,6 @@ function resetBackendForm() {
   backendForm.name = ""
   backendForm.backend_type = "openai"
   backendForm.base_url = ""
-  backendForm.auth_mode = "api_key"
   backendForm.provider_name = ""
   backendForm.provider_native_tools = []
 }
@@ -657,7 +693,6 @@ function startEditBackend(backend) {
   backendForm.name = backend.name
   backendForm.backend_type = backend.backend_type || "openai"
   backendForm.base_url = backend.base_url || ""
-  backendForm.auth_mode = backend.auth_mode || "api_key"
   backendForm.provider_name = backend.provider_name || ""
   backendForm.provider_native_tools = Array.from(backend.provider_native_tools || [])
   showBackendForm.value = true
@@ -665,7 +700,6 @@ function startEditBackend(backend) {
 
 function onBackendFormUpdate({ key, value }) {
   backendForm[key] = key === "provider_native_tools" ? Array.from(value || []) : value
-  if (key === "backend_type" && value !== "openai" && backendForm.auth_mode === "none") backendForm.auth_mode = "api_key"
 }
 
 async function saveBackend() {
@@ -676,7 +710,6 @@ async function saveBackend() {
       name: backendName,
       backend_type: backendForm.backend_type,
       base_url: backendForm.base_url,
-      auth_mode: backendForm.auth_mode,
       provider_name: backendForm.provider_name || backendName,
       provider_native_tools: Array.from(backendForm.provider_native_tools || []),
     })
@@ -832,13 +865,12 @@ function modelIdentifier(preset) {
 }
 
 async function handleSetDefault(preset) {
-  if (!preset || !preset.name) return
   const identifier = modelIdentifier(preset)
+  if (!identifier) return
   try {
     await settingsAPI.setDefaultModel(identifier)
     ElMessage.success(t("settings.models.defaultSet", { name: identifier }))
     await loadPresets()
-    // Refresh the editor's bound preset so the badge flips.
     const refreshed = (allPresets.value || []).find((p) => p.name === preset.name && p.provider === preset.provider)
     if (refreshed) editorPreset.value = refreshed
     fireModelCatalogChanged({ reason: "default-changed", model: identifier })
@@ -869,7 +901,6 @@ async function confirmDeletePreset(name) {
     ElMessage.success(t("settings.models.deleted", { name }))
     cancelEdit()
     await loadPresets()
-    fireModelCatalogChanged({ reason: "profile-deleted", model: `${preset.provider}/${name}` })
   } catch (err) {
     ElMessage.error(err.response?.data?.detail || t("settings.models.deleteFailed"))
   }
@@ -944,16 +975,53 @@ async function removeMCPServer(name) {
 const codexUsage = ref(null)
 const codexUsageLoading = ref(false)
 const codexUsageError = ref("")
+const redeemingCreditId = ref("")
 
 async function loadCodexUsage() {
   codexUsageLoading.value = true
   codexUsageError.value = ""
   try {
-    codexUsage.value = await settingsAPI.getCodexUsage()
+    // Live snapshot for the settings-target node — no model round.
+    codexUsage.value = await settingsAPI.getCodexUsage(providerNode.value)
   } catch (err) {
     codexUsageError.value = err.response?.data?.detail || t("settings.account.loadFailed")
   } finally {
     codexUsageLoading.value = false
+  }
+}
+
+const resetCredits = computed(() => codexUsage.value?.reset_credits?.credits || [])
+
+// Outcome → user message. The redeem is idempotent on the backend, so a
+// stable key derived from the credit id means a retried click never
+// double-spends. Refetch on success so the snapshot + credit list reflect
+// the redemption.
+async function redeemResetCredit(credit) {
+  if (!credit?.id || redeemingCreditId.value) return
+  redeemingCreditId.value = credit.id
+  try {
+    const res = await settingsAPI.codexResetConsume({ idempotencyKey: `reset-${credit.id}`, creditId: credit.id }, providerNode.value)
+    switch (res?.outcome) {
+      case "reset":
+        ElMessage.success(t("settings.account.resetRedeemed"))
+        break
+      case "nothingToReset":
+        ElMessage.info(t("settings.account.resetNothing"))
+        break
+      case "noCredit":
+        ElMessage.warning(t("settings.account.resetNoCredit"))
+        break
+      case "alreadyRedeemed":
+        ElMessage.info(t("settings.account.resetAlready"))
+        break
+      default:
+        ElMessage.info(String(res?.outcome || ""))
+    }
+    await loadCodexUsage()
+  } catch (err) {
+    ElMessage.error(err.response?.data?.detail || t("settings.account.resetFailed"))
+  } finally {
+    redeemingCreditId.value = ""
   }
 }
 
@@ -1001,8 +1069,16 @@ onMounted(async () => {
 })
 
 watch(activeTab, (tab) => {
-  if (tab === "account" && !codexUsage.value && !codexUsageLoading.value) loadCodexUsage()
+  // Live refresh every time the Account tab is opened — the snapshot is
+  // fetched fresh (no model round), never served from a stale cache.
+  if (tab === "account" && !codexUsageLoading.value) loadCodexUsage()
 })
+
+// The Drives *record* panel lives in a workspace, not in global Settings.
+// Point the operator there rather than force a cross-context navigation.
+function onOpenDrives() {
+  ElMessage.info("Open a running creature or terrarium workspace and use its Drives panel to review active records.")
+}
 </script>
 
 <style scoped>

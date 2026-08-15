@@ -6,13 +6,28 @@ session store is involved.
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
+from kohakuterrarium.errors import SessionNotResumableError
 from kohakuterrarium.terrarium.creature_host import Creature
 from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.terrarium.drive.store import (
+    DriveRepositoryClosedError,
+)
 from kohakuterrarium.terrarium.events import EventFilter, EventKind
 from kohakuterrarium.testing.terrarium import _FakeAgent, TestTerrariumBuilder
+
+
+async def _wait_true(predicate, *, timeout: float = 5.0) -> None:
+    """Yield to the loop until ``predicate()`` holds (barrier-gated async work)."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("condition not met within timeout")
+        await asyncio.sleep(0.005)
+
 
 # ── construction / context manager ─────────────────────────────
 
@@ -52,19 +67,94 @@ class TestAddRemoveCreature:
         finally:
             await t.shutdown()
 
-    async def test_remove_graph_is_atomic(self):
-        t = (
-            await TestTerrariumBuilder()
-            .with_creature("alice")
-            .with_creature("bob")
-            .with_creature("carol")
-            .build()
+    async def test_start_failure_removes_inserted_creature(self):
+        t = Terrarium()
+        creature = Creature(
+            creature_id="alice", name="alice", agent=_FakeAgent("alice")
         )
-        gid = t.get_creature("alice").graph_id
+
+        async def fail_start():
+            raise RuntimeError("start failed")
+
+        creature.agent.start = fail_start
         try:
-            await t.remove_graph(gid)
-            assert t.list_graphs() == []
+            with pytest.raises(RuntimeError, match="start failed"):
+                await t.add_creature(creature)
             assert t.list_creatures() == []
+            assert t.list_graphs() == []
+        finally:
+            await t.shutdown()
+
+    async def test_session_attach_failure_removes_inserted_creature(self, monkeypatch):
+        t = Terrarium()
+        creature = Creature(
+            creature_id="alice", name="alice", agent=_FakeAgent("alice")
+        )
+
+        async def fail_attach(*args, **kwargs):
+            raise RuntimeError("attach failed")
+
+        monkeypatch.setattr(
+            "kohakuterrarium.terrarium.autosession.attach_for_new_creature",
+            fail_attach,
+        )
+        try:
+            with pytest.raises(RuntimeError, match="attach failed"):
+                await t.add_creature(creature, start=False)
+            assert t.list_creatures() == []
+            assert t.list_graphs() == []
+        finally:
+            await t.shutdown()
+
+    async def test_persisted_graph_rejects_duplicate_name_before_add(self):
+        t = await TestTerrariumBuilder().with_creature("alice").build()
+        graph_id = t.get_creature("alice").graph_id
+        other = await TestTerrariumBuilder().with_creature("alice").build()
+        duplicate = other.get_creature("alice")
+        duplicate.creature_id = "alice_copy"
+        t._session_stores[graph_id] = object()
+        try:
+            with pytest.raises(
+                (SessionNotResumableError, ValueError), match="already contains"
+            ):
+                await t.add_creature(duplicate, graph=graph_id, start=False)
+            assert t.get_graph(graph_id).creature_ids == {"alice"}
+        finally:
+            t._session_stores.clear()
+            await t.shutdown()
+            await other.shutdown()
+
+    async def test_add_rejects_duplicate_config_alias_before_mutation(self):
+        t = await TestTerrariumBuilder().with_creature("alice").build()
+        other = await TestTerrariumBuilder().with_creature("other").build()
+        candidate = other.get_creature("other")
+        candidate.config = SimpleNamespace(name="alice")
+        graph_id = t.get_creature("alice").graph_id
+        try:
+            with pytest.raises(ValueError, match="already contains"):
+                await t.add_creature(candidate, graph=graph_id, start=False)
+            assert t.get_graph(graph_id).creature_ids == {"alice"}
+        finally:
+            await t.shutdown()
+            await other.shutdown()
+
+    async def test_add_binds_final_runtime_id_to_executor(self):
+        t = Terrarium()
+        creature = Creature(
+            creature_id="configured-id",
+            name="worker",
+            agent=_FakeAgent(name="worker"),
+        )
+        creature.agent.executor = SimpleNamespace(_creature_id="configured-id")
+        try:
+            added = await t.add_creature(
+                creature,
+                creature_id="runtime-id",
+                start=False,
+                session=False,
+            )
+            assert added.creature_id == "runtime-id"
+            assert creature.agent.executor._creature_id == "runtime-id"
         finally:
             await t.shutdown()
 
@@ -72,6 +162,28 @@ class TestAddRemoveCreature:
         t = Terrarium()
         with pytest.raises(KeyError):
             await t.remove_creature("ghost")
+
+    async def test_remove_survives_closed_drive_repo(self):
+        # A stale drive registry entry can point at an already-closed
+        # repository (Windows closes a session-backed repo's sqlite connection
+        # with its store after a merge/split). Creature removal must treat
+        # that as quiescence and STILL remove the creature from the topology —
+        # otherwise a dead node lingers and later splits into its own session.
+        t = await TestTerrariumBuilder().with_creature("alice").build()
+        try:
+            assert "alice" in t
+
+            async def _boom(*_a, **_k):
+                raise DriveRepositoryClosedError(
+                    "Drive repository is closed; its executor has been shut down"
+                )
+
+            t._drive_runtime.on_creature_removed = _boom
+            await t.remove_creature("alice")
+            assert "alice" not in t
+            assert t.list_graphs() == []
+        finally:
+            await t.shutdown()
 
     async def test_get_creature(self):
         t = await TestTerrariumBuilder().with_creature("alice").build()
@@ -181,6 +293,74 @@ class TestConnectDisconnect:
             graph = t.get_graph(t.get_creature("alice").graph_id)
             assert "chat" in graph.send_edges["alice"]
             assert "chat" in graph.listen_edges["bob"]
+        finally:
+            await t.shutdown()
+
+    async def test_connect_rejects_non_endpoint_duplicate_names(self):
+        from kohakuterrarium.terrarium.graph_identity import GraphNameConflictError
+
+        t = await (
+            TestTerrariumBuilder()
+            .with_creature("left-endpoint")
+            .with_creature("left-worker")
+            .with_connection("left-endpoint", "left-worker")
+            .with_creature("right-endpoint")
+            .with_creature("right-worker")
+            .with_connection("right-endpoint", "right-worker")
+            .with_separate_graphs()
+            .build()
+        )
+        try:
+            left_worker = t.get_creature("left-worker")
+            right_worker = t.get_creature("right-worker")
+            left_worker.name = "worker"
+            left_worker.agent.config.name = "worker"
+            right_worker.name = "worker"
+            right_worker.agent.config.name = "worker"
+            with pytest.raises(GraphNameConflictError):
+                await t.connect("left-endpoint", "right-endpoint")
+            assert (
+                t.get_creature("left-endpoint").graph_id
+                != t.get_creature("right-endpoint").graph_id
+            )
+        finally:
+            await t.shutdown()
+
+    async def test_connect_rejects_duplicate_name_across_graphs(self):
+        from kohakuterrarium.terrarium.graph_identity import GraphNameConflictError
+
+        t = await (
+            TestTerrariumBuilder()
+            .with_creature("worker")
+            .with_creature("worker-other")
+            .with_separate_graphs()
+            .build()
+        )
+        other = t.get_creature("worker-other")
+        other.name = "worker"
+        other.agent.config.name = "worker"
+        try:
+            assert t.get_creature("worker").graph_id != other.graph_id
+            with pytest.raises(GraphNameConflictError):
+                await t.connect("worker", other.creature_id)
+            assert t.get_creature("worker").graph_id != other.graph_id
+        finally:
+            await t.shutdown()
+
+    async def test_connect_rejects_duplicate_creature_config_alias(self):
+        t = await (
+            TestTerrariumBuilder()
+            .with_creature("left")
+            .with_creature("right")
+            .with_separate_graphs()
+            .build()
+        )
+        right = t.get_creature("right")
+        right.config = SimpleNamespace(name="left")
+        try:
+            with pytest.raises(ValueError, match="already contains"):
+                await t.connect("left", "right")
+            assert t.get_creature("left").graph_id != right.graph_id
         finally:
             await t.shutdown()
 
@@ -505,10 +685,14 @@ class TestApplyRecipe:
             pwd=None,
             llm=None,
             strict=True,
+            start=True,
             creature_builder=None,
+            created_ids=None,
+            transaction=None,
         ):
             captured["recipe"] = recipe
             captured["pwd"] = pwd
+            captured["start"] = start
             return None
 
         from kohakuterrarium.terrarium import engine as engine_mod
@@ -519,6 +703,7 @@ class TestApplyRecipe:
             await t.apply_recipe("/some/recipe.yaml", pwd="/cwd")
             assert captured["recipe"] == "/some/recipe.yaml"
             assert captured["pwd"] == "/cwd"
+            assert captured["start"] is True
         finally:
             await t.shutdown()
 
@@ -663,3 +848,136 @@ class TestAttachSessionReplace:
         await t.attach_session("g1", s)  # same object — must NOT close it
         assert getattr(s, "_closed", False) is False
         s.close()
+
+
+# ── Drive runtime (Phase E) ────────────────────────────────────
+
+
+class TestDriveRuntime:
+    """Default-on Drive behavior, explicit opt-out, and shutdown drain."""
+
+    def _enabled(self, **over):
+        from kohakuterrarium.terrarium.drive.config import (
+            DriveRuntimeConfig,
+            default_registrations,
+        )
+
+        return dict(
+            drive_config=DriveRuntimeConfig(enabled=True, **over),
+            drive_registrations=default_registrations(),
+        )
+
+    def test_default_engine_has_runtime(self):
+        runtime = Terrarium().drives
+        assert runtime is not None
+        assert [item.descriptor.name for item in runtime.snapshot.entries] == [
+            "generic",
+            "goal",
+        ]
+
+    def test_enabled_empty_registrations_rejected_at_construction(self):
+        from kohakuterrarium.terrarium.drive.config import DriveRuntimeConfig
+        from kohakuterrarium.terrarium.drive.errors import DriveValidationError
+
+        with pytest.raises(DriveValidationError):
+            Terrarium(
+                drive_config=DriveRuntimeConfig(enabled=True),
+                drive_registrations=[],
+            )
+
+    def test_disabled_config_builds_no_runtime(self):
+        from kohakuterrarium.terrarium.drive.config import DriveRuntimeConfig
+
+        assert Terrarium(drive_config=DriveRuntimeConfig(enabled=False)).drives is None
+
+    async def test_default_creature_gets_drive_service(self):
+        from kohakuterrarium.terrarium.channels import DRIVE_SERVICE_KEY
+
+        t = await TestTerrariumBuilder().with_creature("alice").build()
+        try:
+            env = t._environments[t.get_creature("alice").graph_id]
+            assert env.get(DRIVE_SERVICE_KEY) is t.drives
+        finally:
+            await t.shutdown()
+
+    async def test_drive_enabled_registers_service_and_starts_dispatcher(self):
+        from kohakuterrarium.terrarium.channels import DRIVE_SERVICE_KEY
+
+        t = Terrarium(**self._enabled())
+        async with t:
+            c = Creature(creature_id="w", name="w", agent=_FakeAgent(name="w"))
+            await t.add_creature(c)
+            env = t._environments[c.graph_id]
+            assert env.get(DRIVE_SERVICE_KEY) is t.drives
+            # Dispatcher start is barrier-gated (design §6.5): it starts once the
+            # creature crosses the restoration barrier (async), not eagerly on add.
+            await _wait_true(lambda: t.drives.manager.dispatcher._task is not None)
+        # __aexit__ -> shutdown drained + stopped the dispatcher.
+        assert t.drives.manager.dispatcher._task is None
+
+    async def test_shutdown_drains_before_stopping_creatures(self):
+        t = Terrarium(**self._enabled())
+        await t.__aenter__()
+        c = Creature(creature_id="w", name="w", agent=_FakeAgent(name="w"))
+        await t.add_creature(c)
+        # Barrier-gated start (design §6.5): wait for the reconcile to start it.
+        await _wait_true(lambda: t.drives.manager.dispatcher._task is not None)
+        await t.shutdown()
+        assert t.drives.manager.dispatcher._task is None
+
+    async def test_reconfigure_on_disabled_engine_raises(self):
+        from kohakuterrarium.terrarium.drive.config import DriveRuntimeConfig
+
+        with pytest.raises(RuntimeError):
+            Terrarium(
+                drive_config=DriveRuntimeConfig(enabled=False)
+            ).reconfigure_drives([])
+
+    async def test_reconfigure_delegates_to_runtime(self):
+        from kohakuterrarium.terrarium.drive.config import default_registrations
+        from kohakuterrarium.terrarium.drive.runtime import APPLIED_LIVE
+
+        t = Terrarium(**self._enabled())
+        async with t:
+            # Re-applying the same set is a live no-op-shaped apply.
+            assert t.reconfigure_drives(default_registrations()) == APPLIED_LIVE
+
+    async def test_from_recipe_forwards_drive_args(self):
+        # Constructor forwarding (design §8.3): the recipe itself stays
+        # Drive-unaware, but the engine it builds is Drive-enabled.
+        from kohakuterrarium.terrarium.config import TerrariumConfig
+
+        recipe = TerrariumConfig(name="t", creatures=[], channels=[])
+        t = await Terrarium.from_recipe(recipe, **self._enabled())
+        try:
+            assert t.drives is not None
+        finally:
+            await t.shutdown()
+
+    async def test_with_creature_forwards_drive_args(self):
+        c = Creature(creature_id="w", name="w", agent=_FakeAgent(name="w"))
+        t, creature = await Terrarium.with_creature(c, **self._enabled())
+        try:
+            assert t.drives is not None
+            # The creature's graph got a manager + started dispatcher.
+            assert t.drives.peek_manager(creature.graph_id) is not None
+        finally:
+            await t.shutdown()
+
+    async def test_two_disconnected_graphs_have_isolated_managers(self):
+        # Per-graph partitioning (design §3.1): each disconnected graph owns
+        # its own manager + repository.
+        t = Terrarium(**self._enabled())
+        async with t:
+            a = await t.add_creature(
+                Creature(creature_id="a", name="a", agent=_FakeAgent(name="a"))
+            )
+            b = await t.add_creature(
+                Creature(creature_id="b", name="b", agent=_FakeAgent(name="b"))
+            )
+            assert a.graph_id != b.graph_id
+            ma = t.drives.peek_manager(a.graph_id)
+            mb = t.drives.peek_manager(b.graph_id)
+            assert ma is not None and mb is not None
+            assert ma is not mb
+            assert ma.repository is not mb.repository

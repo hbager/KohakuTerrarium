@@ -32,6 +32,9 @@ import pytest
 
 from kohakuterrarium.bootstrap import agent_init as _agent_init
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm
+from kohakuterrarium.builtins.subagents.research import RESEARCH_CONFIG
+from kohakuterrarium.builtins.tools import web_search
+from kohakuterrarium.builtins.tools.web_search import WebSearchTool
 from kohakuterrarium.core.agent import Agent
 from kohakuterrarium.core.config_types import (
     AgentConfig,
@@ -49,6 +52,7 @@ from kohakuterrarium.modules.plugin.base import (
     PluginContext as RuntimePluginContext,
 )
 from kohakuterrarium.modules.plugin.manager import PluginManager
+from kohakuterrarium.modules.subagent.base import SubAgent
 from kohakuterrarium.modules.subagent.config import (
     ContextUpdateMode,
     OutputTarget,
@@ -63,6 +67,7 @@ from kohakuterrarium.modules.tool.base import (
     ToolContext,
     ToolResult,
 )
+from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.modules.trigger.timer import TimerTrigger
 from kohakuterrarium.modules.user_command.base import (
     BaseUserCommand,
@@ -125,6 +130,51 @@ class RecordingTool(BaseTool):
                 error="recorder failed: deliberate explosion", exit_code=1
             )
         return ToolResult(output=f"recorder saw: {msg}")
+
+
+class _DeepSeekResponse:
+    status_code = 200
+
+    def json(self):
+        return {
+            "output": [
+                {
+                    "type": "web_search_call",
+                    "action": {"type": "search", "query": "kt"},
+                },
+                {
+                    "type": "message",
+                    "content": [
+                        {
+                            "type": "output_text",
+                            "text": "Grounded answer",
+                            "annotations": [
+                                {
+                                    "type": "url_citation",
+                                    "url": "https://example.com/source",
+                                    "title": "Source",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            ]
+        }
+
+
+class _DeepSeekClient:
+    def __init__(self, capture):
+        self.capture = capture
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def post(self, url, **kwargs):
+        self.capture.append((url, kwargs["json"]))
+        return _DeepSeekResponse()
 
 
 class GuardrailPlugin(BasePlugin):
@@ -1444,3 +1494,340 @@ class TestModulesIntegration:
             assert "handled the failure" in last.get_text_content()
         finally:
             await agent.stop()
+
+    async def test_web_search_backend_switch_executes_and_resumes(
+        self, make_agent, monkeypatch, tmp_path
+    ):
+        """Ordinary tool options switch DeepSeek live and persist by session."""
+        capture = []
+        monkeypatch.setattr(web_search, "has_api_key", lambda provider: True)
+        monkeypatch.setattr(web_search, "get_api_key", lambda provider: "ds-secret")
+        monkeypatch.setattr(
+            web_search.httpx,
+            "AsyncClient",
+            lambda **kwargs: _DeepSeekClient(capture),
+        )
+        store = SessionStore(str(tmp_path / "modules.kohakutr"))
+        store.init_meta(
+            session_id="modules",
+            config_type="agent",
+            config_path="test",
+            pwd=str(tmp_path),
+            agents=["modules_agent"],
+        )
+        agent = make_agent(
+            script=[
+                ScriptEntry(
+                    "[/web_search]@@query=kt search\n[web_search/]",
+                    match="search now",
+                ),
+                ScriptEntry("search complete", match="Grounded answer"),
+            ]
+        )
+        tool = WebSearchTool()
+        agent.registry.register_tool(tool)
+        agent.executor.register_tool(tool)
+        agent.attach_session_store(store)
+        command = agent.list_user_commands()["module"]
+
+        changed = await command.execute(
+            "set web_search backend deepseek", agent._user_command_context
+        )
+        assert changed.success
+        assert tool.backend == "deepseek"
+        research = SubAgent(
+            config=RESEARCH_CONFIG,
+            parent_registry=agent.registry,
+            llm=agent.llm,
+            agent_path=tmp_path,
+        )
+        assert research.registry.get_tool("web_search") is tool
+        assert research.registry.get_tool("web_search").backend == "deepseek"
+
+        await agent.start()
+        try:
+            await agent._process_event(create_user_input_event("search now"))
+            assert capture
+            assert capture[0][1]["model"] == "deepseek-v4-flash"
+            assert "ds-secret" not in repr(capture[0][1])
+        finally:
+            await agent.stop()
+
+        search_result = next(
+            event
+            for event in store.get_events("modules_agent")
+            if event["type"] == "tool_result"
+            and event["call_id"].startswith("web_search_")
+        )
+        assert search_result["tool_metadata"]["backend"] == "deepseek"
+        assert search_result["tool_metadata"]["citation_status"] == "verified"
+        assert search_result["tool_metadata"]["annotation_count"] == 1
+        assert search_result["tool_metadata"]["verified_sources"] == [
+            {"title": "Source", "url": "https://example.com/source"}
+        ]
+        assert "ds-secret" not in repr(search_result)
+
+        resumed = make_agent(script=["ok"])
+        resumed_tool = WebSearchTool()
+        resumed.registry.register_tool(resumed_tool)
+        resumed.executor.register_tool(resumed_tool)
+        resumed.attach_session_store(store)
+        assert resumed_tool.backend == "deepseek"
+
+        resumed_command = resumed.list_user_commands()["module"]
+        reset = await resumed_command.execute(
+            "reset web_search", resumed._user_command_context
+        )
+        assert reset.success
+        assert resumed_tool.backend == "duckduckgo"
+        store.close()
+
+    async def test_drive_tools_injected_and_execute_through_engine(
+        self, llm_box, tmp_path
+    ):
+        """tool protocol — a Drive-enabled Terrarium injects the self-service
+        Drive tools onto every creature (and ``group_drive`` onto privileged
+        ones), and executing them drives the real per-graph DriveManager.
+
+        This is the real-Agent + real-engine + injection + execution path the
+        _FakeAgent unit tests can't cover end-to-end (design §9.3).
+        """
+        from kohakuterrarium.modules.tool.base import ToolContext
+        from kohakuterrarium.terrarium.drive.config import (
+            DriveRuntimeConfig,
+            default_registrations,
+        )
+        from kohakuterrarium.terrarium.drive.tools import SELF_SERVICE_TOOL_NAMES
+        from kohakuterrarium.terrarium.engine import Terrarium
+
+        llm_box.set(["ok"] * 8)
+
+        def _cfg(name: str) -> AgentConfig:
+            return AgentConfig(
+                name=name,
+                model="gpt-4",
+                provider="openai",
+                api_key_env="",
+                system_prompt="drive test agent",
+                include_hints_in_prompt=False,
+                agent_path=tmp_path,
+                input=InputConfig(type="none"),
+                output=OutputConfig(type="none"),
+            )
+
+        engine = Terrarium(
+            pwd=str(tmp_path),
+            drive_config=DriveRuntimeConfig(enabled=True),
+            drive_registrations=default_registrations(),
+        )
+        async with engine:
+            root = await engine.add_creature(
+                _cfg("drive_root"), is_privileged=True, start=False
+            )
+            worker = await engine.add_creature(
+                _cfg("drive_worker"), graph=root.graph_id, start=False
+            )
+            root_agent = engine.get_creature(root.creature_id).agent
+            worker_agent = engine.get_creature(worker.creature_id).agent
+
+            # Injection: self-service on both; group_drive only on the privileged.
+            for name in SELF_SERVICE_TOOL_NAMES:
+                assert name in root_agent.registry.list_tools()
+                assert name in worker_agent.registry.list_tools()
+            assert "group_drive" in root_agent.registry.list_tools()
+            assert "group_drive" not in worker_agent.registry.list_tools()
+
+            def _ctx(creature):
+                return ToolContext(
+                    agent_name=creature.name,
+                    creature_id=creature.creature_id,
+                    session=None,
+                    working_dir=tmp_path,
+                    environment=engine._environments[creature.graph_id],
+                )
+
+            # Self-service create is forced caller-owned.
+            self_res = await root_agent.registry.get_tool("drive_create")._execute(
+                {"title": "self drive"}, context=_ctx(root)
+            )
+            assert self_res.error is None, self_res.error
+            assert self_res.metadata["drive"]["owner"] == f"creature:{root.creature_id}"
+            assert self_res.output.startswith("Drive generic-")
+            assert not self_res.output.lstrip().startswith("{")
+
+            # Privileged group_drive creates a graph-owned drive and lists it.
+            grp = root_agent.registry.get_tool("group_drive")
+            created = await grp._execute(
+                {"action": "create", "title": "graph drive", "assignee": worker.name},
+                context=_ctx(root),
+            )
+            assert created.error is None, created.error
+            body = created.metadata["drive"]
+            assert body["scope_type"] == "graph"
+            assert body["assignee"] == worker.creature_id
+
+            listed = await grp._execute({"action": "list"}, context=_ctx(root))
+            assert not created.output.lstrip().startswith("{")
+            ids = {d["drive_id"] for d in listed.metadata["drive"]["drives"]}
+            assert body["drive_id"] in ids
+
+    async def test_goal_plugin_contributes_command_over_drive(self, llm_box, tmp_path):
+        """user_command + plugin protocols — the built-in GoalPlugin contributes
+        ``/goal`` into a creature's live command registry, and the command drives
+        real Goal Drives over the generic Drive service.
+
+        Full workflow: use a plain default Terrarium → verify automatic Goal
+        registration, plugin, command, and tools → ``/goal set`` through the live
+        command → the drive_ready turn settles → ``/goal complete`` → verify the
+        repository → disable the plugin → ``/goal`` disappears while the Drive +
+        registration remain. Only the LLM is scripted."""
+        import asyncio
+
+        from kohakuterrarium.modules.user_command.base import UserCommandContext
+        from kohakuterrarium.terrarium.drive.models import ActorRef, DriveStatus
+        from kohakuterrarium.terrarium.engine import Terrarium
+        from kohakuterrarium.terrarium.service import LocalTerrariumService
+
+        alice = ActorRef("user", "alice")
+
+        llm_box.set(["working on it"] * 16)
+
+        cfg = AgentConfig(
+            name="goal_worker",
+            model="gpt-4",
+            provider="openai",
+            api_key_env="",
+            system_prompt="goal worker",
+            include_hints_in_prompt=False,
+            agent_path=tmp_path,
+            input=InputConfig(type="none"),
+            output=OutputConfig(type="none"),
+        )
+        engine = Terrarium(pwd=str(tmp_path))
+        async with engine:
+            worker = await engine.add_creature(cfg, creature_id="goal_worker")
+            agent = engine.get_creature(worker.creature_id).agent
+            service = LocalTerrariumService(engine)
+
+            assert "goal" in agent.list_user_commands()
+            assert "durable Goal" in agent._controller_config.system_prompt
+            assert {
+                "drive_create",
+                "drive_status",
+                "drive_update",
+                "drive_report",
+                "drive_transition",
+            }.issubset(agent.registry.list_tools())
+            assert {
+                registration["kind"]
+                for registration in await service.list_drive_registrations()
+            } == {
+                "generic",
+                "goal",
+            }
+
+            extra = {
+                "service": service,
+                "creature_id": worker.creature_id,
+                "principal": "user:alice",
+                # Trusted console: graph-authority verbs (/goal set) require the
+                # explicit operator bit now that it defaults off (R1-21).
+                "is_operator": True,
+            }
+            cmd = agent.list_user_commands()["goal"]
+
+            # /goal set through the resolved command object. It immediately
+            # wakes the assigned creature and defaults to continuing autonomy.
+            set_res = await cmd.execute(
+                "set Fix the auth race",
+                UserCommandContext(agent=agent, extra=dict(extra)),
+            )
+            assert set_res.success, set_res.error
+            drives = await service.list_drives(
+                actor=alice,
+                assignee_creature_id=worker.creature_id,
+                kinds=frozenset({"goal"}),
+                is_privileged=True,
+            )
+            assert len(drives) == 1
+            drive_id = drives[0].record.drive_id
+            assert drives[0].record.owner.format() == "user:alice"
+            assert drives[0].record.spec["autonomy"] == "continue_when_ready"
+
+            # The drive_ready delivered and settled as an ordinary turn.
+            for _ in range(200):
+                deliveries = await service.list_drive_deliveries(drive_id)
+                if any(d.state == "acknowledged" for d in deliveries):
+                    break
+                await asyncio.sleep(0.03)
+            deliveries = await service.list_drive_deliveries(drive_id)
+            assert any(d.state in ("admitted", "acknowledged") for d in deliveries), [
+                d.state for d in deliveries
+            ]
+
+            # /goal complete: user-authoritative completion (self_propose).
+            comp = await cmd.execute(
+                f"complete {drive_id}",
+                UserCommandContext(agent=agent, extra=dict(extra)),
+            )
+            assert comp.success, comp.error
+            final = await service.get_drive(drive_id, actor=alice, is_privileged=True)
+            assert final.record.status is DriveStatus.COMPLETED
+
+            # Runtime-driven continuation: a continue_when_ready goal with a
+            # turn budget re-arms itself across settlements (no manual
+            # update/wake) until the budget stops it — and never completes.
+            from kohakuterrarium.terrarium.drive.goal import build_goal_spec
+            from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest
+
+            cont = await service.create_drive(
+                CreateDriveRequest(
+                    kind="goal",
+                    title="Keep the tests green",
+                    scope_type="graph",
+                    scope_id=worker.graph_id,
+                    owner=alice,
+                    owner_scope="actor",
+                    created_by=alice,
+                    spec=build_goal_spec(
+                        "Keep the tests green",
+                        autonomy="continue_when_ready",
+                        budgets={"max_turns": 2},
+                    ),
+                    assignee_creature_id=worker.creature_id,
+                ),
+                graph_id=worker.graph_id,
+                actor=alice,
+                operator=True,
+            )
+            cont_id = cont.record.drive_id
+
+            async def _cont_acked() -> list:
+                deliveries = await service.list_drive_deliveries(cont_id)
+                return [d for d in deliveries if d.state == "acknowledged"]
+
+            for _ in range(300):
+                if len(await _cont_acked()) >= 2:
+                    break
+                await asyncio.sleep(0.03)
+            acked = await _cont_acked()
+            # Exactly the budgeted number of turns; the budget stops the next.
+            assert len(acked) == 2, [
+                d.state for d in await service.list_drive_deliveries(cont_id)
+            ]
+            cont_final = await service.get_drive(
+                cont_id, actor=alice, is_privileged=True
+            )
+            assert cont_final.record.status is DriveStatus.ACTIVE  # never completed
+
+            # Disabling the plugin removes /goal AND its prompt prose together
+            # (R1-23), but leaves the Drive + registration intact.
+            agent.plugins.disable("goal")
+            assert "goal" not in agent.list_user_commands()
+            assert "durable Goal" not in agent._controller_config.system_prompt
+            still = await service.get_drive(drive_id, actor=alice, is_privileged=True)
+            assert still is not None
+            # The goal registration is still enabled: a new goal is creatable.
+            assert any(
+                r["kind"] == "goal" for r in await service.list_drive_registrations()
+            )

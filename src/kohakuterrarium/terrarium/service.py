@@ -24,21 +24,28 @@ DTOs vs live objects:
 - :class:`CreatureInfo` is a frozen, msgpack-serializable snapshot of
   a creature's identity + topology binding. Used for cross-process
   transit and for code that only needs identity/topology data.
-- The :attr:`LocalTerrariumService.engine` escape hatch returns the
-  live :class:`~kohakuterrarium.terrarium.engine.Terrarium` for local
-  callers that need access not on the Protocol (rare; primarily
-  inside Phase 0 before W1 migration).
+- The :attr:`LocalTerrariumService.engine` escape hatch returns the live
+  :class:`~kohakuterrarium.terrarium.engine.Terrarium` for rare local callers
+  that need access not exposed by the Protocol.
 """
 
+import uuid
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
 from kohakuterrarium.core.channel import ChannelMessage as _ChannelMessage
-from kohakuterrarium.terrarium.creature_host import Creature
+from kohakuterrarium.session.raw_history import UserMessageSelector
+from kohakuterrarium.terrarium.drive.service import DriveServiceMixin
+from kohakuterrarium.terrarium.drive.service_protocol import DriveServiceProtocol
+from kohakuterrarium.terrarium.local_command_service import LocalCommandServiceMixin
+from kohakuterrarium.terrarium.service_dto import (
+    BranchMutationResult,
+    CreatureInfo,
+    _channel_message_to_dict,
+    creature_to_info,
+)
 from kohakuterrarium.terrarium.creature_ops import (
     agent_env as _agent_env,
-    agent_execute_command as _agent_execute_command,
     agent_get_module_options as _agent_get_module_options,
     agent_get_native_tool_options as _agent_get_native_tool_options,
     agent_list_modules as _agent_list_modules,
@@ -55,11 +62,10 @@ from kohakuterrarium.terrarium.creature_ops import (
     agent_triggers as _agent_triggers,
     agent_working_dir as _agent_working_dir,
     attach_policies_for as _attach_policies_for,
-    branch_status_payload as _branch_status,
     build_runtime_graph_snapshot_for as _build_runtime_graph_snapshot_for,
     chat_branches_for as _chat_branches_for,
     chat_history_for as _chat_history_for,
-    normalize_command_args as _normalize_command_args,
+    normalize_command_args,
     session_attach_policies_for as _session_attach_policies_for,
     wire_creature_on_engine as _wire_creature_on_engine,
 )
@@ -70,98 +76,37 @@ from kohakuterrarium.terrarium.events import (
     EngineEvent,
     EventFilter,
 )
+from kohakuterrarium.terrarium.graph_identity import resolve_local_graph_target
 from kohakuterrarium.terrarium.topology import (
     ChannelInfo,
     GraphTopology,
     TopologyDelta,
 )
 
-
-@dataclass(frozen=True)
-class CreatureInfo:
-    """Identity + topology snapshot of a single creature.
-
-    Serializable; safe to send over Lab. The live
-    :class:`~kohakuterrarium.terrarium.creature_host.Creature` object
-    is *not* serializable (holds Agent, channels, etc.), so the
-    Protocol returns this DTO instead.
-    """
-
-    creature_id: str
-    name: str
-    graph_id: str
-    is_running: bool
-    is_privileged: bool
-    parent_creature_id: str | None
-    listen_channels: tuple[str, ...]
-    send_channels: tuple[str, ...]
-    # Resolved LLM model + canonical id (B3/B4: empty == deferred).
-    model: str = ""
-    llm_name: str = ""
+_normalize_command_args = normalize_command_args
 
 
-def _channel_message_to_dict(m: Any) -> dict[str, Any]:
-    """Serialize a :class:`ChannelMessage` to a JSON-friendly dict.
-
-    Used by ``channel_history`` so the API surface returns the same
-    shape on both local and remote service paths.  ``timestamp`` is
-    ISO-8601 (or empty when the field isn't a datetime); ``content``
-    is passed through verbatim (string or list-of-parts).
-    """
-    ts = getattr(m, "timestamp", None)
-    ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts or "")
+def _completed_branch_result(
+    agent: Any, request_id: str | None
+) -> BranchMutationResult:
+    parent_path = getattr(agent, "_parent_branch_path", ()) or ()
     return {
-        "message_id": getattr(m, "message_id", ""),
-        "sender": getattr(m, "sender", ""),
-        "sender_id": getattr(m, "sender_id", None),
-        "content": getattr(m, "content", ""),
-        "channel": getattr(m, "channel", None),
-        "timestamp": ts_str,
+        "status": "completed",
+        "request_id": request_id or uuid.uuid4().hex,
+        "turn_index": int(getattr(agent, "_turn_index", 0)),
+        "branch_id": int(getattr(agent, "_branch_id", 0)),
+        "parent_branch_path": [list(pair) for pair in parent_path],
     }
 
 
-def creature_to_info(creature: Creature) -> CreatureInfo:
-    """Build a :class:`CreatureInfo` snapshot from a live Creature."""
-    agent = getattr(creature, "agent", None)
-    llm = getattr(agent, "llm", None) if agent is not None else None
-    model = (
-        getattr(llm, "model", "")
-        or getattr(getattr(llm, "config", None), "model", "")
-        or (getattr(agent, "config", None) and getattr(agent.config, "model", ""))
-        or ""
-    )
-    # Canonical "provider/name" — falls back to raw model so the modal
-    # never shows "No model" when one IS bound (B3/B4).
-    llm_name = ""
-    get_ident = getattr(agent, "llm_identifier", None) if agent is not None else None
-    if callable(get_ident):
-        try:
-            llm_name = get_ident() or ""
-        except Exception:
-            pass
-    llm_name = llm_name or str(model or "")
-    return CreatureInfo(
-        creature_id=creature.creature_id,
-        name=creature.name,
-        graph_id=creature.graph_id,
-        is_running=creature.is_running,
-        is_privileged=creature.is_privileged,
-        parent_creature_id=creature.parent_creature_id,
-        listen_channels=tuple(creature.listen_channels),
-        send_channels=tuple(creature.send_channels),
-        model=str(model or ""),
-        llm_name=str(llm_name or ""),
-    )
-
-
 @runtime_checkable
-class TerrariumService(Protocol):
+class TerrariumService(DriveServiceProtocol, Protocol):
     """Operations Studio needs from a terrarium runtime.
 
     Method semantics match the underlying
     :class:`~kohakuterrarium.terrarium.engine.Terrarium` engine
     exactly; an implementation that diverges from engine behavior is
-    a bug.
+    a bug. The Drive surface comes from ``DriveServiceProtocol``.
     """
 
     @property
@@ -224,7 +169,7 @@ class TerrariumService(Protocol):
         ...
 
     async def remove_creature(self, creature_id: str) -> None: ...
-    async def remove_graph(self, graph_id: str) -> None: ...
+
     async def start_creature(self, creature_id: str) -> None: ...
 
     async def stop_creature(self, creature_id: str) -> None: ...
@@ -311,7 +256,7 @@ class TerrariumService(Protocol):
         """Inject ``message`` and stream the agent's text response."""
         ...
 
-    # === Per-creature control (per ``api-lab-design.md`` §2) ===
+    # === Per-creature control ===
 
     async def interrupt(self, creature_id: str) -> None:
         """Interrupt the creature's current controller turn.
@@ -350,7 +295,9 @@ class TerrariumService(Protocol):
         *,
         turn_index: int | None = None,
         branch_view: dict[int, int] | None = None,
-    ) -> dict[str, Any]:
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> BranchMutationResult:
         """Regenerate an assistant response (whole tail by default).
 
         ``turn_index`` opens a new branch under a specific turn instead
@@ -369,7 +316,9 @@ class TerrariumService(Protocol):
         turn_index: int | None = None,
         user_position: int | None = None,
         branch_view: dict[int, int] | None = None,
-    ) -> bool | dict[str, Any]:
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> BranchMutationResult:
         """Edit the user message at ``msg_idx`` and re-run from there."""
         ...
 
@@ -453,11 +402,16 @@ class TerrariumService(Protocol):
         module_name: str,
     ) -> dict[str, Any]: ...
 
+    async def command_inventory(self, creature_id: str) -> dict[str, Any]: ...
+
     async def execute_command(
         self,
         creature_id: str,
         command: str,
-        args: dict[str, Any] | None = None,
+        args: str | dict[str, Any] | None = None,
+        *,
+        principal: str = "user:local",
+        is_operator: bool = False,
     ) -> dict[str, Any]: ...
 
     async def wire_creature(
@@ -516,7 +470,7 @@ class TerrariumService(Protocol):
     ) -> AsyncIterator[EngineEvent]: ...
 
 
-class LocalTerrariumService:
+class LocalTerrariumService(LocalCommandServiceMixin, DriveServiceMixin):
     """Direct in-process implementation backed by a :class:`Terrarium`.
 
     Every method delegates to the underlying engine with at most a
@@ -624,9 +578,6 @@ class LocalTerrariumService:
 
     async def remove_creature(self, creature_id: str) -> None:
         await self._engine.remove_creature(creature_id)
-
-    async def remove_graph(self, graph_id: str) -> None:
-        await self._engine.remove_graph(graph_id)
 
     async def start_creature(self, creature_id: str) -> None:
         await self._engine.start(creature_id)
@@ -775,12 +726,19 @@ class LocalTerrariumService:
         *,
         turn_index: int | None = None,
         branch_view: dict[int, int] | None = None,
-    ) -> dict[str, Any]:
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> BranchMutationResult:
         agent = self._agent(creature_id)
-        await agent.regenerate_last_response(
-            turn_index=turn_index, branch_view=branch_view
-        )
-        return _branch_status(agent, "regenerating")
+        kwargs = {
+            "turn_index": turn_index,
+            "branch_view": branch_view,
+            "request_id": request_id,
+        }
+        if target is not None:
+            kwargs["target"] = target
+        await agent.regenerate_last_response(**kwargs)
+        return _completed_branch_result(agent, request_id)
 
     async def edit_message(
         self,
@@ -791,16 +749,22 @@ class LocalTerrariumService:
         turn_index: int | None = None,
         user_position: int | None = None,
         branch_view: dict[int, int] | None = None,
-    ) -> bool | dict[str, Any]:
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> BranchMutationResult:
         agent = self._agent(creature_id)
-        ok = await agent.edit_and_rerun(
-            msg_idx,
-            content,
-            turn_index=turn_index,
-            user_position=user_position,
-            branch_view=branch_view,
-        )
-        return _branch_status(agent, "edited") if ok else False
+        kwargs = {
+            "turn_index": turn_index,
+            "user_position": user_position,
+            "branch_view": branch_view,
+            "request_id": request_id,
+        }
+        if target is not None:
+            kwargs["target"] = target
+        ok = await agent.edit_and_rerun(msg_idx, content, **kwargs)
+        if not ok:
+            raise ValueError(f"message {msg_idx} cannot be edited")
+        return _completed_branch_result(agent, request_id)
 
     async def rewind(self, creature_id: str, msg_idx: int) -> None:
         await self._agent(creature_id).rewind_to(msg_idx)
@@ -849,9 +813,9 @@ class LocalTerrariumService:
     async def switch_model(self, creature_id: str, model: str) -> str:
         agent = self._agent(creature_id)
         if hasattr(agent, "switch_model"):
-            resolved = agent.switch_model(model)
-            return str(resolved or model)
-        agent.config.model = model
+            agent.switch_model(model)
+        else:
+            agent.config.model = model
         return model
 
     async def list_plugins(self, creature_id: str) -> list[dict[str, Any]]:
@@ -907,16 +871,6 @@ class LocalTerrariumService:
             self._agent(creature_id), module_type, module_name
         )
 
-    async def execute_command(
-        self,
-        creature_id: str,
-        command: str,
-        args: str | dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        return await _agent_execute_command(
-            self._agent(creature_id), command, _normalize_command_args(args)
-        )
-
     async def wire_creature(
         self,
         graph_id: str,
@@ -934,6 +888,7 @@ class LocalTerrariumService:
             direction,
             enabled=enabled,
         )
+        await self._engine.checkpoint_graph(graph_id)
 
     async def list_output_wiring(self, creature_id: str) -> list[dict[str, Any]]:
         try:
@@ -947,7 +902,21 @@ class LocalTerrariumService:
         creature_id: str,
         target: str | dict[str, Any],
     ) -> dict[str, Any]:
-        edge_id = await self._engine.wire_output(creature_id, target)
+        if isinstance(target, dict):
+            target_name = str(target.get("to", ""))
+            canonical = dict(target)
+        else:
+            target_name = str(target)
+            canonical = {"to": target_name}
+        if target_name != "root":
+            resolved = resolve_local_graph_target(
+                self._engine._topology,
+                self._engine._creatures,
+                caller_id=creature_id,
+                target=target_name,
+            )
+            canonical["to"] = resolved.target_id
+        edge_id = await self._engine.wire_output(creature_id, canonical)
         return {"edge_id": str(edge_id)}
 
     async def unwire_output(self, creature_id: str, edge_id: str) -> bool:

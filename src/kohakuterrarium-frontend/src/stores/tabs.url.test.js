@@ -11,9 +11,7 @@ describe("tabsUrl — parseTabId", () => {
   it("parses singletons", () => {
     expect(parseTabId("dashboard")).toEqual({ kind: "dashboard", id: "dashboard" })
     expect(parseTabId("catalog")).toEqual({ kind: "catalog", id: "catalog" })
-    expect(parseTabId("extensions")).toEqual({ kind: "extensions", id: "extensions" })
     expect(parseTabId("settings")).toEqual({ kind: "settings", id: "settings" })
-    expect(parseTabId("graph-editor")).toEqual({ kind: "graph-editor", id: "graph-editor" })
   })
 
   it("parses attach", () => {
@@ -167,9 +165,7 @@ describe("tabsUrl — round-trip", () => {
         entityKind: "creature",
       },
       { kind: "catalog", id: "catalog" },
-      { kind: "extensions", id: "extensions" },
       { kind: "settings", id: "settings" },
-      { kind: "graph-editor", id: "graph-editor" },
       {
         kind: "code-editor",
         id: "code-editor:src-foo",
@@ -179,7 +175,7 @@ describe("tabsUrl — round-trip", () => {
     const q = encodeTabsToQuery(tabs, "inspect:alice")
     const params = Object.fromEntries(new URLSearchParams(q))
     const { tabs: out, activeIndex } = decodeTabsFromQuery(params)
-    expect(out).toHaveLength(10)
+    expect(out).toHaveLength(8)
     expect(out.map((t) => t.kind)).toEqual([
       "dashboard",
       "attach",
@@ -187,9 +183,7 @@ describe("tabsUrl — round-trip", () => {
       "session-viewer",
       "studio-editor",
       "catalog",
-      "extensions",
       "settings",
-      "graph-editor",
       "code-editor",
     ])
     expect(activeIndex).toBe(2)

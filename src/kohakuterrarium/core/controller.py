@@ -1,14 +1,4 @@
-"""
-Controller - Main LLM conversation loop with event queue.
-
-The controller orchestrates agent operation:
-- Receives TriggerEvents (input, tool completion, etc.)
-- Maintains conversation context
-- Runs LLM and parses output
-- Dispatches tool calls and sub-agents
-
-Supports multimodal content (text + images).
-"""
+"""LLM conversation orchestration for queued, multimodal agent events."""
 
 import asyncio
 import base64
@@ -35,12 +25,15 @@ from kohakuterrarium.core.controller_plugins import (
     run_post_llm_call_chain,
 )
 from kohakuterrarium.core.conversation import Conversation, ConversationConfig
-from kohakuterrarium.core.events import TriggerEvent
+from kohakuterrarium.core.conversation_elide import (
+    TOOL_FEEDBACK_KIND,
+)
+from kohakuterrarium.core.events import EventType, TriggerEvent
+from kohakuterrarium.core.controller_context import format_events_for_context
 from kohakuterrarium.core.executor import Executor
 from kohakuterrarium.core.job import JobResult, JobStatus, JobStore
 from kohakuterrarium.core.registry import Registry
-from kohakuterrarium.core.tool_output import materialize_image_part, render_content_text
-from kohakuterrarium.llm.artifact_resolve import resolve_message_image_urls
+from kohakuterrarium.core.tool_output import materialize_image_part
 from kohakuterrarium.llm.base import LLMProvider
 from kohakuterrarium.llm.message import ContentPart, FilePart, ImagePart, TextPart
 from kohakuterrarium.llm.tools import build_provider_native_tools, build_tool_schemas
@@ -78,43 +71,31 @@ def _merge_text_and_parts(
 
 @dataclass
 class ControllerConfig:
-    """
-    Configuration for the controller.
-
-    Attributes:
-        system_prompt: Base system prompt
-        include_job_status: Include job status in context
-        include_tools_list: Include tool list in system prompt
-        batch_stackable_events: Batch stackable events together
-        max_messages: Maximum number of messages to keep
-        ephemeral: If True, clear conversation after each interaction (keep system only)
-        known_outputs: Set of known output target names (e.g., "discord")
-        tool_format: Tool calling format — "bracket", "xml", "native", or None
-    """
+    """Configure controller context, batching, retention, and tool parsing."""
 
     system_prompt: str = "You are a helpful assistant."
     include_job_status: bool = True
     include_tools_list: bool = True
+    # Elide stale tool results only when the prompt is near the compact
+    # threshold; with ample context the controller keeps full results so it
+    # can reference what it read without re-running tools.
+    elide_tool_results: bool = True
     batch_stackable_events: bool = True
-    max_messages: int = 50  # Keep last 50 messages
-    ephemeral: bool = False  # Clear after each interaction (for group chat bots)
-    known_outputs: set[str] = field(default_factory=set)  # Output targets for parser
-    tool_format: str | None = None  # "bracket", "xml", "native", or None (auto)
-    # Pre-LLM sanitiser (mirrors ``AgentConfig.sanitize_orphan_tool_calls``).
-    # Threads through to ``ConversationConfig`` so the wire payload drops
-    # compact-induced orphan tool_call / tool-result fragments.
+    max_messages: int = 50
+    ephemeral: bool = False
+    known_outputs: set[str] = field(default_factory=set)
+    tool_format: str | None = None
+    # Compaction can separate native calls from results; providers must not see
+    # either half of such an orphaned exchange.
     sanitize_orphan_tool_calls: bool = True
 
 
 @dataclass
 class ControllerContext:
-    """Context passed to commands/handlers.
+    """Expose controller runtime state to commands and handlers.
 
-    ``skills_registry`` lets built-in skill/info handlers reach the runtime
-    :class:`SkillRegistry`. ``agent_path`` is the creature's config folder
-    — ``InfoCommand`` consults ``<agent_path>/prompts/tools/<name>.md`` as
-    its documented priority-#1 doc override. Both are populated by
-    ``bootstrap/agent_init`` after the controller is built.
+    The bootstrap layer supplies ``skills_registry`` and ``agent_path`` after
+    construction because command documentation depends on the fully built agent.
     """
 
     controller: "Controller"
@@ -143,29 +124,7 @@ class ControllerContext:
 
 
 class Controller:
-    """
-    Main controller for agent operation.
-
-    Manages:
-    - Event queue for incoming triggers
-    - Conversation history
-    - LLM interaction with streaming
-    - Tool/sub-agent dispatch
-    - Command execution
-
-    Usage:
-        controller = Controller(llm_provider, config)
-
-        # Push events
-        await controller.push_event(trigger_event)
-
-        # Run controller loop
-        async for parse_event in controller.run_once():
-            if isinstance(parse_event, TextEvent):
-                print(parse_event.text, end="")
-            elif isinstance(parse_event, ToolCallEvent):
-                handle_tool_call(parse_event)
-    """
+    """Run queued events through an LLM and dispatch parsed actions."""
 
     def __init__(
         self,
@@ -174,15 +133,7 @@ class Controller:
         executor: Executor | None = None,
         registry: Registry | None = None,
     ):
-        """
-        Initialize controller.
-
-        Args:
-            llm: LLM provider for chat
-            config: Controller configuration
-            executor: Tool executor (creates one if None)
-            registry: Module registry (creates one if None)
-        """
+        """Initialize the controller with optional shared execution state."""
         self.llm = llm
         self.config = config or ControllerConfig()
         self.executor = executor
@@ -199,36 +150,31 @@ class Controller:
         # Token usage tracking
         self._last_usage: dict[str, int] = {}
 
-        # Session store for artifact persistence. Attached by the
-        # parent agent after construction via ``attach_session_store``
-        # so the controller can write generated images (and any future
-        # binary artifact) to disk alongside the session file.
+        # The parent agent attaches this after construction so generated binary
+        # content shares the graph's session lifecycle.
         self.session_store: Any = None
 
         # Event queue
         self._event_queue: asyncio.Queue[TriggerEvent] = asyncio.Queue()
         self._pending_events: list[TriggerEvent] = []
 
-        # Stream parser (config built lazily from registry)
+        # Parser state is rebuilt lazily because tools and sub-agents may be
+        # registered after controller construction.
         self._parser_config: ParserConfig | None = None
         self._parser: StreamParser | None = None
 
         # Interrupt flag: checked during LLM streaming
         self._interrupted = False
 
-        # Plugin manager (set by agent after creation, None = no overhead)
+        # The agent injects optional collaborators after all modules are built.
         self.plugins: Any = None
 
-        # Output router (set by agent after creation). Used to emit
-        # ``assistant_message_edited`` activity events when a plugin's
-        # post_llm_call rewrites the response.
+        # Post-LLM rewrites use the same router as streamed output so attached
+        # consumers observe a coherent assistant turn.
         self.output_router: Any = None
 
-        # Messages queued by plugins via
-        # ``PluginContext.inject_message_before_llm``. Drained right
-        # before the ``pre_llm_call`` hooks run on the next LLM round,
-        # so every plugin sees the injected messages in its ``messages``
-        # argument.
+        # Injections remain pending until the next round so every pre-LLM hook
+        # receives the same augmented message list.
         self._pending_injections: list[dict] = []
 
         # Job store (shared with executor if provided)
@@ -256,8 +202,7 @@ class Controller:
         self._setup_system_prompt()
 
     def _get_parser(self) -> StreamParser:
-        """Get parser with current registry tools, sub-agents, and outputs."""
-        # Build config from current registry state
+        """Build a parser from the registry's current callable surface."""
         known_tools = set(self.registry.list_tools())
         known_subagents = set(self.registry.list_subagents())
 
@@ -357,63 +302,7 @@ class Controller:
     def _format_events_for_context(
         self, events: list[TriggerEvent]
     ) -> "str | list[ContentPart]":
-        """
-        Format events as user message content.
-
-        Returns multimodal content if any event has images.
-        """
-        text_parts: list[str] = []
-        image_parts: list[ImagePart] = []
-        file_parts: list[FilePart] = []
-
-        def append_multimodal(prefix: str, parts: list[ContentPart]) -> None:
-            part_text = render_content_text(parts)
-            text_parts.append(f"{prefix}\n{part_text}" if part_text else prefix)
-            for part in parts:
-                if isinstance(part, ImagePart):
-                    image_parts.append(part)
-                elif isinstance(part, FilePart):
-                    file_parts.append(part)
-
-        for event in events:
-            if event.type == "user_input":
-                if isinstance(event.content, list):
-                    for part in event.content:
-                        if isinstance(part, TextPart):
-                            text_parts.append(part.text)
-                        elif isinstance(part, ImagePart):
-                            image_parts.append(part)
-                        elif isinstance(part, FilePart):
-                            file_parts.append(part)
-                elif isinstance(event.content, str):
-                    text_parts.append(event.content)
-            elif event.type == "tool_complete":
-                prefix = f"[Tool {event.job_id} completed]"
-                if isinstance(event.content, list):
-                    append_multimodal(prefix, event.content)
-                else:
-                    text_parts.append(f"{prefix}\n{event.get_text_content()}")
-            elif event.type == "subagent_output":
-                content_text = event.get_text_content()
-                text_parts.append(f"[Sub-agent {event.job_id} output]\n{content_text}")
-            elif event.prompt_override:
-                if isinstance(event.content, list):
-                    append_multimodal(event.prompt_override, event.content)
-                else:
-                    text_parts.append(event.prompt_override)
-            else:
-                content_text = event.get_text_content()
-                text_parts.append(f"[{event.type}] {content_text}")
-
-        combined_text = "\n\n".join(text_parts)
-
-        if image_parts or file_parts:
-            result: list[ContentPart] = [TextPart(text=combined_text)]
-            result.extend(image_parts)
-            result.extend(file_parts)
-            return result
-
-        return combined_text
+        return format_events_for_context(events)
 
     def _build_turn_context(
         self, events: list[TriggerEvent]
@@ -494,9 +383,8 @@ class Controller:
 
         self._log_token_usage()
 
-        # Structured assistant parts — e.g. images from a provider-
-        # native image-generation tool. Persist them, rewrite URLs,
-        # and emit a StreamEvent per image so the UI can render live.
+        # Materialize binary output before recording it so the conversation
+        # remains small and later readers use stable session URLs.
         structured_parts = self._collect_structured_assistant_parts()
         for part in structured_parts:
             if isinstance(part, ImagePart):
@@ -513,8 +401,8 @@ class Controller:
             self.llm.last_tool_calls if hasattr(self.llm, "last_tool_calls") else []
         )
 
-        # Stateful-chain reasoning fields (DeepSeek / MiMo / Qwen / …)
-        # round-trip back via extra_fields regardless of tool-call state.
+        # Some providers require opaque reasoning state to round-trip on the
+        # next request, including completions that contain no tool call.
         extra_fields = getattr(self.llm, "last_assistant_extra_fields", {}) or {}
         final_content = _merge_text_and_parts(assistant_content, structured_parts)
         append_kwargs: dict = {"extra_fields": extra_fields}
@@ -546,21 +434,11 @@ class Controller:
 
         self.conversation.append("assistant", final_content, **append_kwargs)
 
-    # ------------------------------------------------------------------
-    # Structured assistant content (images etc. from provider-native tools)
-    # ------------------------------------------------------------------
-
     def _collect_structured_assistant_parts(self) -> list[ContentPart]:
-        """Pull structured parts the provider captured during the turn.
+        """Materialize structured content captured by the provider.
 
-        Providers surface these via
-        ``last_assistant_content_parts``. For every ``ImagePart`` whose
-        URL is a ``data:image/…`` payload, we decode the bytes, write
-        them into the session's artifacts directory, and rewrite the
-        URL to a served ``/api/sessions/{id}/artifacts/…`` path so the
-        conversation JSON stays small and the frontend can stream the
-        image lazily. Providers without structured output return
-        ``None`` here and this is a no-op.
+        Inline images move into session artifacts and receive stable served URLs;
+        providers without structured output produce an empty list.
         """
         source = getattr(self.llm, "last_assistant_content_parts", None)
         if source is None:
@@ -583,11 +461,10 @@ class Controller:
         return materialized
 
     def _persist_image_part(self, part: ImagePart) -> ImagePart:
-        """Persist a data-URL image part to disk, return a rewritten part.
+        """Persist a data-URL image and return a session-backed part.
 
-        Falls back to the original ImagePart (with the data URL) if no
-        session store is attached or the URL isn't a recognised data
-        URL — keeping behavior correct in unit tests / ephemeral runs.
+        Without a session store, or for an unrecognized URL, the original part
+        is retained so ephemeral agents do not lose generated content.
         """
         rewritten = materialize_image_part(
             part,
@@ -850,14 +727,11 @@ class Controller:
         logger.debug("Processing events", count=len(events))
 
         user_content, combined_text = self._build_turn_context(events)
-        # Skip user append: native-mode tool round-trips, and pure regen.
-        # A pure-image/file input has empty combined_text but still
-        # carries meaningful multimodal payload — don't skip it.
-        has_multimodal = isinstance(user_content, list) and any(
-            isinstance(p, (ImagePart, FilePart)) for p in user_content
-        )
+        # Tool continuations and unedited regeneration reuse existing context;
+        # appending an empty user message would corrupt provider turn ordering.
         skip_empty = (
-            self._is_native_mode and not combined_text.strip() and not has_multimodal
+            not combined_text.strip()
+            and (self._is_native_mode or all(e.type == "tool_complete" for e in events))
         ) or any(
             e.type == "user_input"
             and e.context.get("rerun")
@@ -865,15 +739,19 @@ class Controller:
             for e in events
         )
         if not skip_empty:
-            self.conversation.append("user", user_content)
+            msg = self.conversation.append("user", user_content)
+            # Pure tool-feedback rounds are tagged so their results can
+            # be elided once the round is no longer the latest; a batch
+            # carrying any real user input is never tagged (and never
+            # elided).
+            if events and all(e.type == EventType.TOOL_COMPLETE for e in events):
+                msg.metadata["kind"] = TOOL_FEEDBACK_KIND
 
         messages = self.conversation.to_messages()
         messages = await self._resolve_message_files(messages)
 
-        # Drain any messages queued by plugins via
-        # ``PluginContext.inject_message_before_llm``. These are
-        # inserted after the system prompt so they appear as early
-        # context — and they're visible to ``pre_llm_call`` hooks.
+        # Insert after all system messages so plugin context is early while
+        # remaining visible to every pre-LLM hook.
         if self._pending_injections:
             injected = self._pending_injections
             self._pending_injections = []
@@ -897,7 +775,6 @@ class Controller:
                 model=getattr(self.llm, "model", ""),
                 tools=self._get_native_tool_schemas() if self._is_native_mode else None,
             )
-        messages = resolve_message_image_urls(messages, self.session_store)
 
         logger.info("Generating response...")
 
@@ -927,16 +804,15 @@ class Controller:
                 ),
             )
 
-        # Plugin post_llm_call chain-with-return (cluster B.3). Logic
-        # lives in ``controller_plugins.py`` to keep this file under
-        # the 1000-line hard cap.
+        # Post hooks run after conversation append because rewrites must update
+        # the canonical assistant message rather than only the streamed copy.
         if self.plugins:
             await run_post_llm_call_chain(self, messages)
 
     def register_command(
         self, command_name: str, cmd: Command, override: bool = False
     ) -> None:
-        """Register a ``##name##`` controller command (cluster C.1)."""
+        """Register a ``##name##`` controller command."""
         register_controller_command(self, command_name, cmd, override=override)
 
     async def _handle_command(self, event: CommandEvent) -> CommandResult:
@@ -985,7 +861,14 @@ class Controller:
         on_tool: Any | None = None,
         on_subagent: Any | None = None,
     ) -> None:
-        """Run the controller loop and dispatch optional event callbacks."""
+        """
+        Run continuous controller loop.
+
+        Args:
+            on_text: Callback for text events
+            on_tool: Callback for tool call events
+            on_subagent: Callback for sub-agent call events
+        """
         while True:
             async for event in self.run_once():
                 if isinstance(event, TextEvent) and on_text:

@@ -313,16 +313,6 @@ class TestResolveControllerLlm:
         policy["max_attempts"] = 99
         assert profile.retry_policy["max_attempts"] == 5
 
-    def test_auth_mode_override_applied(self):
-        profile = resolve_controller_llm({"llm": "openai/gpt-5.4", "auth_mode": "none"})
-        assert profile.auth_mode == "none"
-
-    def test_transport_auth_mode_hint_does_not_override_backend_auth(self):
-        profile = resolve_controller_llm(
-            {"llm": "anthropic/claude-opus-4.7", "auth_mode": "anthropic"}
-        )
-        assert profile.auth_mode == "api_key"
-
     def test_reasoning_effort_override_applied(self):
         profile = resolve_controller_llm(
             {"llm": "codex/gpt-5.4", "reasoning_effort": "low"}
@@ -476,30 +466,6 @@ class TestIsAvailable:
         )
         save_api_key("myresp", "sk-resp")
         assert _is_available("myresp") is True
-
-    def test_custom_codex_missing_base_url_env_is_not_oauth_available(
-        self, monkeypatch
-    ):
-        from kohakuterrarium.llm.api_keys import save_api_key
-        from kohakuterrarium.llm.backends import save_yaml_store
-
-        monkeypatch.delenv("KT_CODEX_ENDPOINT", raising=False)
-        monkeypatch.setattr(
-            CodexTokens, "load", classmethod(lambda cls, path=None: object())
-        )
-        save_yaml_store(
-            {
-                "backends": {
-                    "myresp": {
-                        "backend_type": "codex",
-                        "base_url": "${KT_CODEX_ENDPOINT}",
-                        "api_key_env": "MYRESP_KEY",
-                    }
-                }
-            }
-        )
-        save_api_key("myresp", "sk-resp")
-        assert _is_available("myresp") is False
 
     def test_provider_available_with_stored_key(self):
         from kohakuterrarium.llm.api_keys import save_api_key
@@ -683,20 +649,6 @@ class TestLoadProfilesAndListAll:
         defaults = [e for e in entries if e["is_default"]]
         assert len(defaults) == 1
         assert (defaults[0]["provider"], defaults[0]["name"]) == ("codex", "gpt-5.4")
-
-    def test_list_all_merges_partial_default_variations_with_inferred_values(self):
-        set_default_model("codex/gpt-5.5@speed=fast")
-
-        entry = next(
-            item
-            for item in list_all()
-            if item["provider"] == "codex" and item["name"] == "gpt-5.5"
-        )
-
-        assert entry["selected_variations"] == {
-            "reasoning": "xhigh",
-            "speed": "fast",
-        }
 
     def test_list_all_user_preset_overrides_builtin_pair(self):
         # a user preset at (codex, gpt-5.4) replaces the builtin entry

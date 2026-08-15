@@ -9,10 +9,8 @@ listens to, a :class:`ChannelTrigger` is added to its
 Supports both static wiring (declared at recipe-load time) and live
 hot-plug (creatures connecting after they're already running).
 
-The ``connect_creatures`` / ``disconnect_creatures`` helpers below are
-the bodies of ``Terrarium.connect`` / ``Terrarium.disconnect``;
-they're kept here to keep ``engine.py`` under the 600-line cap and
-because every line of logic in them is channel-related.
+The engine delegates channel connection behavior to these helpers so topology
+mutation and live channel injection remain coordinated.
 """
 
 import asyncio
@@ -25,11 +23,15 @@ import kohakuterrarium.terrarium.session_coord as _session_coord
 import kohakuterrarium.terrarium.topology as _topo
 from kohakuterrarium.core.channel import ChannelRegistry
 from kohakuterrarium.core.environment import Environment
+from kohakuterrarium.errors import SessionNotResumableError
 from kohakuterrarium.modules.trigger.channel import ChannelTrigger
 from kohakuterrarium.terrarium.events import (
     ConnectionResult,
     EngineEvent,
     EventKind,
+)
+from kohakuterrarium.terrarium.graph_identity_engine import (
+    resolve_and_guard_connect,
 )
 from kohakuterrarium.terrarium.topology import ChannelInfo
 from kohakuterrarium.utils.logging import get_logger
@@ -47,6 +49,18 @@ logger = get_logger(__name__)
 # read it via ``ToolContext.environment.get(TERRARIUM_ENGINE_KEY)`` to
 # resolve the engine without a global singleton.
 TERRARIUM_ENGINE_KEY = "terrarium_engine"
+
+# Environment registration key for the Drive runtime handle. Registered
+# only on a Drive-enabled engine's graph environments; the self-service
+# Drive tools read it via ``ToolContext.environment.get(DRIVE_SERVICE_KEY)``
+# to reach the DriveManager (a disabled engine never registers it, so the
+# tools fail closed there).
+DRIVE_SERVICE_KEY = "drive_service"
+
+
+def register_drive_service(env: "Environment", service: Any) -> None:
+    """Register the Drive runtime handle on a graph environment (enabled only)."""
+    env.register(DRIVE_SERVICE_KEY, service)
 
 
 def register_channel_in_environment(
@@ -369,6 +383,23 @@ async def connect_creatures(
     rid = engine._resolve_creature_id(receiver)
     sender_creature = engine.get_creature(sid)
     receiver_creature = engine.get_creature(rid)
+    sender_gid = engine._topology.creature_to_graph[sid]
+    receiver_gid = engine._topology.creature_to_graph[rid]
+    if sender_gid != receiver_gid and any(
+        graph_id in engine._session_stores for graph_id in (sender_gid, receiver_gid)
+    ):
+        names = [
+            engine._creatures[cid].name
+            for graph_id in (sender_gid, receiver_gid)
+            for cid in engine._topology.graphs[graph_id].creature_ids
+            if cid in engine._creatures
+        ]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise SessionNotResumableError(
+                "Cannot merge persisted graphs with duplicate creature names: "
+                + ", ".join(duplicates)
+            )
 
     channel_name, delta = _topo.connect(engine._topology, sid, rid, channel=channel)
     if delta.kind == "merge":
@@ -467,6 +498,21 @@ async def ensure_same_graph(
     b_gid = engine._topology.creature_to_graph[rid]
     if a_gid == b_gid:
         return a_gid
+    persisted = any(graph_id in engine._session_stores for graph_id in (a_gid, b_gid))
+    if persisted:
+        names = [
+            engine._creatures[cid].name
+            for graph_id in (a_gid, b_gid)
+            for cid in engine._topology.graphs[graph_id].creature_ids
+            if cid in engine._creatures
+        ]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise SessionNotResumableError(
+                "Cannot merge persisted graphs with duplicate creature names: "
+                + ", ".join(duplicates)
+            )
+    resolve_and_guard_connect(engine, a, b)
     delta = _topo._merge_graphs(engine._topology, a_gid, b_gid)
     keep_gid = delta.new_graph_ids[0]
     drop_gids = [g for g in delta.old_graph_ids if g != keep_gid]
@@ -479,12 +525,25 @@ async def ensure_same_graph(
                 cid, creature.graph_id
             )
     _session_coord.apply_merge(engine, delta)
+    checkpoint = getattr(engine, "checkpoint_graph", None)
+    if checkpoint is not None:
+        await checkpoint(keep_gid)
     # Promote the surviving session's meta kind from "creature" to
     # "terrarium" when the merge produced a multi-creature graph so
     # the v2 rail (which splits the listing by kind) stops bouncing
     # between agentAPI.list and terrariumAPI.list as snapshots roll in.
     _promote_session_kind_after_merge(keep_gid)
     _emit_session_kind_changed(engine, keep_gid, drop_gids, delta)
+    # Drain the Drive row movement this merge stashed before returning.
+    # ``apply_merge`` only stashes the capture; without draining here a caller
+    # like ``group_wire`` that invokes this primitive directly (not through
+    # ``Terrarium.connect``) would leave the absorbed graph's Drive rows in its
+    # obsolete manager until some unrelated later topology op. Idempotent — a
+    # subsequent engine-level drain finds nothing pending.
+    await engine._drain_drive_topology()
+    checkpoint = getattr(engine, "checkpoint_graph", None)
+    if checkpoint is not None:
+        await checkpoint(keep_gid)
     engine._emit(
         EngineEvent(
             kind=EventKind.TOPOLOGY_CHANGED,

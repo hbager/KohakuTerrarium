@@ -1,9 +1,4 @@
-"""
-Tool protocol and base classes.
-
-Tools are executable functions that can be called by the controller.
-Supports multimodal tool results (text + images).
-"""
+"""Define tool protocols, execution context, and multimodal results."""
 
 import traceback
 from abc import abstractmethod
@@ -13,6 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from kohakuterrarium.builtin_skills import get_builtin_tool_doc
+from kohakuterrarium.modules.tool.runtime_options import validate_tool_options
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -24,29 +20,17 @@ if TYPE_CHECKING:
 class ExecutionMode(Enum):
     """Tool execution mode."""
 
-    DIRECT = "direct"  # Complete all jobs, return results immediately
-    BACKGROUND = "background"  # Periodic status updates, context refresh
-    STATEFUL = "stateful"  # Multi-turn interaction (like generators)
+    DIRECT = "direct"
+    BACKGROUND = "background"
+    STATEFUL = "stateful"
 
 
 @dataclass
 class ToolConfig:
-    """
-    Configuration for a tool.
-
-    Attributes:
-        timeout: Maximum execution time in seconds (0 = no timeout)
-        max_output: Maximum UTF-8 bytes of text output to keep centrally
-            after execution. ``0`` means no limit.
-        working_dir: Working directory for execution
-        env: Additional environment variables
-        notify_controller_on_background_complete: Whether a backgrounded tool
-            completion should push a new event back into the controller loop
-        extra: Tool-specific configuration
-    """
+    """Configure execution limits, environment, and background notification."""
 
     timeout: float = 60.0
-    max_output: int = 64 * 1024
+    max_output: int = 256 * 1024
     working_dir: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     notify_controller_on_background_complete: bool = True
@@ -55,22 +39,19 @@ class ToolConfig:
 
 @dataclass
 class ToolContext:
-    """
-    Context available to tools during execution.
-
-    Injected by the executor for tools that opt-in via needs_context.
-    """
+    """Provide executor-injected agent and runtime state to context-aware tools."""
 
     agent_name: str
-    session: Any  # Session object - carries channels, scratchpad, extras
+    session: Any
     working_dir: Path
     memory_path: Path | None = None
-    environment: Any = None  # Environment - shared state (None for standalone agents)
-    tool_format: str = "native"  # "native", "bracket", "xml", or custom
-    agent: Any = None  # Agent instance - for trigger_manager access, etc.
-    file_read_state: Any = None  # FileReadState - tracks which files the model has read
-    path_guard: Any = None  # PathBoundaryGuard - warns/blocks access outside cwd
+    environment: Any = None
+    tool_format: str = "native"
+    agent: Any = None
+    file_read_state: Any = None
+    path_guard: Any = None
     runtime_services: dict[str, Any] = field(default_factory=dict)
+    creature_id: str = ""
 
     @property
     def channels(self) -> Any:
@@ -78,11 +59,7 @@ class ToolContext:
         return self.session.channels if self.session else None
 
     def resolve_path(self, path_str: str) -> Path:
-        """Resolve a path relative to the agent's working directory.
-
-        If *path_str* is relative, it is anchored to ``self.working_dir``
-        instead of the process cwd.
-        """
+        """Resolve relative paths against the agent directory, not process cwd."""
         p = Path(path_str).expanduser()
         if not p.is_absolute():
             return (self.working_dir / p).resolve()
@@ -95,28 +72,26 @@ class ToolContext:
 
 
 def resolve_tool_path(path_str: str, context: ToolContext | None = None) -> Path:
-    """Resolve *path_str* against the agent's working directory.
-
-    Convenience wrapper for tools that may or may not have a context.
-    """
+    """Resolve a path against agent context when one is available."""
     if context:
         return context.resolve_path(path_str)
     return Path(path_str).expanduser().resolve()
 
 
+def has_interactive_responder(router: Any) -> bool:
+    """Return whether a router has an output capable of replying interactively."""
+    default = getattr(router, "default_output", None)
+    if default is not None and getattr(default, "supports_interactive", True):
+        return True
+    return any(
+        getattr(out, "on_supersede", None) is not None
+        for out in getattr(router, "_secondary_outputs", [])
+    )
+
+
 @dataclass
 class ToolResult:
-    """
-    Result from tool execution.
-
-    Supports both text-only and multimodal output (text + images).
-
-    Attributes:
-        output: Output content - str or list of ContentPart for multimodal
-        exit_code: Exit code (None if not applicable)
-        error: Error message if failed
-        metadata: Additional result metadata
-    """
+    """Represent text or multimodal tool output and execution status."""
 
     output: "str | list[ContentPart]" = ""
     exit_code: int | None = None
@@ -129,11 +104,7 @@ class ToolResult:
         return self.error is None and (self.exit_code is None or self.exit_code == 0)
 
     def get_text_output(self) -> str:
-        """
-        Extract text output from result.
-
-        For multimodal results, concatenates all text parts.
-        """
+        """Return text output, concatenating text parts for multimodal results."""
         if isinstance(self.output, str):
             return self.output
         return "\n".join(
@@ -153,15 +124,7 @@ class ToolResult:
 
 @runtime_checkable
 class Tool(Protocol):
-    """
-    Protocol for tools.
-
-    Tools must implement:
-    - name: Tool identifier
-    - description: One-line description for system prompt
-    - execution_mode: How the tool should be executed
-    - execute: Async method to run the tool
-    """
+    """Define the interface required for executable controller tools."""
 
     @property
     def tool_name(self) -> str:
@@ -181,116 +144,55 @@ class Tool(Protocol):
     async def execute(
         self, args: dict[str, Any], context: ToolContext | None = None
     ) -> ToolResult:
-        """
-        Execute the tool with given arguments.
-
-        Args:
-            args: Arguments parsed from tool call
-            context: Optional ToolContext injected by executor
-
-        Returns:
-            ToolResult with output and status
-        """
+        """Execute parsed arguments with optional executor context."""
         ...
 
 
 class BaseTool:
-    """
-    Base class for tools with common functionality.
+    """Provide common configuration, error handling, and documentation lookup."""
 
-    Subclasses should implement:
-    - tool_name property
-    - description property
-    - _execute method
-    """
+    needs_context: bool = False
+    require_manual_read: bool = False
 
-    needs_context: bool = False  # Set True in subclass to receive ToolContext
-    require_manual_read: bool = False  # Block usage until info tool reads the manual
-
-    # Provider-native tools represent capabilities the LLM provider
-    # performs itself (e.g. Codex image_generation, OpenAI web_search).
-    # The tool appears in the agent's inventory, but the tool runner
-    # MUST NOT execute it — the provider translates the entry into a
-    # built-in tool spec on the wire and surfaces results as
-    # structured assistant content.
-    #
-    # Provider-native tools are **opt-out**: every provider declares
-    # which native tools it serves via ``provider_native_tools`` on
-    # the provider class, and those entries are auto-registered into
-    # every creature that runs on that provider. Creatures can
-    # suppress any of them via ``disable_provider_tools`` in the
-    # creature config. Subclasses set ``is_provider_native = True``
-    # and populate ``provider_support`` with the canonical
-    # ``provider_name`` of every provider that can honor this tool;
-    # an explicitly-wired tool on a non-supporting provider is
-    # silently dropped at agent start.
+    # Native tools remain in inventory but must be executed by the provider,
+    # never by the local runner. Unsupported explicit registrations are dropped.
     is_provider_native: bool = False
     provider_support: frozenset[str] = frozenset()
 
     @classmethod
     def provider_native_option_schema(cls) -> dict[str, dict[str, Any]]:
-        """Declare the user-tunable options for this provider-native tool.
+        """Declare UI-renderable options accepted by a provider-native tool.
 
-        UIs (Studio, ``kt config``, the Rich settings dialog, the
-        ``/settings`` slash command) read this schema to render a generic
-        form. The runtime merges values from this schema into the
-        wire-format spec via :meth:`provider_native_options`.
-
-        Schema shape per entry::
-
-            "<option>": {
-                "type": "string" | "int" | "float" | "bool" | "enum",
-                "default": <value>,        # value sent when nothing is set
-                "label": "...",            # optional UI label
-                "description": "...",      # optional one-liner
-
-                # Strict enum (UI must render as dropdown, no custom):
-                "values": [...],          # required when type == "enum"
-
-                # Free-form with hints (UI renders combo box / autocomplete
-                # — values not in the list are still accepted):
-                "suggestions": [...],     # optional for non-enum types
-
-                # Numeric bounds (optional, type == "int" | "float"):
-                "min": <number>,
-                "max": <number>,
-                "step": <number>,
-
-                # Free-form input hint:
-                "placeholder": "...",
-            }
-
-        Use ``enum`` only when the provider's wire protocol actually
-        rejects anything outside the listed values. Otherwise prefer
-        ``string`` / ``int`` / ``float`` / ``bool`` with ``suggestions``
-        so users can override with custom values.
-
-        Default returns an empty dict — non-native tools and tools with
-        no user-visible knobs simply omit the override.
+        ``enum`` is reserved for provider-enforced closed sets; use suggestions
+        for values that users may override. An empty schema exposes no controls.
         """
         return {}
 
-    # Concurrency-safety flag used by the executor to partition parallel
-    # tool batches (see Cluster 5 / G.1 of the extension-point decisions).
-    # Tools flagged ``False`` acquire a shared serial lock, so at most
-    # one unsafe tool runs at a time while safe tools keep running in
-    # parallel. Default True — the historical behavior. Flip to False
-    # in subclasses that mutate shared state in ways that race each
-    # other (file writes, destructive shell commands, etc.).
+    def runtime_option_schema(self) -> dict[str, dict[str, Any]]:
+        """Declare runtime-mutable options for an ordinary local tool."""
+        return {}
+
+    # Unsafe tools share a serial lock while safe tools may remain parallel.
     is_concurrency_safe: bool = True
 
-    # Three-bucket ordering for :meth:`prompt_contribution` output. The
-    # aggregator groups contributions by bucket and then sorts
-    # alphabetically *within* a bucket:
-    #   - ``"first"``  → appears before the normal-alphabetical bucket
-    #   - ``"normal"`` → default; sorted alphabetical by tool name
-    #   - ``"last"``   → appears after the normal-alphabetical bucket
-    # Unknown values fall back to ``"normal"`` with a logged warning.
+    # Buckets order prompt contributions; names remain alphabetical within each bucket.
     prompt_contribution_bucket: str = "normal"
 
     def __init__(self, config: ToolConfig | None = None):
         self.config = config or ToolConfig()
-        self._manual_read = False  # Set to True after info tool reads this tool's docs
+        self._manual_read = False
+
+    def validate_runtime_options(
+        self, values: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Validate configured runtime options without changing the tool."""
+        schema = self.runtime_option_schema() or {}
+        source = self.config.extra if values is None else values
+        selected = {key: source[key] for key in schema if key in source}
+        return validate_tool_options(self.tool_name, selected, schema)
+
+    def refresh_runtime_options(self, options: dict[str, Any]) -> None:
+        """Apply validated effective options after a runtime update."""
 
     @property
     @abstractmethod
@@ -314,9 +216,7 @@ class BaseTool:
     ) -> ToolResult:
         """Execute with error handling."""
         if self.is_provider_native:
-            # Should never be reached — the tool runner is expected to
-            # skip provider-native tools. Raising here fails loud so a
-            # regression in the filter surfaces immediately.
+            # Fail visibly if runner filtering violates the provider-native boundary.
             return ToolResult(
                 error=(
                     f"Tool {self.tool_name!r} is provider-native and must be "
@@ -328,7 +228,7 @@ class BaseTool:
                 result = await self._execute(args, context=context)
             else:
                 result = await self._execute(args)
-            # Guard: _execute must return ToolResult, not str
+            # Preserve compatibility with tools that predate the ToolResult contract.
             if isinstance(result, str):
                 logger.warning(
                     "Tool _execute returned str instead of ToolResult",
@@ -343,56 +243,24 @@ class BaseTool:
 
     @abstractmethod
     async def _execute(self, args: dict[str, Any], **kwargs: Any) -> ToolResult:
-        """
-        Internal execution method.
-
-        Subclasses implement this without worrying about error handling.
-        Tools that set needs_context = True will receive context as a keyword arg.
-        """
+        """Implement tool behavior while the base class handles failures."""
         raise NotImplementedError
 
     def get_full_documentation(self, tool_format: str = "native") -> str:
-        """
-        Get full documentation for the info tool.
-
-        Reads from builtin_skills/tools/{name}.md if available,
-        otherwise returns a minimal default.
-
-        Args:
-            tool_format: "native", "bracket", "xml", or custom
-        """
+        """Return built-in documentation or a minimal generated fallback."""
         doc = get_builtin_tool_doc(self.tool_name)
         if doc:
             return doc
         return f"# {self.tool_name}\n\n{self.description}\n"
 
     def prompt_contribution(self) -> str | None:
-        """Optional self-described guidance, inserted into the system prompt
-        once per session when the tool is registered.
-
-        Subclasses override to return a short prose hint ("use me like
-        this"). Return ``None`` to skip the contribution (default). The
-        text should be kept short — full tool reference documentation
-        stays behind the ``info`` tool.
-
-        Called once at aggregation time per Cluster 5 / E.1 of the
-        extension-point decisions; cached in the assembled system
-        prompt (so the prefix stays stable for prompt caching).
-        """
+        """Return brief system-prompt guidance, leaving full reference text to info."""
         return None
 
 
 @dataclass
 class ToolInfo:
-    """
-    Tool information for registration and system prompt.
-
-    Attributes:
-        tool_name: Tool identifier
-        description: One-line description
-        execution_mode: Execution mode
-        documentation: Full documentation for info lookups
-    """
+    """Store tool metadata used for registration and prompt aggregation."""
 
     tool_name: str
     description: str
@@ -404,7 +272,7 @@ class ToolInfo:
         """Create ToolInfo from a Tool instance."""
         doc = ""
         if hasattr(tool, "get_full_documentation"):
-            doc = tool.get_full_documentation()  # type: ignore
+            doc = tool.get_full_documentation()  # type: ignore[attr-defined]
         return cls(
             tool_name=tool.tool_name,
             description=tool.description,

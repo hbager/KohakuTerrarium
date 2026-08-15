@@ -9,7 +9,7 @@ import pytest
 
 from kohakuterrarium.core.events import EventType
 from kohakuterrarium.core.executor import Executor
-from kohakuterrarium.core.job import JobState
+from kohakuterrarium.core.job import JobState, JobStore
 from kohakuterrarium.modules.tool.base import (
     BaseTool,
     ExecutionMode,
@@ -75,14 +75,15 @@ class _ManualReadTool(BaseTool):
 class _UnsafeTool(BaseTool):
     is_concurrency_safe = False
 
-    def __init__(self, hold_seconds=0.05):
-        super().__init__()
+    def __init__(self, hold_seconds=0.05, *, timeout=60.0, name="unsafe"):
+        super().__init__(ToolConfig(timeout=timeout))
         self.hold = hold_seconds
+        self.name = name
         self.starts: list[float] = []
 
     @property
     def tool_name(self):
-        return "unsafe"
+        return self.name
 
     @property
     def description(self):
@@ -177,6 +178,46 @@ class TestErrorPaths:
         assert result.exit_code == 1
         status = ex.get_status(jid)
         assert status.state == JobState.ERROR
+        assert ex.get_result(jid) is result
+
+
+def _agent(skill_mode="dynamic", has_info=True):
+    """Minimal agent stub exposing the fields the manual-read gate reads."""
+    tools = {"info": object()} if has_info else {}
+    registry = types.SimpleNamespace(get_tool=tools.get)
+    return types.SimpleNamespace(
+        config=types.SimpleNamespace(skill_mode=skill_mode),
+        registry=registry,
+    )
+
+
+class TestManualReadGate:
+    async def test_dynamic_with_info_still_blocks(self):
+        ex = Executor()
+        ex._agent = _agent(skill_mode="dynamic", has_info=True)
+        ex.register_tool(_ManualReadTool())
+        result = await ex.wait_for(await ex.submit("manual", {}))
+        assert result.error is not None
+        assert result.exit_code == 1
+
+    async def test_static_mode_bypasses_gate(self):
+        # Full docs already live in the prompt — the info-read gate is moot.
+        ex = Executor()
+        ex._agent = _agent(skill_mode="static")
+        ex.register_tool(_ManualReadTool())
+        result = await ex.wait_for(await ex.submit("manual", {}))
+        assert result.error is None
+        assert result.output == "never reached"
+
+    async def test_missing_info_tool_bypasses_gate(self):
+        # Without an ``info`` tool the block is unsatisfiable, so the tool
+        # would be permanently undispatchable — the gate must relax.
+        ex = Executor()
+        ex._agent = _agent(skill_mode="dynamic", has_info=False)
+        ex.register_tool(_ManualReadTool())
+        result = await ex.wait_for(await ex.submit("manual", {}))
+        assert result.error is None
+        assert result.output == "never reached"
 
 
 # ── on_complete callback + event queue ───────────────────────────
@@ -333,13 +374,81 @@ class TestSerialLock:
             ex.submit("unsafe", {}),
             ex.submit("unsafe", {}),
         )
-        # Wait all.
         results = await ex.wait_all(timeout=5.0)
         assert len(results) == 3
-        # Each run started AT LEAST hold_seconds after the previous one.
         starts = sorted(tool.starts)
         for a, b in zip(starts, starts[1:]):
-            assert b - a >= 0.02  # roughly the hold time
+            assert b - a >= 0.02
+
+    async def test_allow_concurrent_skips_serial_lock(self):
+        ex = Executor()
+        tool = _UnsafeTool(hold_seconds=0.03)
+        ex.register_tool(tool)
+        await ex.submit("unsafe", {})
+        await asyncio.sleep(0)
+        concurrent = await ex.submit("unsafe", {"allow_concurrent": True})
+        await ex.wait_for(concurrent, timeout=1.0)
+
+        assert len(tool.starts) == 2
+        assert tool.starts[1] - tool.starts[0] < 0.02
+
+    async def test_text_allow_concurrent_skips_serial_lock(self):
+        ex = Executor()
+        tool = _UnsafeTool(hold_seconds=0.03)
+        ex.register_tool(tool)
+        await ex.submit("unsafe", {})
+        await asyncio.sleep(0)
+        concurrent = await ex.submit("unsafe", {"allow_concurrent": "true"})
+        await ex.wait_for(concurrent, timeout=1.0)
+
+        assert len(tool.starts) == 2
+
+    async def test_bash_timeout_includes_lock_wait(self):
+        ex = Executor()
+        tool = _UnsafeTool(hold_seconds=0.08, timeout=0.02, name="bash")
+        ex.register_tool(tool)
+        await ex.submit("bash", {})
+        await asyncio.sleep(0)
+        blocked = await ex.submit("bash", {"timeout": 0.01})
+        result = await ex.wait_for(blocked, timeout=1.0)
+
+        assert result is not None
+        assert result.metadata["blocked"] is True
+        assert result.metadata["command_started"] is False
+        assert len(tool.starts) == 1
+
+    async def test_bash_timeout_budget_is_forwarded_after_lock(self):
+        ex = Executor()
+        tool = _UnsafeTool(hold_seconds=0.01, timeout=0.2, name="bash")
+        ex.register_tool(tool)
+        first = await ex.submit("bash", {})
+        await ex.wait_for(first, timeout=1.0)
+        second = await ex.submit("bash", {"timeout": 0.2})
+        await ex.wait_for(second, timeout=1.0)
+
+        assert len(tool.starts) == 2
+
+    async def test_bash_timeout_rejects_negative_values(self):
+        ex = Executor()
+        tool = _UnsafeTool(name="bash")
+        ex.register_tool(tool)
+        job_id = await ex.submit("bash", {"timeout": -1})
+        result = await ex.wait_for(job_id, timeout=1.0)
+
+        assert result is not None
+        assert result.error == "timeout must be >= 0"
+        assert tool.starts == []
+
+    async def test_bash_timeout_rejects_non_finite_values(self):
+        ex = Executor()
+        tool = _UnsafeTool(name="bash")
+        ex.register_tool(tool)
+        job_id = await ex.submit("bash", {"timeout": "nan"})
+        result = await ex.wait_for(job_id, timeout=1.0)
+
+        assert result is not None
+        assert result.error == "timeout must be finite"
+        assert tool.starts == []
 
 
 # ── wait_for / wait_all timeouts ─────────────────────────────────
@@ -351,8 +460,8 @@ class TestWaitTimeouts:
         ex.register_tool(_EchoTool())
         jid = await ex.submit("echo", {"msg": "x"})
         await ex.wait_for(jid)
-        # Drop task — second wait hits cached _results path.
-        ex._tasks.pop(jid, None)
+        await asyncio.sleep(0)
+        assert ex.get_task(jid) is None
         cached = await ex.wait_for(jid)
         assert cached is not None
         assert cached.output == "x"
@@ -364,13 +473,18 @@ class TestWaitTimeouts:
     async def test_wait_for_timeout(self):
         ex = Executor()
         ex.register_tool(_SlowTool())
-        jid = await ex.submit("slow", {"seconds": 5.0})
+        jid = await ex.submit("slow", {"seconds": 0.05})
         out = await ex.wait_for(jid, timeout=0.005)
-        # Either ``None`` (timeout path) or a cancelled JobResult — both
-        # acceptable outcomes depending on how the race resolves. The
-        # important invariant is the wait returned promptly.
-        assert out is None or out.error is not None
-        await ex.cancel(jid)
+        assert out is None
+        assert ex.get_status(jid).state == JobState.RUNNING
+        task = ex.get_task(jid)
+        assert task is not None
+        assert task.done() is False
+
+        completed = await ex.wait_for(jid, timeout=1.0)
+        assert completed is not None
+        assert completed.output == "done"
+        assert completed.error is None
 
     async def test_wait_all_empty(self):
         ex = Executor()
@@ -388,14 +502,15 @@ class TestWaitTimeouts:
     async def test_wait_all_timeout_returns_done_so_far(self):
         ex = Executor()
         ex.register_tool(_SlowTool())
-        jid = await ex.submit("slow", {"seconds": 5.0})
+        jid = await ex.submit("slow", {"seconds": 0.05})
         await asyncio.sleep(0.001)
-        # Timeout short — wait_all returns whatever finished by then.
         out = await ex.wait_all(timeout=0.005)
-        # If anything came back, it was the cancelled job's result.
-        for r in out.values():
-            assert r.error is not None
-        await ex.cancel(jid)
+        assert jid not in out
+        assert ex.get_status(jid).state == JobState.RUNNING
+
+        completed = await ex.wait_for(jid, timeout=1.0)
+        assert completed is not None
+        assert completed.output == "done"
 
 
 # ── output normalisation hook ────────────────────────────────────
@@ -410,6 +525,31 @@ class TestOutputNormalisation:
         assert "truncated" in result.output
         assert result.metadata.get("truncated") is True
 
+    async def test_truncation_note_points_at_bash_output_file(self):
+        # Bash materializes full output to a temp file and exposes the path
+        # as metadata["raw_output_path"]; the truncation hint must surface it.
+        class _BashLikeTool(_EchoTool):
+            @property
+            def tool_name(self):
+                return "bash"
+
+            async def _execute(self, args, **kwargs):
+                return ToolResult(
+                    output=str(args.get("msg", "")),
+                    metadata={
+                        "raw_output_path": "/tmp/kohakuterrarium-bash/bash_1.log"
+                    },
+                )
+
+        ex = Executor()
+        ex.register_tool(_BashLikeTool(max_output=10))
+        jid = await ex.submit("bash", {"msg": "x" * 1000})
+        result = await ex.wait_for(jid)
+        assert (
+            "Full output saved to /tmp/kohakuterrarium-bash/bash_1.log" in result.output
+        )
+        assert "use read to view it" in result.output
+
 
 # ── pending / running / task accessors ───────────────────────────
 
@@ -422,6 +562,24 @@ class TestAccessors:
         jid = await ex.submit("slow", {"seconds": 1.0})
         assert ex.get_pending_count() == 1
         await ex.cancel(jid)
+        await ex.wait_for(jid)
+        assert ex.get_pending_count() == 0
+
+    async def test_completed_tasks_follow_job_store_retention(self):
+        ex = Executor(job_store=JobStore(max_completed=2))
+        ex.register_tool(_EchoTool())
+        job_ids = []
+        for index in range(5):
+            job_id = await ex.submit("echo", {"msg": str(index)})
+            job_ids.append(job_id)
+            await ex.wait_for(job_id)
+        await asyncio.sleep(0)
+
+        assert ex._tasks == {}
+        assert ex.get_pending_count() == 0
+        assert ex.get_result(job_ids[0]) is None
+        assert ex.get_result(job_ids[-1]).output == "4"
+        assert set(await ex.wait_all()) == set(job_ids[-2:])
 
     async def test_get_task(self):
         ex = Executor()
@@ -430,6 +588,8 @@ class TestAccessors:
         task = ex.get_task(jid)
         assert task is not None
         await task
+        await asyncio.sleep(0)
+        assert ex.get_task(jid) is None
         assert ex.get_task("nope") is None
 
     async def test_get_running_jobs(self):
@@ -573,15 +733,18 @@ class TestToolContextBuild:
             async def _execute(self, args, context=None, **kwargs):
                 captured["ctx"] = context
                 captured["agent_name"] = context.agent_name
+                captured["creature_id"] = context.creature_id
                 return ToolResult(output="ok")
 
         ex = Executor()
         ex.register_tool(_NeedsCtx())
         ex._agent_name = "alice"
+        ex._creature_id = "creature-alice"
         ex._working_dir = Path.cwd()
         jid = await ex.submit("needs", {})
         await ex.wait_for(jid)
         assert captured["agent_name"] == "alice"
+        assert captured["creature_id"] == "creature-alice"
 
     async def test_emit_tool_wait_through_router(self):
         ex = Executor()

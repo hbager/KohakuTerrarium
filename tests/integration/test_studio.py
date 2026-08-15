@@ -20,13 +20,14 @@ Each test method runs ONE complete lifecycle end-to-end:
   LLM profiles + keys + MCP registry + UI prefs CRUD, plus the
   read-only builtin catalog + introspection.
 
-The ONLY seam is the LLM: BOTH ``create_llm_provider`` import sites
-(``bootstrap.llm`` and ``bootstrap.agent_init``) are monkeypatched to a
-:class:`ScriptedLLM`. Every other collaborator is real — a real
-:class:`Studio` over a real :class:`Terrarium` engine wrapped in a real
-:class:`LocalTerrariumService`, real on-disk ``.kohakutr`` session
-files in a ``tmp_path`` dir, real workspace directories, the real
-identity YAML stores (redirected to ``tmp_path``).
+The only seams are genuine external I/O: BOTH ``create_llm_provider``
+import sites (``bootstrap.llm`` and ``bootstrap.agent_init``) use a
+:class:`ScriptedLLM`, and the auto memory-search workflow uses a
+deterministic :class:`BaseEmbedder`. Every other collaborator is real
+— a real :class:`Studio` over a real :class:`Terrarium` engine wrapped
+in a real :class:`LocalTerrariumService`, real on-disk ``.kohakutr``
+session files in a ``tmp_path`` dir, real workspace directories, the
+real identity YAML stores (redirected to ``tmp_path``).
 
 No shape asserts: every assertion pins an exact value or an observable
 side effect.
@@ -34,6 +35,7 @@ side effect.
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from kohakuterrarium.errors import (
@@ -43,8 +45,10 @@ from kohakuterrarium.errors import (
 )
 from kohakuterrarium.bootstrap import agent_init as _agent_init_mod
 from kohakuterrarium.bootstrap import llm as _bootstrap_llm_mod
+from kohakuterrarium.session.embedding import BaseEmbedder
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.persistence import store as _persistence_store_mod
+from kohakuterrarium.studio.sessions import memory_search as _session_memory_mod
 from kohakuterrarium.studio.studio import Studio
 from kohakuterrarium.testing.llm import ScriptedLLM
 
@@ -52,8 +56,24 @@ pytestmark = pytest.mark.timeout(30)
 
 
 # ---------------------------------------------------------------------------
-# Fixtures — isolate every module-global path + the LLM seam.
+# Fixtures — isolate module-global paths and genuine external I/O.
 # ---------------------------------------------------------------------------
+
+
+class _HashEmbedder(BaseEmbedder):
+    """Deterministic stand-in for the external embedding provider."""
+
+    dimensions = 64
+
+    def encode(self, texts: list[str]) -> np.ndarray:
+        vectors = np.zeros((len(texts), self.dimensions), dtype=np.float32)
+        for row, text in enumerate(texts):
+            for token in text.lower().split():
+                vectors[row, sum(token.encode("utf-8")) % self.dimensions] += 1.0
+            norm = float(np.linalg.norm(vectors[row]))
+            if norm > 0:
+                vectors[row] /= norm
+        return vectors
 
 
 @pytest.fixture
@@ -73,6 +93,16 @@ def scripted_llm(monkeypatch):
     monkeypatch.setattr(_bootstrap_llm_mod, "create_llm_provider", _fake_create)
     monkeypatch.setattr(_agent_init_mod, "create_llm_provider", _fake_create)
     return holder
+
+
+@pytest.fixture
+def deterministic_embedder(monkeypatch):
+    """Keep auto memory search on its real path without downloading a model."""
+    monkeypatch.setattr(
+        _session_memory_mod,
+        "create_embedder",
+        lambda _config: _HashEmbedder(),
+    )
 
 
 @pytest.fixture
@@ -163,7 +193,7 @@ class TestStudioIntegration:
     """Each method runs one complete studio-tier lifecycle."""
 
     async def test_workspace_to_session_to_persistence_lifecycle(
-        self, scripted_llm, isolated_paths
+        self, scripted_llm, deterministic_embedder, isolated_paths
     ):
         """The headline flow, end-to-end through the Studio façade:
 
@@ -344,7 +374,7 @@ class TestStudioIntegration:
             assert out == "First reply."
             out2 = await _drain_chat(studio, session_id, creature_id, "ping two")
             assert out2 == "Second reply."
-            history = studio.sessions.chat.history(session_id, creature_id)
+            history = await studio.sessions.chat.history(session_id, creature_id)
             # The user message + assistant reply are both in the
             # conversation snapshot the chat history endpoint returns
             # (index 0 is the system prompt).
@@ -358,12 +388,11 @@ class TestStudioIntegration:
             assert "Second reply." in history["messages"][-1]["content"]
             assert any(e["type"] == "user_input" for e in history["events"])
             assert history["is_processing"] is False
-            # Per-turn branch metadata — two linear turns, no branching.
-            branches = studio.sessions.chat.branches(session_id, creature_id)
-            assert branches["creature_id"] == creature_id
-            assert [t["turn_index"] for t in branches["turns"]] == [1, 2]
-            assert all(t["branches"] == [1] for t in branches["turns"])
-            assert all(t["latest_branch"] == 1 for t in branches["turns"])
+            # Canonical user turns are branch 1 before any regenerate/edit fork.
+            branches = await studio.sessions.chat.branches(session_id, creature_id)
+            assert [row["turn_index"] for row in branches] == [1, 2]
+            assert [row["selected"] for row in branches] == [1, 1]
+            assert all(row["branches"][0]["branch_id"] == 1 for row in branches)
 
             # --- sessions.state: read-only runtime surface --------------
             # The system prompt carries the workspace creature's seeded
@@ -550,7 +579,7 @@ class TestStudioIntegration:
             resumed = await studio.persistence.resume(saved_path)
             assert len(resumed.creatures) == 1
             resumed_cid = resumed.creatures[0]["creature_id"]
-            resumed_history = studio.sessions.chat.history(
+            resumed_history = await studio.sessions.chat.history(
                 resumed.session_id, resumed_cid
             )
             # The resumed conversation carries the original turn forward.
@@ -635,8 +664,8 @@ class TestStudioIntegration:
             assert mem["mode"] == "fts"
             assert mem["session_name"] == saved_stem
             assert mem["count"] >= 1
-            # ``auto`` mode resolves the embedder + falls back to FTS when
-            # no vector index exists — still hits the recorded turn.
+            # ``auto`` resolves the deterministic embedder and exercises
+            # hybrid search; its FTS side still finds the recorded turn.
             mem_auto = await studio.sessions.search_memory(
                 saved_path,  # a direct .kohakutr path works too
                 "ping",
@@ -756,7 +785,13 @@ class TestStudioIntegration:
             # --- plugin toggle: flip on, then back off ------------------
             plugins = studio.sessions.plugins.list(session_id, creature_id)
             assert any(p["name"] == "sandbox" for p in plugins)
-            assert all(p["enabled"] is False for p in plugins)
+            assert any(p["name"] == "goal" and p["enabled"] for p in plugins)
+            assert any(p["name"] == "drive_runtime" and p["enabled"] for p in plugins)
+            assert all(
+                p["enabled"] is False
+                for p in plugins
+                if p["name"] not in {"goal", "drive_runtime"}
+            )
             toggled_on = await studio.sessions.plugins.toggle(
                 session_id, creature_id, "sandbox"
             )
@@ -780,12 +815,12 @@ class TestStudioIntegration:
 
             # --- chat history mutation: rewind drops the tail -----------
             # Conversation before rewind: [system, user, assistant].
-            pre_rewind = studio.sessions.chat.history(session_id, creature_id)
+            pre_rewind = await studio.sessions.chat.history(session_id, creature_id)
             assert pre_rewind["messages"][-1]["role"] == "assistant"
             # Rewind to msg index 1 (the user message) — drops the
             # assistant reply without re-running.
             await studio.sessions.chat.rewind(session_id, creature_id, 1)
-            post_rewind = studio.sessions.chat.history(session_id, creature_id)
+            post_rewind = await studio.sessions.chat.history(session_id, creature_id)
             assert all(m["role"] != "assistant" for m in post_rewind["messages"])
 
             # --- channels: declare + introspect + broadcast -------------
@@ -1177,3 +1212,155 @@ class TestStudioIntegration:
             # leak this delete raises PermissionError on Windows.
             removed = studio.persistence.delete(saved_stem)
             assert all(not p.exists() for p in removed)
+
+    async def test_drive_settings_resolver_and_service_lifecycle(
+        self, scripted_llm, isolated_paths
+    ):
+        """The Drive management flow, end-to-end through the Studio façade:
+
+        identity.drives.save (operator settings)
+            -> Studio()-owned engine resolves the settings -> Drive-enabled
+            -> identity.drives.status joins catalog + enabled state
+            -> sessions.start_creature mints a graph
+            -> service.create_drive / assign / report / transition / status
+               administer a Drive WITHOUT the engine escape hatch
+            -> identity.drives.save round-trips a new revision
+
+        Mirrors the managed CLI/TUI/web path: Studio is the settings owner and
+        every Drive op funnels through ``TerrariumService`` (design §8.4, §9.2).
+        """
+        from kohakuterrarium.studio.identity import drive_settings as ds
+        from kohakuterrarium.studio.identity.drive_settings import (
+            DriveSettings,
+            RegistrationSetting,
+        )
+        from kohakuterrarium.terrarium.drive.config import DriveRuntimeConfig
+        from kohakuterrarium.terrarium.drive.models import ActorRef, DriveStatus
+        from kohakuterrarium.terrarium.drive.requests import (
+            CreateDriveRequest,
+            DrivePatch,
+        )
+
+        scripted_llm["script"] = ["ok"] * 12
+        workspace_root = isolated_paths["tmp_path"] / "drive_workspace"
+        workspace_root.mkdir()
+        actor = ActorRef("user", "operator")
+
+        # Operator enables the generic Drive runtime BEFORE the engine is built.
+        ds.save_settings(
+            DriveSettings(
+                runtime=DriveRuntimeConfig(enabled=True),
+                registrations={"generic": RegistrationSetting(enabled=True)},
+            )
+        )
+
+        async with Studio() as studio:
+            # The Studio-owned engine resolved the managed settings.
+            assert studio.engine.drives is not None
+            status = studio.identity.drives.status()
+            assert any(
+                r["name"] == "generic" and r["enabled"] for r in status["registrations"]
+            )
+
+            creature_dir = _scaffold_creature(studio, workspace_root, "scout")
+            session = await studio.sessions.start_creature(str(creature_dir))
+            creature_id = session.creatures[0]["creature_id"]
+            gid = (await studio.service.get_creature_info(creature_id)).graph_id
+            svc = studio.service
+
+            # Create + administer a graph Drive through the service surface only.
+            view = await svc.create_drive(
+                CreateDriveRequest(
+                    kind="generic",
+                    title="watch deploy",
+                    scope_type="graph",
+                    scope_id=gid,
+                    owner=actor,
+                    owner_scope="service",
+                    created_by=actor,
+                    spec={"instruction": "monitor"},
+                ),
+                graph_id=gid,
+                actor=actor,
+                is_privileged=True,
+            )
+            did = view.record.drive_id
+            assert view.record.status is DriveStatus.ACTIVE
+
+            renamed = await svc.update_drive(
+                did,
+                DrivePatch(title="watch prod deploy"),
+                expected_revision=view.record.revision,
+                actor=actor,
+                is_privileged=True,
+            )
+            assert renamed.record.title == "watch prod deploy"
+
+            assigned = await svc.assign_drive(
+                did,
+                creature_id,
+                gid,
+                expected_revision=renamed.record.revision,
+                actor=actor,
+                is_privileged=True,
+            )
+            assert assigned.assignee_creature_id == creature_id
+
+            progress = await svc.report_drive_progress(
+                did,
+                summary="halfway",
+                evidence={"pct": 50},
+                actor=actor,
+                is_privileged=True,
+            )
+            assert progress.drive_id == did
+
+            current = await svc.get_drive(did, actor=actor, is_privileged=True)
+            paused = await svc.transition_drive(
+                did,
+                DriveStatus.PAUSED,
+                expected_revision=current.record.revision,
+                actor=actor,
+                is_privileged=True,
+            )
+            assert paused.record.status is DriveStatus.PAUSED
+
+            runtime_status = await svc.drive_runtime_status()
+            assert runtime_status.enabled is True
+            assert runtime_status.counts.get("paused") == 1
+            assert {r["name"] for r in runtime_status.registrations} == {"generic"}
+
+            # A settings save is distinct from apply and round-trips a revision.
+            saved = studio.identity.drives.save(
+                {
+                    "runtime": {"enabled": True, "max_active_per_creature": 4},
+                    "registrations": {"generic": {"enabled": True}},
+                }
+            )
+            assert saved.revision == ds.current_revision()
+
+            # The session-scoped record façade (studio.sessions.drives) is the
+            # surface the HTTP routes / CLI / /drives command all delegate to:
+            # session_id == graph_id, rows redact spec, detail keeps it.
+            drive_ns = studio.sessions.drives
+            new_detail = await drive_ns.create(
+                gid,
+                {"kind": "generic", "title": "second watch", "spec": {"s": 1}},
+                actor="user:operator",
+            )
+            assert new_detail["spec"] == {"s": 1}  # detail keeps spec
+            rows = await drive_ns.list(gid, actor="user:operator")
+            listed = next(r for r in rows if r["drive_id"] == new_detail["drive_id"])
+            assert "spec" not in listed  # rows redact spec
+            assert listed["allowed_actions"]
+            fetched = await drive_ns.get(new_detail["drive_id"], actor="user:operator")
+            assert fetched["drive_id"] == new_detail["drive_id"]
+            cancelled = await drive_ns.transition(
+                new_detail["drive_id"],
+                "cancelled",
+                expected_revision=new_detail["revision"],
+                actor="user:operator",
+            )
+            assert cancelled["status"] == "cancelled"
+
+            await studio.sessions.stop(session.session_id)

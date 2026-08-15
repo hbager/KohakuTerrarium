@@ -638,6 +638,53 @@ class TestApiIntegration:
         assert resp.status_code == 200
         assert "servers" in resp.json()
 
+        # Drive settings endpoints (Phase H). Local target (no ``node``) resolves
+        # against the host's own config home + engine.
+        resp = client.get("/api/settings/drives")
+        assert resp.status_code == 200
+        assert resp.json()["runtime"]["enabled"] is True
+        drive_revision = client.get("/api/settings/drives/config").json()["revision"]
+
+        # Validation is a distinct typed step: a bad mapping 400s, a good one oks.
+        resp = client.post(
+            "/api/settings/drives/validate",
+            json={"settings": {"runtime": {"enabled": "not-a-bool"}}},
+        )
+        assert resp.status_code == 400
+        good = {
+            "schema_version": 1,
+            "runtime": {"enabled": True},
+            "registrations": {"generic": {"enabled": True, "options": {}}},
+        }
+        resp = client.post("/api/settings/drives/validate", json={"settings": good})
+        assert resp.status_code == 200 and resp.json()["ok"] is True
+
+        # Save persists validated config (admin gate is a no-op in standalone).
+        resp = client.put(
+            "/api/settings/drives",
+            json={"settings": good, "expected_revision": drive_revision},
+        )
+        assert resp.status_code == 200
+        saved_rev = resp.json()["revision"]
+        assert saved_rev
+        resp = client.get("/api/settings/drives/config")
+        assert resp.status_code == 200
+        assert resp.json()["settings"]["runtime"]["enabled"] is True
+        assert resp.json()["revision"] == saved_rev
+
+        # Saving remains distinct from applying; changing the enabled registry
+        # may apply live or report that a restart is required.
+        resp = client.post("/api/settings/drives/apply")
+        assert resp.status_code == 200
+        assert resp.json()["result"] in {
+            "applied_live",
+            "restart_required",
+            "rejected",
+        }
+        resp = client.get("/api/settings/drives/runtime-status")
+        assert resp.status_code == 200
+        assert "enabled" in resp.json()
+
         # Process metrics snapshot — no sessions yet, so the gauges
         # report zero running creatures.
         resp = client.get("/api/metrics/snapshot")
@@ -755,11 +802,11 @@ class TestApiIntegration:
         # ``(turn_index, branch_id)`` so the frontend's branch
         # navigator can promote without waiting for the post-turn
         # resync. The exact ids come from the agent's state, but the
-        # status is always "regenerating".
+        # The blocking endpoint reports truthful completion.
         resp = client.post(f"{base}/regenerate", json={})
         assert resp.status_code == 200
         body = resp.json()
-        assert body["status"] == "regenerating"
+        assert body["status"] == "completed"
         assert isinstance(body["turn_index"], int) and body["turn_index"] >= 1
         assert isinstance(body["branch_id"], int) and body["branch_id"] >= 1
         # Edit the first user message in place and re-run from there.
@@ -768,13 +815,14 @@ class TestApiIntegration:
             json={"content": "edited first turn", "user_position": 0},
         )
         assert resp.status_code == 200
-        assert resp.json()["status"] == "edited"
-        # Editing a target that isn't a user message → documented 400.
+        assert resp.json()["status"] == "completed"
+        # Editing a target that isn't a user message conflicts with the
+        # selected conversation branch.
         resp = client.post(
             f"{base}/messages/999/edit",
             json={"content": "x", "user_position": 999},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 409
         # Rewind the conversation to message index 1 (keeps the system
         # message at index 0 intact).
         resp = client.post(f"{base}/messages/1/rewind")
@@ -1757,18 +1805,17 @@ terrarium:
         resp = client.post(f"/api/sessions/topology/{session_id}/merge/no-such-session")
         assert resp.status_code == 404
 
-        # connect referencing a creature that does not exist →
-        # documented 400 (KeyError/ValueError in topology_lib).
+        # Connect resolves identities in the URL session before mutation.
         resp = client.post(
             f"/api/sessions/topology/{session_id}/connect",
             json={"sender": alice_id, "receiver": "ghost-creature"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 404
         resp = client.post(
             f"/api/sessions/topology/{session_id}/disconnect",
             json={"sender": alice_id, "receiver": "ghost-creature"},
         )
-        assert resp.status_code == 400
+        assert resp.status_code == 404
         # Channel-info read on an unknown session → 404; channel list
         # on an unknown session → 404.
         resp = client.get(f"/api/sessions/topology/no-such-session/channels/team")
@@ -1800,7 +1847,7 @@ terrarium:
         resp = client.get(f"{wbase}/outputs")
         assert resp.status_code == 200
         outputs = resp.json()["outputs"]
-        assert any(e.get("to") == "bob" for e in outputs)
+        assert any(e.get("to") == bob_id for e in outputs)
         # sinks endpoint reports the empty secondary-sink list.
         resp = client.get(f"{wbase}/sinks")
         assert resp.status_code == 200
@@ -1838,7 +1885,7 @@ terrarium:
         wired_graph = next(
             g for g in resp.json()["graphs"] if g["graph_id"] == session_id
         )
-        edge = next(e for e in wired_graph["output_edges"] if e.get("to") == "bob")
+        edge = next(e for e in wired_graph["output_edges"] if e.get("to") == bob_id)
         assert edge["from"] == alice_id
         assert edge["to_creature_id"] == bob_id
         assert edge["graph_id"] == session_id
@@ -2009,6 +2056,166 @@ def test_session_dir_env_isolation(client: TestClient, tmp_path: Path) -> None:
     session directory."""
     assert os.environ["KT_SESSION_DIR"].startswith(str(tmp_path))
     assert lifecycle._session_dir() == os.environ["KT_SESSION_DIR"]
+
+
+async def test_managed_local_engine_receives_settings_derived_drive_runtime(
+    monkeypatch, tmp_path
+) -> None:
+    """The API's managed lazy engine resolves the host Drive settings into an
+    explicit runtime (design §8.4): with the runtime enabled in settings the
+    deps-built engine is Drive-enabled and its service exposes the running
+    registry; absent settings create and use enabled generic + goal defaults.
+    """
+    from kohakuterrarium.api.deps import get_service_legacy, set_service
+    from kohakuterrarium.studio.identity import drive_settings as ds
+    from kohakuterrarium.studio.identity.drive_settings import (
+        DriveSettings,
+        RegistrationSetting,
+    )
+    from kohakuterrarium.terrarium.drive.config import DriveRuntimeConfig
+
+    monkeypatch.setenv("KT_CONFIG_DIR", str(tmp_path / "managed-cfg"))
+    monkeypatch.setenv("KT_SESSION_DIR", str(tmp_path / "managed-sess"))
+    set_service(None)
+    try:
+        # Absent settings are atomically initialized to enabled defaults.
+        default_runtime = get_service_legacy().engine.drives
+        assert default_runtime is not None
+        assert {
+            entry.descriptor.name for entry in default_runtime.snapshot.entries
+        } == {
+            "generic",
+            "goal",
+        }
+        set_service(None)
+        # Operator enables the generic runtime; the next managed build resolves it.
+        ds.save_settings(
+            DriveSettings(
+                runtime=DriveRuntimeConfig(enabled=True),
+                registrations={"generic": RegistrationSetting(enabled=True)},
+            )
+        )
+        svc = get_service_legacy()
+        assert svc.engine.drives is not None
+        status = await svc.drive_runtime_status()
+        assert status.enabled is True
+        assert {r["name"] for r in status.registrations} == {"generic"}
+    finally:
+        set_service(None)
+
+
+def test_drive_record_http_lifecycle(monkeypatch, tmp_path) -> None:
+    """The Drive record HTTP surface end-to-end over a real Drive-enabled engine.
+
+    Mirrors the web panel's own calls (design §12.3): create -> redacted list ->
+    full detail -> CAS patch -> stale-revision 409 -> transition -> 404 for a
+    missing id -> 422 for a disabled kind -> delivery history. The engine is
+    entered by the TestClient lifespan so every async primitive lives in one loop.
+    """
+    from kohakuterrarium.terrarium.drive.config import DriveRuntimeConfig
+    from kohakuterrarium.terrarium.drive.registration import GenericDriveRegistration
+
+    monkeypatch.setenv("KT_SESSION_DIR", str(tmp_path / "drive-sessions"))
+    engine = Terrarium(
+        session_dir=str(tmp_path / "drive-sessions"),
+        drive_config=DriveRuntimeConfig(enabled=True),
+        drive_registrations=(GenericDriveRegistration(),),
+    )
+    set_service(LocalTerrariumService(engine))
+    app = create_app()
+    gid = "g1"
+    try:
+        with TestClient(app) as c:
+            created = c.post(
+                f"/api/sessions/{gid}/drives",
+                json={"kind": "generic", "title": "watch", "spec": {"k": 1}},
+            )
+            assert created.status_code == 200
+            body = created.json()
+            did, rev = body["drive_id"], body["revision"]
+            assert body["spec"] == {"k": 1}  # detail keeps spec
+            assert body["created_by"] == "user:local"  # actor from context
+
+            rows = c.get(f"/api/sessions/{gid}/drives").json()["drives"]
+            row = next(r for r in rows if r["drive_id"] == did)
+            assert "spec" not in row and row["allowed_actions"]  # rows redact
+
+            detail = c.get(f"/api/sessions/{gid}/drives/{did}").json()
+            assert detail["spec"] == {"k": 1}
+
+            patched = c.patch(
+                f"/api/sessions/{gid}/drives/{did}",
+                json={"expected_revision": rev, "title": "renamed"},
+            )
+            assert patched.status_code == 200 and patched.json()["title"] == "renamed"
+            new_rev = patched.json()["revision"]
+
+            stale = c.patch(
+                f"/api/sessions/{gid}/drives/{did}",
+                json={"expected_revision": rev, "title": "x"},
+            )
+            assert stale.status_code == 409  # optimistic-concurrency conflict
+
+            paused = c.post(
+                f"/api/sessions/{gid}/drives/{did}/transition",
+                json={"target_status": "paused", "expected_revision": new_rev},
+            )
+            assert paused.status_code == 200 and paused.json()["status"] == "paused"
+
+            assert c.get(f"/api/sessions/{gid}/drives/ghost").status_code == 404
+            # R1-02: the same Drive addressed through a different graph URL is
+            # not-found, and a cross-graph mutation does not leak through.
+            assert c.get(f"/api/sessions/other-graph/drives/{did}").status_code == 404
+            assert (
+                c.post(
+                    f"/api/sessions/other-graph/drives/{did}/transition",
+                    json={"target_status": "active", "expected_revision": new_rev},
+                ).status_code
+                == 404
+            )
+            assert c.get(f"/api/sessions/{gid}/drives/{did}").json()["status"] == (
+                "paused"
+            )
+            # A disabled kind fails closed with 422, not a generic 400/500.
+            assert (
+                c.post(
+                    f"/api/sessions/{gid}/drives",
+                    json={"kind": "goal", "title": "t"},
+                ).status_code
+                == 422
+            )
+            assert (
+                c.get(f"/api/sessions/{gid}/drives/{did}/deliveries").status_code == 200
+            )
+            status = c.get("/api/settings/drives/runtime-status").json()
+            assert status["enabled"] is True
+
+            # 8. Drive structural events reach the runtime-graph WS (the stream
+            #    the web panel reconciles on). Open the socket, mutate, and drain
+            #    until a ``drive_*`` frame carrying the drive_id arrives — the
+            #    generic engine-event forwarding serializes Drive events with no
+            #    Drive-specific WS code (design §9.4; payload carries ids, not spec).
+            with c.websocket_connect("/ws/runtime/graph") as ws:
+                ws.receive_json()  # initial snapshot
+                c.post(
+                    f"/api/sessions/{gid}/drives/{did}/transition",
+                    json={
+                        "target_status": "active",
+                        "expected_revision": paused.json()["revision"],
+                    },
+                )
+                drive_frame = None
+                for _ in range(40):
+                    frame = ws.receive_json()
+                    if str(frame.get("type", "")).startswith("drive"):
+                        drive_frame = frame
+                        break
+                assert drive_frame is not None
+                assert drive_frame["payload"].get("drive_id") == did
+                # The event carries ids/revision, never the spec (redacted §9.4).
+                assert "spec" not in drive_frame["payload"]
+    finally:
+        set_service(None)
 
 
 # ── multi-node (lab-host) api workflow — regression coverage ──────────

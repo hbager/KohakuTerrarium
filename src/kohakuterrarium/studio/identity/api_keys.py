@@ -3,11 +3,15 @@
 import os
 from typing import Any
 
-from kohakuterrarium.llm.api_keys import KEYS_PATH, list_api_keys
-from kohakuterrarium.llm.profiles import (
+from kohakuterrarium.llm.api_keys import (
+    KEYS_PATH,
+    KeyPool,
     PROVIDER_KEY_MAP,
-    _is_available,
     get_api_key,
+    list_api_keys,
+)
+from kohakuterrarium.llm.profiles import (
+    _is_available,
     load_backends,
     save_api_key,
 )
@@ -15,19 +19,38 @@ from kohakuterrarium.llm.profiles import (
 KEYS_FILE_PATH = KEYS_PATH
 
 
+def _provider_credentials(
+    backends: dict[str, Any] | None = None,
+) -> dict[str, tuple[str, str]]:
+    """Return provider -> (backend type, env var), including tool-only keys."""
+    resolved_backends = load_backends() if backends is None else backends
+    credentials = {
+        name: (
+            getattr(backend, "backend_type", "credential"),
+            getattr(backend, "api_key_env", "") or "",
+        )
+        for name, backend in resolved_backends.items()
+    }
+    for name, env_var in PROVIDER_KEY_MAP.items():
+        credentials.setdefault(name, ("credential", env_var))
+    return credentials
+
+
 def list_keys_payload() -> list[dict[str, Any]]:
-    """Return per-provider key status (HTTP shape)."""
+    """Return the HTTP-facing API-key status for each configured provider."""
     masked = list_api_keys()
     entries: list[dict[str, Any]] = []
-    for name, backend in load_backends().items():
+    backends = load_backends()
+    for name, (backend_type, env_var) in _provider_credentials(backends).items():
+        has_key = bool(get_api_key(name))
         entries.append(
             {
                 "provider": name,
-                "backend_type": backend.backend_type,
-                "env_var": backend.api_key_env,
-                "has_key": bool(get_api_key(name)),
+                "backend_type": backend_type,
+                "env_var": env_var,
+                "has_key": has_key,
                 "masked_key": masked.get(name, ""),
-                "available": _is_available(name),
+                "available": _is_available(name) if name in backends else has_key,
                 "built_in": name in {"codex", *PROVIDER_KEY_MAP.keys()},
             }
         )
@@ -35,12 +58,11 @@ def list_keys_payload() -> list[dict[str, Any]]:
 
 
 def list_keys_for_cli() -> list[dict[str, Any]]:
-    """Return masked keys + env-resolution status for ``kt config key list``."""
+    """Return masked keys and environment resolution for the CLI listing."""
     masked = list_api_keys()
     rows: list[dict[str, Any]] = []
-    for provider, backend in sorted(load_backends().items()):
+    for provider, (_, env_var) in sorted(_provider_credentials().items()):
         value = masked.get(provider, "")
-        env_var = backend.api_key_env or ""
         if value:
             source = "stored"
         elif env_var and os.environ.get(env_var):
@@ -59,35 +81,24 @@ def list_keys_for_cli() -> list[dict[str, Any]]:
     return rows
 
 
-def set_key(provider: str, key: str | list[str]) -> None:
-    """Persist an API key or comma-separated key pool.
-
-    A single key is stored as a string for backward compatibility; multiple
-    keys are stored as a list and consumed by the round-robin KeyPool.
-    """
-    if isinstance(key, str):
-        normalized: str | list[str] = [
-            part.strip() for part in key.split(",") if part.strip()
-        ]
-    else:
-        normalized = [str(part).strip() for part in key if str(part).strip()]
-    if isinstance(normalized, list) and len(normalized) == 1:
-        normalized = normalized[0]
-
-    if not provider or not normalized:
+def set_key(provider: str, key: str) -> None:
+    """Persist an API key, rejecting missing values or unknown providers."""
+    if not provider or not key:
         raise ValueError("Provider and key are required")
-    if provider not in load_backends():
+    if provider not in _provider_credentials():
         raise LookupError(f"Provider not found: {provider}")
-    save_api_key(provider, normalized)
+    keys = [part.strip() for part in key.split(",") if part.strip()]
+    save_api_key(provider, keys if len(keys) > 1 else keys[0])
 
 
 def remove_key(provider: str) -> None:
-    """Delete the stored key for a provider. Raises on unknown provider."""
-    if provider not in load_backends():
+    """Delete a provider's stored key, rejecting unknown providers."""
+    if provider not in _provider_credentials():
         raise LookupError(f"Provider not found: {provider}")
     save_api_key(provider, "")
 
 
 def get_existing_key(provider: str) -> str:
-    """Return the first currently configured key (for masked display only)."""
-    return get_api_key(provider).first
+    """Return the resolved provider key for masked display workflows."""
+    value = get_api_key(provider)
+    return value.first if isinstance(value, KeyPool) else value

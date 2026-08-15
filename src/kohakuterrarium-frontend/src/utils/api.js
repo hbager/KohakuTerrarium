@@ -224,7 +224,6 @@ export const terrariumAPI = {
     const body = { config_path: configPath }
     if (pwd) body.pwd = pwd
     if (name) body.name = name
-    if (opts.llm) body.llm = opts.llm
     // Lab cluster site — backend defaults to "_host" if absent, so
     // standalone mode is unaffected.
     if (opts.onNode && opts.onNode !== "_host") body.on_node = opts.onNode
@@ -377,6 +376,44 @@ export const terrariumAPI = {
     return data
   },
 
+  /**
+   * Read a creature sub-agent's inner conversation. Identify by live
+   * ``job_id``, live-interactive ``name``, or persisted ``name`` + ``run``.
+   * @returns {Promise<{name, run, job_id, live, interactive, messages, meta}>}
+   */
+  async getSubagentConversation(id, creature, { jobId, name, run } = {}) {
+    const params = {}
+    if (jobId) params.job_id = jobId
+    if (name) params.name = name
+    if (run != null) params.run = run
+    const { data } = await api.get(
+      `/sessions/${id}/creatures/${encodeTarget(creature)}/subagents/conversation`,
+      { params },
+    )
+    return data
+  },
+
+  /** Send a message to a LIVE sub-agent. ``jobId`` targets the exact live
+   *  run (disambiguates repeated runs of the same name); 409 when the run
+   *  is not live. */
+  async sendSubagentMessage(id, creature, name, content, jobId = "") {
+    const body = { content }
+    if (jobId) body.job_id = jobId
+    const { data } = await api.post(
+      `/sessions/${id}/creatures/${encodeTarget(creature)}/subagents/${encodeTarget(name)}/send`,
+      body,
+    )
+    return data
+  },
+
+  /** Fetch live commands and skills for a terrarium creature */
+  async getCreatureCommandInventory(id, name) {
+    const { data } = await api.get(
+      `/sessions/${id}/creatures/${encodeTarget(name)}/command-inventory`,
+    )
+    return data
+  },
+
   /** Execute a slash command on a terrarium creature */
   async executeCreatureCommand(id, name, command, args = "") {
     const { data } = await api.post(`/sessions/${id}/creatures/${encodeTarget(name)}/command`, {
@@ -451,7 +488,6 @@ export const agentAPI = {
     const body = { config_path: configPath }
     if (pwd) body.pwd = pwd
     if (name) body.name = name
-    if (opts.llm) body.llm = opts.llm
     if (opts.onNode && opts.onNode !== "_host") body.on_node = opts.onNode
     const { data } = await api.post("/sessions/active/agents", body)
     return data
@@ -496,15 +532,25 @@ export const agentAPI = {
    * name. Old call sites that pass only an agent id can still call
    * ``regenerate(agentId)`` — the second arg defaults to the first.
    */
-  async regenerate(sessionId, creatureId, { turnIndex, branchView } = {}) {
+  async regenerate(sessionId, creatureId, { turnIndex, branchView, requestId, locator } = {}) {
     const sid = sessionId || "_"
     const cid = creatureId || sessionId
     const body = {}
     if (turnIndex != null) body.turn_index = turnIndex
     if (branchView && Object.keys(branchView).length) body.branch_view = branchView
+    if (requestId) body.request_id = requestId
+    if (locator) {
+      body.target = {
+        event_id: locator.eventId,
+        turn_index: locator.turnIndex,
+        branch_id: locator.branchId,
+      }
+    }
+    // This POST blocks through the whole rerun turn — no client timeout.
     const { data } = await api.post(
       `/sessions/${encodeTarget(sid)}/creatures/${encodeTarget(cid)}/regenerate`,
       body,
+      { timeout: 0 },
     )
     return data
   },
@@ -517,11 +563,21 @@ export const agentAPI = {
     if (target.branchView && Object.keys(target.branchView).length) {
       body.branch_view = target.branchView
     }
+    if (target.requestId) body.request_id = target.requestId
+    if (target.locator) {
+      body.target = {
+        event_id: target.locator.eventId,
+        turn_index: target.locator.turnIndex,
+        branch_id: target.locator.branchId,
+      }
+    }
     const sid = sessionId || "_"
     const cid = creatureId || sessionId
+    // This POST blocks through the whole rerun turn — no client timeout.
     const { data } = await api.post(
       `/sessions/${encodeTarget(sid)}/creatures/${encodeTarget(cid)}/messages/${msgIdx}/edit`,
       body,
+      { timeout: 0 },
     )
     return data
   },
@@ -641,6 +697,12 @@ export const filesAPI = {
  *  are kept for the per-creature URL methods.
  */
 export const sessionAPI = {
+  /** Conversations that are still open, whether live or dormant. */
+  async listOpen() {
+    const { data } = await api.get("/sessions/open")
+    return data
+  },
+
   /** Active sessions — list every running session. */
   async listActive() {
     const { data } = await api.get("/sessions/active")
@@ -660,6 +722,11 @@ export const sessionAPI = {
     await api.delete(`/sessions/active/${encodeTarget(id)}`)
   },
 
+  async endConversation(conversationId) {
+    const { data } = await api.post(`/sessions/open/${encodeTarget(conversationId)}/end`)
+    return data
+  },
+
   // ── saved-session lookups ────────────────────────────────────────
 
   async list({ limit = 20, offset = 0, search = "", refresh = false } = {}) {
@@ -670,10 +737,40 @@ export const sessionAPI = {
     return data
   },
 
+  /** Inspect saved workspaces without creating a runtime. */
+  async preflightResume(sessionName, opts = {}) {
+    const body = {}
+    if (opts.onNode && opts.onNode !== "_host") body.on_node = opts.onNode
+    if (opts.members) body.members = opts.members
+    if (opts.pwd) body.pwd = opts.pwd
+    if (opts.workspaceOverrides) {
+      body.workspace_overrides = opts.workspaceOverrides
+    }
+    if (opts.memberWorkspaceOverrides) {
+      body.member_workspace_overrides = opts.memberWorkspaceOverrides
+    }
+    if (opts.memberPwdOverrides) {
+      body.member_pwd_overrides = opts.memberPwdOverrides
+    }
+    const { data } = await api.post(`/sessions/${sessionName}/resume/preflight`, body)
+    return data
+  },
+
   /** @returns {Promise<{instance_id: string, type: string, session_name: string}>} */
   async resume(sessionName, opts = {}) {
     const body = {}
     if (opts.onNode && opts.onNode !== "_host") body.on_node = opts.onNode
+    if (opts.members) body.members = opts.members
+    if (opts.pwd) body.pwd = opts.pwd
+    if (opts.workspaceOverrides) {
+      body.workspace_overrides = opts.workspaceOverrides
+    }
+    if (opts.memberWorkspaceOverrides) {
+      body.member_workspace_overrides = opts.memberWorkspaceOverrides
+    }
+    if (opts.memberPwdOverrides) {
+      body.member_pwd_overrides = opts.memberPwdOverrides
+    }
     const { data } = await api.post(`/sessions/${sessionName}/resume`, body)
     return data
   },
@@ -991,8 +1088,19 @@ export const settingsAPI = {
     const { data } = await api.get(`/settings/mcp/${name}/usage`)
     return data
   },
-  async getCodexUsage() {
-    const { data } = await api.get("/settings/codex-usage")
+  async getCodexUsage(node = "_host") {
+    const { data } = await api.get("/settings/codex-usage", _nodeQuery(node))
+    return data
+  },
+  /**
+   * Redeem a Codex rate-limit reset credit. ``idempotency_key`` must be
+   * stable across retries of the same redeem so a double-submit can't
+   * double-spend; ``credit_id`` targets a specific credit when known.
+   * @returns {Promise<{outcome: 'reset'|'nothingToReset'|'noCredit'|'alreadyRedeemed', idempotency_key: string}>}
+   */
+  async codexResetConsume({ idempotencyKey, creditId } = {}, node = "_host") {
+    const body = { idempotency_key: idempotencyKey || null, credit_id: creditId || null }
+    const { data } = await api.post("/settings/codex-reset-consume", body, _nodeQuery(node))
     return data
   },
   async getCodexStatus(node = "_host") {

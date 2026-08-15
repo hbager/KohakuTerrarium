@@ -1,11 +1,8 @@
 """Runtime group-prompt — keeps each creature's system prompt in sync
 with the live wiring it has access to.
 
-Replaces ``studio.sessions.runtime_topology``. The block lives at the
-Terrarium layer because engine-driven mutations (tool calls, recipe
-applies, hot-plug API operations) all flow through one engine — keeping
-the refresh listener engine-side guarantees no path forgets to update
-the prompt.
+The block lives at the Terrarium layer so every engine mutation path refreshes
+the prompt consistently.
 
 Sentinel-bounded by ``<!-- runtime-graph -->`` ... ``<!-- /runtime-graph -->``
 so repeated refreshes replace the previous block instead of stacking.
@@ -182,7 +179,10 @@ def build_runtime_graph_section(engine: "Terrarium", creature: "Creature") -> st
     output_in: list[str] = []
     output_out: list[str] = []
     self_id = getattr(creature.agent, "_creature_id", creature.creature_id)
-    for other_cid, other_creature in engine._creatures.items():
+    for other_cid in sorted(graph.creature_ids):
+        other_creature = engine._creatures.get(other_cid)
+        if other_creature is None:
+            continue
         agent_cfg = getattr(other_creature.agent, "config", None)
         wiring_entries = (
             getattr(agent_cfg, "output_wiring", None) if agent_cfg else None
@@ -196,7 +196,7 @@ def build_runtime_graph_section(engine: "Terrarium", creature: "Creature") -> st
     own_entries = (getattr(own_cfg, "output_wiring", None) if own_cfg else None) or []
     for entry in own_entries:
         target = getattr(entry, "to", "")
-        if target:
+        if target == "root" or target in graph.creature_ids:
             output_out.append(target)
 
     spawned: list[tuple[str, str]] = []

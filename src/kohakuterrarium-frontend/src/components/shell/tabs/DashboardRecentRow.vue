@@ -34,6 +34,7 @@ import { useInstancesStore } from "@/stores/instances"
 import { useTabsStore } from "@/stores/tabs"
 import { sessionAPI } from "@/utils/api"
 import { useI18n } from "@/utils/i18n"
+import { openSavedSessionHistory, prepareWorkspaceResume } from "@/utils/workdirPrompt"
 import { extractTextPreview } from "@/utils/multimodal"
 
 const props = defineProps({ session: { type: Object, required: true } })
@@ -77,7 +78,21 @@ async function onResume() {
   if (!sessionId.value || resuming.value) return
   resuming.value = true
   try {
-    const result = await sessionAPI.resume(sessionId.value)
+    const onNode = props.session.on_node || props.session.home_node || props.session.node_id
+    const prepared = await prepareWorkspaceResume(sessionId.value, { onNode })
+    if (prepared.action === "history") {
+      openSavedSessionHistory(sessionId.value)
+      return
+    }
+    if (prepared.action !== "resume") return
+    const result = await sessionAPI.resume(sessionId.value, {
+      onNode,
+      members: prepared.members,
+      workspaceOverrides: prepared.workspaceOverrides,
+      memberWorkspaceOverrides: prepared.memberWorkspaceOverrides,
+      memberPwdOverrides: prepared.memberPwdOverrides,
+      pwd: prepared.pwd,
+    })
     await instances.fetchAll()
     const id = result?.instance_id
     if (id) {

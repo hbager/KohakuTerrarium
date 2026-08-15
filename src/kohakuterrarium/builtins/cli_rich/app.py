@@ -29,6 +29,7 @@ redraws the app area below the cursor's new position.
 
 import asyncio
 import sys
+import weakref
 from typing import Any
 
 from prompt_toolkit.application import Application
@@ -42,12 +43,14 @@ from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.text import Text
 
+from kohakuterrarium.builtins.cli_rich.app_drive import AppDriveMixin
 from kohakuterrarium.builtins.cli_rich.app_multi import AppMultiCreatureMixin
 from kohakuterrarium.builtins.cli_rich.app_output import AppOutputMixin
 from kohakuterrarium.builtins.cli_rich.app_pickers import AppPickersMixin
 from kohakuterrarium.builtins.cli_rich.commit import ScrollbackCommitter, SessionReplay
 from kohakuterrarium.builtins.cli_rich.composer import Composer
 from kohakuterrarium.builtins.cli_rich.dialogs.bus_overlay import BusInteractiveOverlay
+from kohakuterrarium.builtins.cli_rich.dialogs.drive_overlay import DriveOverlay
 from kohakuterrarium.builtins.cli_rich.dialogs.model_picker import ModelPicker
 from kohakuterrarium.builtins.cli_rich.dialogs.module_picker import ModulePicker
 from kohakuterrarium.builtins.cli_rich.dialogs.settings import SettingsOverlay
@@ -75,13 +78,8 @@ logger = get_logger(__name__)
 DEFAULT_WIDTH = 100
 
 
-class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
-    """Single-Application orchestrator for ``--mode cli``.
-
-    Output events from the agent's OutputRouter (``on_text_chunk``,
-    ``on_tool_start``, …) are provided by ``AppOutputMixin`` — see
-    ``app_output.py`` — to keep this file focused on lifecycle + layout.
-    """
+class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin, AppDriveMixin):
+    """Orchestrate the Rich CLI lifecycle, layout, input, and overlays."""
 
     def __init__(self, agent: Any):
         self.agent = agent
@@ -91,7 +89,15 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
             load_presets=self._load_presets_for_picker,
             on_apply=self._apply_model_selector,
         )
-        self.settings_overlay = SettingsOverlay()
+        self.settings_overlay = SettingsOverlay(get_engine=lambda: self.engine)
+        self.drive_overlay = DriveOverlay(
+            get_engine=lambda: self.engine,
+            get_creature_id=self._drive_focus_id,
+            schedule=lambda coro: spawn(coro),
+            on_invalidate=self._invalidate,
+            on_close=self._stop_drive_watch,
+        )
+        self._drive_watch_task: asyncio.Task | None = None
         self.module_picker = ModulePicker(get_agent=lambda: self.agent)
         self.bus_overlay = BusInteractiveOverlay(
             get_router=lambda: getattr(self.agent, "output_router", None),
@@ -101,12 +107,15 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
         self._exit_requested = False
         self._processing = False
         self._command_registry: dict = {}
+        self._command_registry_agents: list[weakref.ReferenceType] = []
         self._pending_task: asyncio.Task | None = None
+        self._pending_task_target: str | None = None
+        self._turn_tasks: dict[str, asyncio.Task] = {}
         self._ctrl_c_armed = False
         self._ctrl_c_reset_task: asyncio.Task | None = None
         self._render_ticker_task: asyncio.Task | None = None
 
-        # Console used only for committing to scrollback (via run_in_terminal).
+        # Scrollback writes must run outside prompt_toolkit's live area.
         self._scroll_console = Console(
             force_terminal=True,
             color_system="truecolor",
@@ -116,9 +125,7 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
         )
         self.committer = ScrollbackCommitter(self)
 
-        # Initialize footer with model info — prefer the canonical
-        # ``provider/name[@variations]`` identifier so the footer
-        # matches what ``/model`` shows and what the picker emits.
+        # The canonical profile name keeps the footer consistent with /model.
         model = agent.llm_identifier() or getattr(agent.llm, "model", "") or ""
         if model:
             self.live_region.update_footer_model(model)
@@ -126,8 +133,7 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
         if max_ctx:
             self.live_region.footer._max_context = max_ctx
 
-        # Composer (built before the Application so we can pass its
-        # text_area + key_bindings into the Layout).
+        # The Application layout depends on the composer's controls and bindings.
         self.composer = Composer(
             creature_name=getattr(agent.config, "name", "creature"),
             on_submit=self._handle_submit,
@@ -147,7 +153,6 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
         )
 
         self.app: Application | None = None
-        # Multi-creature state (topic 08) — see AppMultiCreatureMixin.
         self.multi_creature_enabled = False
         self.engine = None
         self.focus_controller = FocusController()
@@ -157,57 +162,43 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
         self.agent_overlay = None
         self.peek_panel = None
 
-    # ── Public lifecycle ──
+    def setup_single_creature(self, engine: Any, focus_creature_id: str) -> None:
+        """Bind engine and focus state for a single-creature run."""
+        self.engine = engine
+        self.focus_controller = FocusController(
+            creature_ids=[focus_creature_id], focus_id=focus_creature_id
+        )
+
     async def run(self) -> None:
         """Run the rich CLI loop until exit."""
         self._wire_command_registry()
-        self._print_banner()  # Banner goes to scrollback (no app yet)
+        self._print_banner()  # The live Application does not exist yet.
 
         self.app = self._build_application()
 
-        # Capture previous values BEFORE the try block so ``finally``
-        # can safely restore them even if we bail out early.
+        # Capture process-wide state before any setup can fail.
         loop = asyncio.get_running_loop()
         prev_handler = loop.get_exception_handler()
         prev_stderr = sys.stderr
 
         try:
-            # Route asyncio loop exceptions to the file logger so random
-            # background-task crashes don't paint garbage on the screen.
+            # Background tracebacks must not corrupt the live region.
             loop.set_exception_handler(self._loop_exception_handler)
-            # Capture stderr for the duration of the app — every stray
-            # write (asyncio task warnings, prompt_toolkit error prints,
-            # library tracebacks) goes to the log file instead of
-            # corrupting the live region.
+            # Redirect stray library and asyncio diagnostics away from the terminal.
             sys.stderr = StderrToLogger()
-            # Ask the terminal to emit Shift+Enter / Ctrl+Enter as
-            # distinct keys (xterm modifyOtherKeys=2 + kitty CSI u).
-            # Terminals that don't support either silently ignore.
+            # Unsupported terminals safely ignore these keyboard protocols.
             enable_enhanced_keyboard()
 
-            # Conditional render ticker — drives the spinner / elapsed
-            # clock animation while something is actually animating, and
-            # stays silent the rest of the time so the user's mouse
-            # selection sticks. Replaces the unconditional
-            # ``refresh_interval`` we used to pass to ``Application``.
+            # Redraw only during animation so idle mouse selections remain intact.
             self._render_ticker_task = spawn(self._render_ticker())
 
-            # ``handle_sigint`` MUST stay True (the default). It tells
-            # prompt_toolkit to install a SIGINT handler that translates
-            # the signal into a synthetic ``Keys.SIGINT`` keystroke — which
-            # is the only way our ``@kb.add(Keys.SIGINT, eager=True)``
-            # binding fires. With ``handle_sigint=False`` the signal
-            # bypasses prompt_toolkit entirely and Python's default
-            # handler raises ``KeyboardInterrupt``, tearing down the
-            # asyncio loop so neither the buffer-clear branch nor the
-            # double-tap-to-exit prompt ever runs (and on Windows the
-            # whole CLI just dies on the first Ctrl+C).
+            # Keep prompt_toolkit's default SIGINT handling so Ctrl+C reaches its
+            # key binding instead of raising KeyboardInterrupt, especially on Windows.
             await self.app.run_async()
         finally:
             disable_enhanced_keyboard()
             sys.stderr = prev_stderr
             loop.set_exception_handler(prev_handler)
-            # Cancel any in-flight agent task
             if self._render_ticker_task and not self._render_ticker_task.done():
                 self._render_ticker_task.cancel()
                 try:
@@ -220,28 +211,20 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
                     await self._ctrl_c_reset_task
                 except (asyncio.CancelledError, Exception):
                     pass
-            if self._pending_task and not self._pending_task.done():
-                self._pending_task.cancel()
-                try:
-                    await self._pending_task
-                except (asyncio.CancelledError, Exception):
-                    pass
+            pending = set(self._turn_tasks.values())
+            if self._pending_task:
+                pending.add(self._pending_task)
+            for task in pending:
+                if not task.done():
+                    task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            self._turn_tasks.clear()
             self.app = None
-            print()  # Trailing newline so the terminal cursor is clean
+            print()  # Leave the shell cursor on a clean line.
 
     async def _render_ticker(self) -> None:
-        """Wake the renderer ~5 fps while something on screen needs to animate.
-
-        Replaces ``Application(refresh_interval=0.2)``. The unconditional
-        version of that flag fired even when the agent was idle, and
-        each redraw repainted the prompt area, which silently destroyed
-        any in-progress mouse selection — copy from the rich CLI was
-        effectively impossible. This loop only schedules a redraw when
-        :attr:`LiveRegion.needs_animation` is True (spinner up, elapsed
-        clock ticking, tool running). When the agent is idle we tick at
-        a slower cadence and don't invalidate, so selection sticks and
-        right-click / Ctrl+Shift+C work as expected.
-        """
+        """Refresh active animations without disturbing idle text selection."""
         idle_sleep = 0.5
         active_sleep = 0.2
         while True:
@@ -260,12 +243,7 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
                 await asyncio.sleep(active_sleep)
 
     def _loop_exception_handler(self, loop, context: dict) -> None:
-        """Send asyncio loop exceptions to the file logger only.
-
-        Without this, asyncio's default handler prints the traceback to
-        stderr — which corrupts the live region. Sending to the logger
-        keeps the screen clean while still leaving a trail in the log file.
-        """
+        """Log asyncio loop exceptions without writing into the live region."""
         message = context.get("message", "<no message>")
         exc = context.get("exception")
         if exc is not None:
@@ -273,10 +251,7 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
         else:
             logger.error("loop exception: %s | context=%r", message, context)
 
-    # ── Application + Layout ──
-
     def _build_application(self) -> Application:
-        # Live status window — text comes from LiveRegion.to_ansi().
         status_control = FormattedTextControl(
             text=self._status_text,
             focusable=False,
@@ -295,18 +270,13 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
                 or self.model_picker.visible
                 or self.module_picker.visible
                 or self.settings_overlay.visible
+                or self.drive_overlay.visible
                 or (self.agent_overlay is not None and self.agent_overlay.visible)
                 or self.live_region.has_content
             ),
         )
 
-        # Input area — no more Frame(title="message"). User flagged the
-        # labelled box as "not what other CLIs look like" and pointed
-        # out the bottom separator mattered most. We replace the full
-        # Frame with a pair of dim horizontal rules (top + bottom) that
-        # bracket the textarea. The bottom rule doubles as the visual
-        # boundary between composer and footer, which the Frame used to
-        # provide via its lower edge.
+        # Rules delimit the composer without adding a bulky titled frame.
         input_top_rule = Window(
             char="─",
             height=Dimension.exact(1),
@@ -318,11 +288,7 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
             style="class:input.rule",
         )
 
-        # Slash-command hint bar — renders as a single line between the
-        # input frame and the footer. Visible only when the buffer starts
-        # with "/" and has matches. Think of it as the always-on version
-        # of the completion dropdown: even before you type a letter, the
-        # bar shows you what commands exist at all.
+        # Hints appear only for slash-prefixed input with matching commands.
         hint_control = FormattedTextControl(
             text=self._hint_text,
             focusable=False,
@@ -339,7 +305,6 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
             filter=Condition(self._hint_has_content),
         )
 
-        # Topic 08 — roster row (hidden for single-creature).
         roster_container = ConditionalContainer(
             content=Window(
                 content=FormattedTextControl(
@@ -352,7 +317,6 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
             filter=Condition(self.roster_visible),
         )
 
-        # Footer (single line).
         footer_control = FormattedTextControl(
             text=self._footer_text,
             focusable=False,
@@ -395,28 +359,13 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
             erase_when_done=False,
             color_depth=ColorDepth.TRUE_COLOR,
             style=style,
-            # NOTE: ``refresh_interval`` is intentionally left unset.
-            # An unconditional periodic redraw repaints the prompt area
-            # several times per second — which on every terminal we've
-            # tested clears any in-progress mouse selection, making it
-            # impossible to copy text out of the rich CLI. The
-            # ``_render_ticker`` task spawned in :meth:`run` instead
-            # invalidates the screen only while the live region has
-            # something animating (spinner / elapsed clock / running
-            # tools). When the agent is idle we never invalidate, so
-            # selection sticks and Ctrl+Shift+C / right-click-copy work
-            # as expected.
+            # A fixed refresh interval destroys terminal text selection while idle.
             output=make_output(),
         )
 
-    # ── FormattedTextControl callbacks ──
-
     def _status_text(self):
         width = self._terminal_width()
-        # When an overlay is open, it owns the status area — the
-        # live region's normal content (streaming message, tools) is
-        # hidden until the overlay closes, so all user attention is on
-        # the overlay.
+        # The active overlay exclusively owns the status area.
         if self.bus_overlay.visible:
             ansi = self.bus_overlay.render(width)
             return ANSI(ansi) if ansi else ""
@@ -428,6 +377,9 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
             return ANSI(ansi) if ansi else ""
         if self.settings_overlay.visible:
             ansi = self.settings_overlay.render(width)
+            return ANSI(ansi) if ansi else ""
+        if self.drive_overlay.visible:
+            ansi = self.drive_overlay.render(width)
             return ANSI(ansi) if ansi else ""
         if self.agent_overlay is not None and self.agent_overlay.visible:
             ansi = self.agent_overlay_ansi(width)
@@ -461,9 +413,7 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
 
     def _footer_text(self):
         width = self._terminal_width()
-        # Sync the footer's cursor-position indicator from the composer's
-        # current Document. Cheap (document access is O(1)) and keeps the
-        # footer responsive to every keystroke without a separate hook.
+        # Reading the current Document avoids a separate cursor-change hook.
         try:
             doc = self.composer.text_area.buffer.document
             total_lines = doc.line_count
@@ -491,34 +441,37 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
             )
             return DEFAULT_WIDTH
 
-    # ── Submission ──
-
     def _handle_submit(self, text: str) -> None:
-        """Called by the composer when the user hits Enter on a non-empty line."""
+        """Dispatch a non-empty composer submission."""
         if not text.strip():
             return
 
-        # Feat 3 mid-turn: queue in live region (not chat history) and
-        # leave _pending_task alone. Canonical line is committed by
-        # RichCLIOutput._dispatch on user_input_injected from drain.
+        # Mid-turn input remains pending until the agent confirms its injection.
         is_slash = text.startswith("/")
         is_at_name = self.multi_creature_enabled and text.startswith("@")
-        if self._processing and not is_slash and not is_at_name:
+        if self._focused_is_processing() and not is_slash and not is_at_name:
+            target_agent = self.agent
             self.live_region.add_queued_input(text)
             self._invalidate()
-            spawn(self._mid_turn_inject(text))
+            spawn(self._mid_turn_inject(text, target_agent))
             return
 
-        if self._pending_task and not self._pending_task.done():
-            self._pending_task.cancel()
+        pending = self._focused_pending_task()
+        focused_processing = self._focused_is_processing()
+        if pending and not pending.done():
+            pending.cancel()
+            # The engine owns the active turn, so cancelling this wrapper is insufficient.
+            if focused_processing:
+                self.agent.interrupt()
 
-        # @name retargets (runs before slash so @bob /help routes to bob).
+        # Resolve @name before slash commands so targeted commands reach that creature.
         if self.multi_creature_enabled:
             redirect = parse_at_name(text)
             if redirect is not None:
                 if redirect.is_broadcast:
                     self.commit_user_message_broadcast(text)
                     self._pending_task = spawn(self.broadcast_to_all(redirect.payload))
+                    self._pending_task_target = self._focused_target_id()
                 else:
                     target = self.resolve_creature_by_name(redirect.name)
                     if target is None:
@@ -528,82 +481,187 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
                         self._invalidate()
                         return
                     self.commit_user_message_for(target.creature_id, text)
-                    self._pending_task = spawn(
-                        self.inject_to_creature(target.creature_id, redirect.payload)
+                    self._spawn_agent_turn(
+                        redirect.payload,
+                        target_id=target.creature_id,
+                        target_agent=target.agent,
+                        target_region=self.live_region_widgets[target.creature_id],
                     )
                 return
 
         self._commit_user_message(text)
 
         if text.startswith("/"):
-            self._pending_task = spawn(self._handle_slash(text))
+            self._spawn_slash(text)
             return
 
-        self._processing = True
-        self.live_region.set_processing(True)
+        self._spawn_agent_turn(
+            text,
+            target_id=self._focused_target_id(),
+            target_agent=self.agent,
+            target_region=self.live_region,
+        )
+
+    def _focused_target_id(self) -> str:
+        if self.multi_creature_enabled:
+            return self.focus_controller.focus_id
+        return ""
+
+    def _focused_pending_task(self) -> asyncio.Task | None:
+        if not self.multi_creature_enabled:
+            return self._pending_task
+        target_id = self._focused_target_id()
+        turn_task = self._turn_tasks.get(target_id)
+        if turn_task and not turn_task.done():
+            return turn_task
+        if self._pending_task_target == target_id:
+            return self._pending_task
+        return None
+
+    def _focused_is_processing(self) -> bool:
+        if not self.multi_creature_enabled and self._processing:
+            return True
+        target_id = self._focused_target_id()
+        turn_task = self._turn_tasks.get(target_id)
+        if turn_task and not turn_task.done():
+            return True
+        processing_task = getattr(self.agent, "_processing_task", None)
+        return bool(processing_task and not processing_task.done())
+
+    def _spawn_agent_turn(
+        self,
+        text: str,
+        *,
+        target_id: str,
+        target_agent: Any,
+        target_region: LiveRegion,
+    ) -> asyncio.Task:
+        """Start and track one foreground turn for a captured creature."""
+        key = target_id if self.multi_creature_enabled else ""
+        target_region.set_processing(True)
+        if not self.multi_creature_enabled:
+            self._processing = True
         self._invalidate()
 
-        async def _send():
+        async def _send() -> None:
             try:
-                await self.agent.inject_input(text, source="cli")
+                await target_agent.inject_input(text, source="cli")
             except Exception as e:
                 logger.exception("Error processing input", error=str(e))
             finally:
-                self._processing = False
-                self.live_region.set_processing(False)
-                # Close any deferred tool-block rule (hanging ═══ fix).
-                self.committer.flush_block_close()
-                self._invalidate()
+                current = asyncio.current_task()
+                if self._turn_tasks.get(key) is current:
+                    self._turn_tasks.pop(key, None)
+                    target_region.set_processing(False)
+                    if not self.multi_creature_enabled:
+                        self._processing = False
+                    self.committer.flush_block_close()
+                    self._invalidate()
 
-        self._pending_task = spawn(_send())
+        task = spawn(_send())
+        self._turn_tasks[key] = task
+        self._pending_task = task
+        self._pending_task_target = key
+        return task
 
-    async def _mid_turn_inject(self, text: str) -> None:
-        # Feat 3 mid-turn follow-up. Does NOT touch _pending_task.
+    def _spawn_slash(self, text: str) -> asyncio.Task:
+        """Run a slash command and associate it with the focused creature."""
+        target_id = self._focused_target_id()
+        task = spawn(self._handle_slash(text))
+        self._pending_task = task
+        self._pending_task_target = target_id
+        return task
+
+    async def _mid_turn_inject(self, text: str, target_agent: Any = None) -> None:
         try:
-            await self.agent.inject_input(text, source="cli")
+            await (target_agent or self.agent).inject_input(text, source="cli")
         except asyncio.CancelledError:
             raise
         except Exception as e:
             logger.exception("Mid-turn inject failed", error=str(e))
 
-    # ── Slash command dispatch ──
-
     def _wire_command_registry(self) -> None:
+        # The live registry includes package, constructor, and plugin commands.
+        registry = self._agent_command_registry()
+        self.composer.set_command_registry(registry)
+        self.composer.set_command_context(agent=self.agent)
+        self.hint_bar.set_registry(registry)
+        self._command_registry = registry
+        # Refresh command surfaces when plugins change the registry.
+        self._command_registry_agents = [
+            ref for ref in self._command_registry_agents if ref() is not None
+        ]
+        if not any(ref() is self.agent for ref in self._command_registry_agents):
+            add_listener = getattr(self.agent, "add_user_command_listener", None)
+            if callable(add_listener):
+                app_ref = weakref.ref(self)
+                agent_ref = weakref.ref(self.agent)
+
+                def on_commands_changed(commands: dict) -> None:
+                    app = app_ref()
+                    agent = agent_ref()
+                    if app is not None and agent is not None:
+                        app._on_agent_user_commands_changed(agent, commands)
+
+                add_listener(on_commands_changed)
+            self._command_registry_agents.append(weakref.ref(self.agent))
+
+    def _agent_command_registry(self) -> dict:
+        lister = getattr(self.agent, "list_user_commands", None)
+        if callable(lister):
+            live = lister()
+            if live:
+                return dict(live)
         registry: dict = {}
         for name in list_builtin_user_commands():
             cmd = get_builtin_user_command(name)
             if cmd:
                 registry[name] = cmd
-        self.composer.set_command_registry(registry)
-        self.composer.set_command_context(agent=self.agent)
-        self.hint_bar.set_registry(registry)
+        return registry
+
+    def _on_agent_user_commands_changed(self, agent: Any, commands: dict) -> None:
+        """Apply command refreshes only for the currently focused agent."""
+        if agent is not self.agent:
+            return
+        self._on_user_commands_changed(commands)
+
+    def _on_user_commands_changed(self, commands: dict) -> None:
+        """Re-point the composer / hint bar at a refreshed command registry."""
+        registry = dict(commands)
         self._command_registry = registry
+        try:
+            self.composer.set_command_registry(registry)
+            self.hint_bar.set_registry(registry)
+        except Exception:  # pragma: no cover - command refresh is best-effort UI wiring
+            pass
+        self._invalidate()
 
     async def _handle_slash(self, text: str) -> None:
+        target_id = self._focused_target_id()
+        target_agent = self.agent
+        target_region = self.live_region
         name, args = parse_slash_command(text)
 
-        # Special path: `/model` with no args opens the interactive
-        # picker. A full selector string is still handled the standard
-        # way via the /model command's own execute().
+        # Bare /model is interactive; selectors use the command implementation.
         if name == "model" and not args.strip():
             self.model_picker.open()
             self._invalidate()
             return
 
-        # Special path: `/settings` / `/config` open the settings overlay.
-        # Unlike /model there's no text-form equivalent — it's always
-        # the interactive surface. The SettingsCommand class still exists
-        # so the command shows up in /help and the slash-hint bar.
+        # Settings commands are interactive but remain registered for discovery.
         if name in ("settings", "config") and not args.strip():
             self.settings_overlay.open()
             self._invalidate()
             return
 
-        # Special path: `/module` (or aliases) opens the module picker.
-        # Bare ``/module`` shows the list; ``/module edit <name>`` opens
-        # the form for that module directly. Other subcommands
-        # (``set`` / ``show`` / ``enable`` / …) fall through to the
-        # text command — single-shot operations don't need an overlay.
+        # Bare /drives opens the overlay; subcommands retain scriptable text output.
+        if name in ("drives", "drive") and not args.strip():
+            self.drive_overlay.open()
+            self._start_drive_watch()
+            self._invalidate()
+            return
+
+        # Listing and editing need the picker; one-shot module actions stay textual.
         if name in ("module", "modules", "mod"):
             stripped = args.strip()
             sub, _, rest = stripped.partition(" ")
@@ -616,13 +674,12 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
                 self._invalidate()
                 return
 
-        # Multi-creature topology commands route through the mixin so
-        # the engine + creature_id reach their context.
+        # Topology commands require both engine and focused-creature context.
         if await self.dispatch_topology_command(name, args):
             return
 
         try:
-            result = await self.agent._try_slash_command_text(text)
+            result = await target_agent._try_slash_command_text(text)
         except Exception as e:
             self._commit_text(f"[red]Command error:[/red] {e}")
             return
@@ -636,33 +693,17 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
         elif result.output and result.consumed:
             self._commit_text(result.output)
         elif result.output:
-            self._processing = True
-            self.live_region.set_processing(True)
-            self._invalidate()
-
-            async def _send_skill_turn():
-                try:
-                    await self.agent.inject_input(result.output, source="cli")
-                except Exception as e:
-                    logger.exception("Error processing skill slash input", error=str(e))
-                finally:
-                    self._processing = False
-                    self.live_region.set_processing(False)
-                    self.committer.flush_block_close()
-                    self._invalidate()
-
-            self._pending_task = spawn(_send_skill_turn())
+            self._spawn_agent_turn(
+                result.output,
+                target_id=target_id,
+                target_agent=target_agent,
+                target_region=target_region,
+            )
 
         if name in ("exit", "quit"):
             self._exit_requested = True
             if self.app:
                 self.app.exit()
-
-    # Output event handlers (on_text_chunk, on_tool_start, etc.) live in
-    # ``AppOutputMixin`` (app_output.py). Kept separate so this file stays
-    # focused on lifecycle + layout.
-
-    # ── Commit helpers ──
 
     def _commit_renderable(self, renderable: Any) -> None:
         self.committer.renderable(renderable)
@@ -680,30 +721,12 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
         self.committer.ansi(ansi)
 
     def replay_session(self, events: list[dict]) -> None:
-        """Replay session events to scrollback. Called during resume,
-        after ``agent.start()`` but before ``app.run_async()``.
-
-        Also hydrates the footer's cumulative token counters AND the
-        context-window limits from the event stream BEFORE the replay
-        renders anything, so ``↑ / ↓`` and ``ctx %`` read correctly
-        immediately after resume — not after the first new LLM call.
-        Mirrors the TUI's ``on_resume`` approach (summing token_usage
-        events) which is more reliable than reading session state
-        directly.
-        """
+        """Restore footer metrics and replay session events to scrollback."""
         self._restore_footer_from_events(events)
         SessionReplay(self).replay(events)
 
     def _restore_footer_from_events(self, events: list[dict]) -> None:
-        """Seed the footer's cumulative token + context values from events.
-
-        Sums every ``token_usage`` event in the replay stream into
-        ``input_total`` / ``output_total`` / ``cached_total``, records
-        the most recent prompt size as ``last_prompt``, and pulls the
-        latest ``max_context`` / ``compact_threshold`` from any
-        ``session_info`` event. All of those fields otherwise stay at 0
-        until the first fresh LLM call after resume.
-        """
+        """Reconstruct cumulative token and context metrics from replay events."""
         if not events:
             return
         total_in = 0
@@ -712,7 +735,7 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
         last_prompt = 0
         max_ctx = 0
         for evt in events:
-            # Events may be wrapped {"type": ..., "data": {...}} or flat.
+            # Session readers may return wrapped or flat event records.
             etype = evt.get("type") or evt.get("etype") or ""
             data = evt.get("data") if isinstance(evt.get("data"), dict) else evt
             if etype == "token_usage":
@@ -739,8 +762,6 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
         if max_ctx:
             footer._max_context = max_ctx
 
-    # ── Misc helpers ──
-
     def _invalidate(self) -> None:
         if self.app is not None:
             self.app.invalidate()
@@ -750,14 +771,14 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
         if self._ctrl_c_reset_task and not self._ctrl_c_reset_task.done():
             self._ctrl_c_reset_task.cancel()
             self._ctrl_c_reset_task = None
-        if self._processing and self.agent:
+        if self._focused_is_processing() and self.agent:
             try:
                 self.agent.interrupt()
             except Exception as e:
                 logger.exception("Interrupt failed", error=str(e))
 
     def _on_ctrl_c(self) -> None:
-        if self._processing:
+        if self._focused_is_processing():
             self._on_interrupt()
             return
         if self._ctrl_c_armed:
@@ -811,13 +832,7 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
 
     def _on_exit(self) -> None:
         self._exit_requested = True
-        # Wake the agent's input drive loop so the creature's input task
-        # exits cleanly when the user hits Ctrl+D. Without this the loop
-        # stays parked on whatever its module is awaiting (RichCLIInput's
-        # ``_wait_event``, a queue, etc.) and the engine teardown blocks.
-        # Only fires for modules that expose ``request_exit`` — leaves
-        # configured inputs without that hook (Discord, webhooks, …)
-        # untouched so the engine teardown drives their stop instead.
+        # Wake supported input modules so teardown does not block on pending input.
         request_exit = getattr(self.agent.input, "request_exit", None)
         if callable(request_exit):
             try:
@@ -839,20 +854,13 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
             return []
 
     def _apply_model_selector(self, selector: str) -> None:
-        """Apply a selector string chosen from the model picker.
-
-        Dispatches through the same ``/model <selector>`` path that
-        text-based invocation uses, so behaviour (validation, error
-        surfacing, notice-to-scrollback) is identical.
-        """
+        """Apply a picker selection through the standard /model command path."""
         if not selector:
             return
-        self._pending_task = spawn(self._handle_slash(f"/model {selector}"))
+        self._spawn_slash(f"/model {selector}")
 
     def _get_composer_text(self) -> str:
-        """Read the composer textarea contents — for the bus overlay's
-        ``ask_text`` flow (user types into the existing input field
-        rather than a separate buffer)."""
+        """Return composer text for interactive overlay prompts."""
         try:
             return self.composer.text_area.buffer.document.text
         except Exception:
@@ -869,20 +877,14 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
             logger.warning("set_composer_text failed", error=str(e), exc_info=True)
 
     def _on_clear_screen(self) -> None:
-        # Send the standard "clear scrollback + screen" escape — handled
-        # via the committer so it goes through run_in_terminal correctly.
+        # Clearing through the committer preserves prompt_toolkit's live area.
         self.committer.ansi("\x1b[3J\x1b[H\x1b[2J")
-        # Once the user wipes the screen, the paste placeholder tokens
-        # they could see in scrollback are gone too — drop the cached
-        # paste bodies so the in-memory store doesn't grow unbounded
-        # over a long session.
+        # Invisible paste placeholders no longer need their retained payloads.
         self.composer.paste_store.clear()
 
     def _print_banner(self) -> None:
         name = getattr(self.agent.config, "name", "agent")
-        # Prefer the full ``provider/name[@variations]`` identifier over
-        # the raw API model id so the banner matches the ``/model``
-        # picker output and the web ModelSwitcher pill.
+        # The canonical profile name keeps model labels consistent across surfaces.
         model = (
             self.agent.llm_identifier() or getattr(self.agent.llm, "model", "") or ""
         )
@@ -893,7 +895,6 @@ class RichCLIApp(AppPickersMixin, AppOutputMixin, AppMultiCreatureMixin):
         if model:
             banner.append(f" ({model})", style="dim")
         self._scroll_console.print(banner)
-        # One compact hint line. Full keymap lives behind /help.
         self._scroll_console.print(
             Text("Type /help for shortcuts · Ctrl+D to quit", style="dim")
         )

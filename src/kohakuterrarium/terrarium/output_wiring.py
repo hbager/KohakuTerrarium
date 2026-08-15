@@ -29,6 +29,10 @@ from kohakuterrarium.core.output_wiring import (
     OutputWiringEntry,
     render_prompt,
 )
+from kohakuterrarium.terrarium.graph_identity import (
+    GraphIdentityError,
+    resolve_local_graph_target,
+)
 from kohakuterrarium.utils.logging import get_logger
 
 if TYPE_CHECKING:
@@ -55,10 +59,8 @@ class TerrariumOutputWiringResolver:
     ) -> None:
         self._creatures = creatures
         self._root_agent = root_agent
-        # Engine reference is optional — only the terrarium runtime
-        # passes it; standalone construction (tests, embedded use) can
-        # leave it as None.  When present, the emit loop falls through
-        # to ``engine._output_wire_adapter`` for remote dispatch.
+        # Standalone resolvers may omit the engine; when present, its adapter
+        # provides remote dispatch after local target resolution fails.
         self._engine = engine
         # Remember which unknown targets we've already warned about so
         # a mis-typed target doesn't spam the log every turn.
@@ -81,10 +83,10 @@ class TerrariumOutputWiringResolver:
                 self._warn_once(target, "terrarium has no root agent configured")
             return root_agent
 
-        handle = self._resolve_handle(target)
+        handle = self._resolve_handle(target, source=source)
         if handle is None:
             if not self._has_cross_node_peer(target):
-                self._warn_once(target, "no such creature in this terrarium")
+                self._warn_once(target, "no such creature in the source graph")
             return None
         return handle.agent
 
@@ -112,27 +114,69 @@ class TerrariumOutputWiringResolver:
         )
         return True
 
-    def _resolve_handle(self, target: str):
-        handle = self._creatures.get(target)
-        if handle is not None:
-            return handle
-        for creature in self._creatures.values():
-            if getattr(creature, "name", None) == target:
-                return creature
-            agent = getattr(creature, "agent", None)
-            config = getattr(agent, "config", None)
-            if getattr(config, "name", None) == target:
-                return creature
-        return None
+    def _resolve_handle(self, target: str, *, source: str = ""):
+        if self._engine is None:
+            handle = self._creatures.get(target)
+            if handle is not None:
+                return handle
+            matches = [
+                creature
+                for creature in self._creatures.values()
+                if target
+                in {
+                    getattr(creature, "name", None),
+                    getattr(getattr(creature, "config", None), "name", None),
+                    getattr(
+                        getattr(getattr(creature, "agent", None), "config", None),
+                        "name",
+                        None,
+                    ),
+                }
+            ]
+            return matches[0] if len(matches) == 1 else None
+        try:
+            resolved = resolve_local_graph_target(
+                self._engine._topology,
+                self._creatures,
+                caller_id=source,
+                target=target,
+            )
+        except GraphIdentityError:
+            return None
+        return self._creatures.get(resolved.target_id)
 
     def _resolve_graph_root_agent(self, source: str | None) -> "Agent | None":
-        source_handle = self._resolve_handle(source or "")
-        source_graph = getattr(source_handle, "graph_id", None)
+        source_handle = self._creatures.get(source or "")
+        if self._engine is not None:
+            if (
+                source_handle is None
+                or source_handle.creature_id != source
+                or (
+                    source_graph := self._engine._topology.creature_to_graph.get(source)
+                )
+                is None
+            ):
+                return None
+            graph = self._engine._topology.graphs.get(source_graph)
+            if graph is None or source not in graph.creature_ids:
+                return None
+            candidate_ids = graph.creature_ids
+        else:
+            if source_handle is None:
+                source_handle = self._resolve_handle(source or "", source=source or "")
+            source_graph = getattr(source_handle, "graph_id", None)
+            candidate_ids = self._creatures
         candidates = [
             c
-            for c in self._creatures.values()
+            for creature_id in candidate_ids
+            if (c := self._creatures.get(creature_id)) is not None
+            if c.creature_id == creature_id
             if getattr(c, "is_privileged", False)
-            and (source_graph is None or getattr(c, "graph_id", None) == source_graph)
+            and (
+                self._engine is not None
+                or source_graph is None
+                or getattr(c, "graph_id", None) == source_graph
+            )
         ]
         if not candidates and self._root_agent is not None:
             return self._root_agent
@@ -190,8 +234,11 @@ class TerrariumOutputWiringResolver:
                 # client mode); standalone runs miss and skip as before.
                 forwarder = getattr(self._engine, "_output_wire_adapter", None)
                 if forwarder is not None:
-                    peer = forwarder.peer_for_target(entry.to)
-                    if peer is not None:
+                    source_graph_id = self._engine._topology.creature_to_graph.get(
+                        source
+                    )
+                    peer = forwarder.peer_for_target(entry.to, graph_id=source_graph_id)
+                    if peer is not None and source_graph_id is not None:
                         delivered_content = content if entry.with_content else ""
                         prompt_text = render_prompt(
                             entry,
@@ -201,20 +248,28 @@ class TerrariumOutputWiringResolver:
                             turn_index=turn_index,
                             source_event_type=source_event_type,
                         )
-                        asyncio.create_task(
+                        task = asyncio.create_task(
                             forwarder.forward_event(
-                                peer,
-                                {
-                                    "target_name": entry.to,
-                                    "source": source,
+                                target_name=entry.to,
+                                event={
+                                    "type": "creature_output",
                                     "content": delivered_content,
-                                    "with_content": bool(entry.with_content),
-                                    "source_event_type": source_event_type,
-                                    "turn_index": turn_index,
+                                    "context": {
+                                        "source": source,
+                                        "target": entry.to,
+                                        "with_content": bool(entry.with_content),
+                                        "source_event_type": source_event_type,
+                                        "turn_index": turn_index,
+                                    },
                                     "prompt_override": prompt_text,
                                 },
+                                source_creature_id=source,
+                                source_graph_id=source_graph_id,
                             ),
                             name=f"wiring_remote_{source}_to_{entry.to}_{turn_index}",
+                        )
+                        task.add_done_callback(
+                            lambda t, tgt=entry.to: _log_task_error(t, source, tgt)
                         )
                         continue
                 continue
@@ -253,36 +308,16 @@ class TerrariumOutputWiringResolver:
                 turn_index=turn_index,
                 prompt_override=prompt_text,
             )
-            # Surface the delivery as an activity event on the
-            # receiver's output bus so its chat tab can render an
-            # "inbound wire from <source>" block (instead of leaving
-            # the user wondering why the receiver suddenly started
-            # processing). This runs before the actual delivery task
-            # so the visual cue lands first.
-            try:
-                target_router = getattr(target_agent, "output_router", None)
-                if target_router is not None and hasattr(
-                    target_router, "notify_activity"
-                ):
-                    preview = (delivered_content or "").strip()
-                    if len(preview) > 240:
-                        preview = preview[:239] + "…"
-                    target_router.notify_activity(
-                        "wire_inbound",
-                        f"Inbound from {source}",
-                        metadata={
-                            "from": source,
-                            "to": entry.to,
-                            "with_content": entry.with_content,
-                            "content_preview": preview,
-                            "source_event_type": source_event_type,
-                            "turn_index": turn_index,
-                        },
-                    )
-            except Exception:
-                logger.debug(
-                    "wire_inbound notify failed; receiver router may not support activity emit",
-                )
+            # Runs before the delivery task so the visual cue lands first.
+            notify_inbound_delivery(
+                target_agent,
+                source=source,
+                to=entry.to,
+                content=delivered_content,
+                with_content=entry.with_content,
+                source_event_type=source_event_type,
+                turn_index=turn_index,
+            )
             # Fire-and-forget: don't block the source's finalisation on
             # the target's turn-processing.
             task = asyncio.create_task(
@@ -302,6 +337,55 @@ class TerrariumOutputWiringResolver:
                 with_content=entry.with_content,
                 turn_index=turn_index,
             )
+
+
+def notify_inbound_delivery(
+    target_agent: "Agent",
+    *,
+    source: str,
+    to: str,
+    content: str,
+    with_content: bool,
+    source_event_type: str,
+    turn_index: int,
+) -> None:
+    """Surface an inbound delivery as a ``wire_inbound`` activity on the
+    receiver's output bus, so its chat tab (live stream and history
+    replay alike) renders an "Inbound from <source>" block instead of
+    the receiver visibly starting a turn with no explanation.
+
+    Shared by output wiring, ``group_send``, and ``group_spawn_child``
+    initial-task delivery — every path that pushes a ``creature_output``
+    event into another creature. Best-effort: a router without activity
+    support is skipped silently.
+    """
+    try:
+        router = getattr(target_agent, "output_router", None)
+        if router is None or not hasattr(router, "notify_activity"):
+            return
+        preview = (content or "").strip()
+        if len(preview) > 240:
+            preview = preview[:239] + "…"
+        router.notify_activity(
+            "wire_inbound",
+            f"Inbound from {source}",
+            metadata={
+                "from": source,
+                "to": to,
+                "with_content": with_content,
+                "content_preview": preview,
+                "source_event_type": source_event_type,
+                # The SOURCE's turn number. Never emitted as ``turn_index``:
+                # stream frames and store rows interpret that key as
+                # receiver-timeline coordinates, and the frontend's branch
+                # gate drops frames whose turn/branch pair mixes timelines.
+                "source_turn_index": turn_index,
+            },
+        )
+    except Exception:
+        logger.debug(
+            "wire_inbound notify failed; receiver router may not support activity emit",
+        )
 
 
 async def _safe_deliver(target_agent: "Agent", event) -> None:

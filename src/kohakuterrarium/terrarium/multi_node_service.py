@@ -9,9 +9,6 @@ engine.  Local is local, multi-node is multi-node — never mixed.
 
 It keeps:
 
-- A dict ``{node_id: RemoteTerrariumService}`` for every connected
-  worker.  Entries are added when a client joins membership and
-  removed when it leaves.
 - A ``creature_id → home_node`` registry rebuilt from ``list_creatures``
   fan-out, and kept up-to-date as ``add_creature`` / ``remove_creature``
   succeed.
@@ -36,6 +33,11 @@ from typing import Any
 
 from kohakuterrarium.laboratory._internal.host import HostEngine
 from kohakuterrarium.laboratory.streams import StreamDemux
+from kohakuterrarium.terrarium.drive.multi_node import DriveRouteCache
+from kohakuterrarium.terrarium.drive.multi_node_ops import MultiNodeDriveServiceMixin
+from kohakuterrarium.terrarium.drive.service_protocol import (
+    DriveServiceUnsupportedMixin,
+)
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.terrarium.events import (
     ConnectionResult,
@@ -58,6 +60,9 @@ from kohakuterrarium.terrarium.multi_node_replication import (
     local_broadcast_adapter,
     record_cross_sub,
 )
+from kohakuterrarium.terrarium.multi_node_runtime_options import (
+    MultiNodeRuntimeOptionsMixin,
+)
 from kohakuterrarium.terrarium.multi_node_routing import (
     creature_graph_id,
     list_creatures_fanout,
@@ -68,11 +73,13 @@ from kohakuterrarium.terrarium.multi_node_routing import (
     runtime_graph_snapshot_fanout,
     stream_subscribe,
 )
+from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.terrarium.remote_service import RemoteTerrariumService
 from kohakuterrarium.terrarium.service import (
     CreatureInfo,
     TerrariumService,
 )
+from kohakuterrarium.terrarium.service_dto import BranchMutationResult
 from kohakuterrarium.terrarium.topology import (
     ChannelInfo,
     GraphTopology,
@@ -86,15 +93,19 @@ HOST_NODE = "_host"
 
 
 class CrossNodeNotSupportedError(RuntimeError):
-    """Raised for ops that would require cross-node wiring (deferred)."""
+    """Raised for operations that cannot be routed across nodes."""
 
 
-class MultiNodeTerrariumService:
+class MultiNodeTerrariumService(
+    MultiNodeDriveServiceMixin,
+    MultiNodeRuntimeOptionsMixin,
+    DriveServiceUnsupportedMixin,
+):
     """Composite TerrariumService for the controller (lab-host mode).
-
     Routes every agent operation to a connected worker.  The host runs
     no agents — :attr:`engine` raises and ``service_for("_host")`` is a
-    ``KeyError``.
+    ``KeyError``.  Drive ops route to the graph-repository home worker via
+    ``MultiNodeDriveServiceMixin`` + the ``drive_id -> home_node`` route cache.
     """
 
     def __init__(
@@ -104,19 +115,17 @@ class MultiNodeTerrariumService:
         coordination_engine: Terrarium | None = None,
     ) -> None:
         self._host = host
-        # Coordination-only engine — holds cross-node channel objects
-        # for the broadcast / output-wire forwarders.  NEVER runs an
-        # agent: no code path calls ``add_creature`` on it.
         self._coordination_engine = coordination_engine
-        # Demux installed once on the host; shared by every remote service.
         self._demux = StreamDemux(host)
         self._remotes: dict[str, RemoteTerrariumService] = {}
+        self._membership_epoch = 0
         self._home: dict[str, str] = {}  # creature_id → node_id
+        self._drive_routes = DriveRouteCache()  # drive/delivery/proposal → home
         # name → (node_id, creature_id).  Populated as a side effect of
         # ``list_creatures``.  Read by the controller's
         # :class:`TerrariumOutputWireAdapter` target resolver to route
         # cross-node output-wiring emits without an async hop.
-        self._creature_name_cache: dict[str, tuple[str, str]] = {}
+        self._creature_name_cache: dict[str, set[tuple[str, str, str]]] = {}
         # Cross-node subscription bookkeeping — keyed by
         # ``(my_node, peer_node, graph_id, channel)`` to a refcount.
         self._cross_subs: dict[tuple[str, str, str, str], int] = {}
@@ -129,6 +138,10 @@ class MultiNodeTerrariumService:
         # ordinary single-host graph has no entries here and renders
         # as itself.
         self._cluster_links: set[frozenset[tuple[str, str]]] = set()
+        # Multiple channels can bridge the same pair of worker graphs. Keep the
+        # cluster folded until the final bridge is removed.
+        self._cluster_link_refs: dict[frozenset[tuple[str, str]], int] = {}
+        self._cluster_mutation_lock = asyncio.Lock()
         # Studio-tier session metadata lookup, injected at boot — used
         # to enrich ``runtime_graph_snapshot`` graphs with name / kind.
         self._runtime_graph_meta_lookup = None
@@ -200,6 +213,7 @@ class MultiNodeTerrariumService:
             return self._remotes[node_id]
         remote = RemoteTerrariumService(self._host, node_id, demux=self._demux)
         self._remotes[node_id] = remote
+        self._membership_epoch = getattr(self, "_membership_epoch", 0) + 1
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -217,9 +231,15 @@ class MultiNodeTerrariumService:
     def drop_remote(self, node_id: str) -> None:
         """Remove a client and purge every per-node cache.
 
-        Thin delegator to :func:`multi_node_routing.purge_node_caches`.
+        Delegates to :func:`multi_node_routing.purge_node_caches`, then drops the
+        Drive route cache's active routes (sticky last-home survives so a read can
+        still report "home offline").
         """
+        if node_id not in self._remotes:
+            return
         purge_node_caches(self, node_id)
+        self._drive_routes.purge_node(node_id)
+        self._membership_epoch = getattr(self, "_membership_epoch", 0) + 1
 
     def connected_nodes(self) -> tuple[str, ...]:
         """The connected *worker* nodes — the host is not in this set.
@@ -344,6 +364,12 @@ class MultiNodeTerrariumService:
             name=name,
         )
         self._home[info.creature_id] = on_node
+        identity = (info.graph_id, on_node, info.creature_id)
+        self._creature_name_cache.setdefault(info.creature_id, set()).add(identity)
+        self._creature_name_cache.setdefault(info.name, set()).add(identity)
+        config_name = getattr(info, "config_name", None)
+        if config_name:
+            self._creature_name_cache.setdefault(config_name, set()).add(identity)
         return info
 
     async def remove_creature(self, creature_id: str) -> None:
@@ -351,28 +377,16 @@ class MultiNodeTerrariumService:
             creature_id, lambda svc: svc.remove_creature(creature_id)
         )
         self._home.pop(creature_id, None)
-        # Purge matching name-cache entries so sync output-wire routing
-        # cannot retain a dead creature address.
-        for key in [
-            k for k, v in self._creature_name_cache.items() if v[1] == creature_id
-        ]:
-            self._creature_name_cache.pop(key, None)
-
-    async def remove_graph(self, graph_id: str) -> None:
-        node_id = await self._resolve_graph_home(graph_id)
-        service = self.service_for(node_id)
-        graph = await service.get_graph(graph_id)
-        await service.remove_graph(graph_id)
-        if graph is not None:
-            creature_ids = set(graph.creature_ids)
-            for creature_id in creature_ids:
-                self._home.pop(creature_id, None)
-            stale_names = [
-                key
-                for key, value in self._creature_name_cache.items()
-                if value[1] in creature_ids
-            ]
-            for key in stale_names:
+        # Also purge every name-cache entry whose value's creature_id
+        # matches the removed creature.  The sync output-wire resolver
+        # reads this cache without an async hop, so a stale entry would
+        # keep routing emits to the dead address until the next
+        # ``list_creatures`` fan-out.
+        for key, entries in list(self._creature_name_cache.items()):
+            retained = {entry for entry in entries if entry[2] != creature_id}
+            if retained:
+                self._creature_name_cache[key] = retained
+            else:
                 self._creature_name_cache.pop(key, None)
 
     async def start_creature(self, creature_id: str) -> None:
@@ -396,8 +410,8 @@ class MultiNodeTerrariumService:
         return None
 
     # ------------------------------------------------------------------
-    # Channels — must stay within one graph's home node in Unit A.
-    # Cross-node wiring (channel spanning two nodes) is deferred.
+    # Channel mutations route through the graph's home worker.
+    # Cross-node creature wiring is coordinated separately through replication.
     # ------------------------------------------------------------------
 
     async def add_channel(
@@ -443,24 +457,25 @@ class MultiNodeTerrariumService:
         *,
         channel: str | None = None,
     ) -> ConnectionResult:
-        sender_home = await self._resolve_home(sender_id)
-        receiver_home = await self._resolve_home(receiver_id)
-        if sender_home is None:
-            raise KeyError(sender_id)
-        if receiver_home is None:
-            raise KeyError(receiver_id)
-        if sender_home == receiver_home:
-            return await self.service_for(sender_home).connect(
-                sender_id, receiver_id, channel=channel
+        async with self._cluster_lock():
+            sender_home = await self._resolve_home(sender_id)
+            receiver_home = await self._resolve_home(receiver_id)
+            if sender_home is None:
+                raise KeyError(sender_id)
+            if receiver_home is None:
+                raise KeyError(receiver_id)
+            if sender_home == receiver_home:
+                return await self.service_for(sender_home).connect(
+                    sender_id, receiver_id, channel=channel
+                )
+            return await cross_node_connect(
+                self,
+                sender_id,
+                receiver_id,
+                sender_home,
+                receiver_home,
+                channel,
             )
-        return await cross_node_connect(
-            self,
-            sender_id,
-            receiver_id,
-            sender_home,
-            receiver_home,
-            channel,
-        )
 
     async def disconnect(
         self,
@@ -469,24 +484,33 @@ class MultiNodeTerrariumService:
         *,
         channel: str | None = None,
     ) -> DisconnectionResult:
-        sender_home = await self._resolve_home(sender_id)
-        receiver_home = await self._resolve_home(receiver_id)
-        if sender_home is None:
-            raise KeyError(sender_id)
-        if receiver_home is None:
-            raise KeyError(receiver_id)
-        if sender_home == receiver_home:
-            return await self.service_for(sender_home).disconnect(
-                sender_id, receiver_id, channel=channel
+        async with self._cluster_lock():
+            sender_home = await self._resolve_home(sender_id)
+            receiver_home = await self._resolve_home(receiver_id)
+            if sender_home is None:
+                raise KeyError(sender_id)
+            if receiver_home is None:
+                raise KeyError(receiver_id)
+            if sender_home == receiver_home:
+                return await self.service_for(sender_home).disconnect(
+                    sender_id, receiver_id, channel=channel
+                )
+            return await cross_node_disconnect(
+                self,
+                sender_id,
+                receiver_id,
+                sender_home,
+                receiver_home,
+                channel,
             )
-        return await cross_node_disconnect(
-            self,
-            sender_id,
-            receiver_id,
-            sender_home,
-            receiver_home,
-            channel,
-        )
+
+    def _cluster_lock(self) -> asyncio.Lock:
+        """Return the lock, including for lightweight test/service doubles."""
+        lock = getattr(self, "_cluster_mutation_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._cluster_mutation_lock = lock
+        return lock
 
     async def _local_broadcast_adapter(self):
         """Thin delegator to :func:`multi_node_replication.local_broadcast_adapter`."""
@@ -564,12 +588,19 @@ class MultiNodeTerrariumService:
         *,
         turn_index: int | None = None,
         branch_view: dict[int, int] | None = None,
-    ) -> dict[str, Any]:
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> BranchMutationResult:
+        kwargs = {
+            "turn_index": turn_index,
+            "branch_view": branch_view,
+            "request_id": request_id,
+        }
+        if target is not None:
+            kwargs["target"] = target
         return await self._route_per_creature(
             creature_id,
-            lambda svc: svc.regenerate(
-                creature_id, turn_index=turn_index, branch_view=branch_view
-            ),
+            lambda svc: svc.regenerate(creature_id, **kwargs),
         )
 
     async def edit_message(
@@ -581,17 +612,20 @@ class MultiNodeTerrariumService:
         turn_index: int | None = None,
         user_position: int | None = None,
         branch_view: dict[int, int] | None = None,
-    ) -> bool | dict[str, Any]:
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> BranchMutationResult:
+        kwargs = {
+            "turn_index": turn_index,
+            "user_position": user_position,
+            "branch_view": branch_view,
+            "request_id": request_id,
+        }
+        if target is not None:
+            kwargs["target"] = target
         return await self._route_per_creature(
             creature_id,
-            lambda svc: svc.edit_message(
-                creature_id,
-                msg_idx,
-                content,
-                turn_index=turn_index,
-                user_position=user_position,
-                branch_view=branch_view,
-            ),
+            lambda svc: svc.edit_message(creature_id, msg_idx, content, **kwargs),
         )
 
     async def rewind(self, creature_id: str, msg_idx: int) -> None:
@@ -599,132 +633,10 @@ class MultiNodeTerrariumService:
             creature_id, lambda svc: svc.rewind(creature_id, msg_idx)
         )
 
-    async def get_scratchpad(self, creature_id: str) -> dict[str, str]:
-        return await self._route_per_creature(
-            creature_id, lambda svc: svc.get_scratchpad(creature_id)
-        )
-
-    async def patch_scratchpad(
-        self,
-        creature_id: str,
-        updates: dict[str, str | None],
-    ) -> dict[str, str]:
-        return await self._route_per_creature(
-            creature_id, lambda svc: svc.patch_scratchpad(creature_id, updates)
-        )
-
-    async def list_triggers(self, creature_id: str) -> list[dict[str, Any]]:
-        return await self._route_per_creature(
-            creature_id, lambda svc: svc.list_triggers(creature_id)
-        )
-
-    async def get_env(self, creature_id: str) -> dict[str, Any]:
-        return await self._route_per_creature(
-            creature_id, lambda svc: svc.get_env(creature_id)
-        )
-
-    async def get_system_prompt(self, creature_id: str) -> dict[str, str]:
-        return await self._route_per_creature(
-            creature_id, lambda svc: svc.get_system_prompt(creature_id)
-        )
-
-    async def get_working_dir(self, creature_id: str) -> str:
-        return await self._route_per_creature(
-            creature_id, lambda svc: svc.get_working_dir(creature_id)
-        )
-
-    async def set_working_dir(self, creature_id: str, new_path: str) -> str:
-        return await self._route_per_creature(
-            creature_id, lambda svc: svc.set_working_dir(creature_id, new_path)
-        )
-
-    async def native_tool_inventory(self, creature_id: str) -> list[dict[str, Any]]:
-        return await self._route_per_creature(
-            creature_id, lambda svc: svc.native_tool_inventory(creature_id)
-        )
-
-    async def get_native_tool_options(
-        self, creature_id: str
-    ) -> dict[str, dict[str, Any]]:
-        return await self._route_per_creature(
-            creature_id, lambda svc: svc.get_native_tool_options(creature_id)
-        )
-
-    async def set_native_tool_options(
-        self,
-        creature_id: str,
-        tool: str,
-        values: dict[str, Any],
-    ) -> dict[str, Any]:
+    async def command_inventory(self, creature_id: str) -> dict[str, Any]:
         return await self._route_per_creature(
             creature_id,
-            lambda svc: svc.set_native_tool_options(creature_id, tool, values),
-        )
-
-    async def switch_model(self, creature_id: str, model: str) -> str:
-        return await self._route_per_creature(
-            creature_id, lambda svc: svc.switch_model(creature_id, model)
-        )
-
-    async def list_plugins(self, creature_id: str) -> list[dict[str, Any]]:
-        return await self._route_per_creature(
-            creature_id, lambda svc: svc.list_plugins(creature_id)
-        )
-
-    async def toggle_plugin(
-        self,
-        creature_id: str,
-        plugin_name: str,
-        enabled: bool,
-    ) -> dict[str, Any]:
-        return await self._route_per_creature(
-            creature_id,
-            lambda svc: svc.toggle_plugin(creature_id, plugin_name, enabled),
-        )
-
-    # ------------------------------------------------------------------
-    # Module catalog + slash commands — route by home.
-    # ------------------------------------------------------------------
-
-    async def list_modules(self, creature_id: str) -> list[dict[str, Any]]:
-        return await self._route_per_creature(
-            creature_id, lambda svc: svc.list_modules(creature_id)
-        )
-
-    async def get_module_options(
-        self,
-        creature_id: str,
-        module_type: str,
-        module_name: str,
-    ) -> dict[str, Any]:
-        return await self._route_per_creature(
-            creature_id,
-            lambda svc: svc.get_module_options(creature_id, module_type, module_name),
-        )
-
-    async def set_module_options(
-        self,
-        creature_id: str,
-        module_type: str,
-        module_name: str,
-        values: dict[str, Any],
-    ) -> dict[str, Any]:
-        return await self._route_per_creature(
-            creature_id,
-            lambda svc: svc.set_module_options(
-                creature_id, module_type, module_name, values
-            ),
-        )
-
-    async def toggle_module(
-        self,
-        creature_id: str,
-        module_type: str,
-        module_name: str,
-    ) -> dict[str, Any]:
-        return await self._route_per_creature(
-            creature_id,
-            lambda svc: svc.toggle_module(creature_id, module_type, module_name),
+            lambda svc: svc.command_inventory(creature_id),
         )
 
     async def execute_command(
@@ -732,9 +644,12 @@ class MultiNodeTerrariumService:
         creature_id: str,
         command: str,
         args: dict[str, Any] | str | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
+        # The trusted ``principal`` and ``is_operator`` context rides to the home worker.
         return await self._route_per_creature(
-            creature_id, lambda svc: svc.execute_command(creature_id, command, args)
+            creature_id,
+            lambda svc: svc.execute_command(creature_id, command, args, **kwargs),
         )
 
     async def list_output_wiring(self, creature_id: str) -> list[dict[str, Any]]:
@@ -832,10 +747,15 @@ class MultiNodeTerrariumService:
         )
 
     async def _find_channel_elsewhere(
-        self, channel: str, *, exclude: str
+        self, channel: str, *, exclude: str, graph_id: str
     ) -> tuple[str, str] | None:
-        """Thin delegator to :func:`multi_node_replication.find_channel_elsewhere`."""
-        return await find_channel_elsewhere(self, channel, exclude=exclude)
+        """Thin delegator to graph-scoped channel lookup."""
+        return await find_channel_elsewhere(
+            self,
+            channel,
+            exclude=exclude,
+            graph_id=graph_id,
+        )
 
     async def attach_policies(self, creature_id: str) -> list[str]:
         return await self._route_per_creature(
@@ -843,8 +763,8 @@ class MultiNodeTerrariumService:
         )
 
     async def session_attach_policies(self, session_id: str) -> list[str]:
-        # CF-10: cluster sessions span multiple workers — each member's
-        # worker may advertise its own subset of policies (e.g. one has
+        # Cluster sessions span multiple workers, and each member's worker may
+        # advertise its own subset of policies (e.g. one has
         # an input module → IO, another has channels → OBSERVER). Union
         # across cluster members so the UI shows the full set rather
         # than only the primary's slice. ``cluster_members_for`` returns
@@ -919,7 +839,7 @@ class MultiNodeTerrariumService:
         Used by ``GET /api/configs/server-info?on_node=<node_id>`` to
         seed the New Creature / New Terrarium modal's "Working
         directory" field with a worker-side path rather than the host's
-        ``os.getcwd()`` (B5).  Routes through the ``terrarium.files``
+        ``os.getcwd()``. Routes through the ``terrarium.files``
         APP namespace ``getcwd`` verb on the named worker.
 
         Returns a dict with ``cwd``, ``home``, and ``platform`` keys.
@@ -995,4 +915,8 @@ class MultiNodeTerrariumService:
         return _cluster_members_for_fn(self, graph_id)
 
 
-__all__ = ["CrossNodeNotSupportedError", "MultiNodeTerrariumService", "HOST_NODE"]
+__all__ = [
+    "CrossNodeNotSupportedError",
+    "MultiNodeTerrariumService",
+    "HOST_NODE",
+]

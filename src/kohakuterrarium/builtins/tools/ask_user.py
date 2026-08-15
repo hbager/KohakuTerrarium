@@ -1,13 +1,7 @@
-"""Ask user tool — request human input mid-execution via the
-Phase B output-event bus.
+"""Interactive free-text input through the output-event bus.
 
-Phase B rewire: emits an ``ask_text`` :class:`OutputEvent` and awaits
-the :class:`UIReply` from whichever renderer (TUI / web frontend /
-custom) the user is interacting with. Replaces the legacy stderr /
-stdin path with a typed, multi-renderer interaction.
-
-Falls back to a stdin read only when no router / agent is available
-(programmatic invocation in tests, etc.).
+The tool waits for the renderer attached to the current agent and falls back
+to stdin only when invoked without an output router.
 """
 
 import asyncio
@@ -22,6 +16,7 @@ from kohakuterrarium.modules.tool.base import (
     ExecutionMode,
     ToolContext,
     ToolResult,
+    has_interactive_responder,
 )
 from kohakuterrarium.utils.logging import get_logger
 
@@ -30,20 +25,9 @@ logger = get_logger(__name__)
 
 @register_builtin("ask_user")
 class AskUserTool(BaseTool):
-    """Request human input mid-execution.
-
-    Phase B: emits an ``ask_text`` OutputEvent through the agent's
-    output bus. Renderers (TUI modal, web composer, custom adapters)
-    surface the prompt and post the reply back; the awaiting tool
-    returns the reply text to the LLM.
-    """
+    """Request free-text input from the human interacting with the agent."""
 
     needs_context: bool = True
-    # ``ask_user`` and ``show_card`` cover overlapping interaction
-    # patterns; force the model to read the manual once so it picks
-    # the right tool (free-text vs button choice) and uses the right
-    # arg shape — same pattern as ``edit`` / ``multi_edit``.
-    require_manual_read: bool = True
 
     @property
     def tool_name(self) -> str:
@@ -57,6 +41,16 @@ class AskUserTool(BaseTool):
     def execution_mode(self) -> ExecutionMode:
         return ExecutionMode.DIRECT
 
+    def prompt_contribution(self) -> str | None:
+        return (
+            "Ask the user for a **free-text** reply and wait for it — "
+            "clarification, a missing value, a typed approval. For a "
+            "pick-one-of-N choice or a styled panel use `show_card` "
+            "instead. Waits forever by default; pass `timeout_s` for a "
+            "bounded wait. With no UI attached (headless) it returns a "
+            "no-responder note immediately rather than blocking."
+        )
+
     async def _execute(
         self, args: dict[str, Any], context: ToolContext | None = None
     ) -> ToolResult:
@@ -65,8 +59,7 @@ class AskUserTool(BaseTool):
         if not question:
             return ToolResult(error="Question is required")
 
-        # Default ``None`` = wait forever. Tools that need a bounded
-        # wait can still pass ``timeout_s`` as an argument.
+        # An omitted timeout deliberately leaves interactive prompts open-ended.
         raw_timeout = args.get("timeout_s")
         timeout_s = float(raw_timeout) if raw_timeout is not None else None
         placeholder = args.get("placeholder", "")
@@ -76,9 +69,14 @@ class AskUserTool(BaseTool):
         router = getattr(agent, "output_router", None) if agent else None
 
         if router is None:
-            # No bus available — legacy stdin fallback for programmatic
-            # / test contexts. Mirrors the pre-Phase-B behaviour.
+            # Direct tool callers may have no agent router but can still use stdin.
             return await self._stdin_fallback(question)
+
+        if not has_interactive_responder(router):
+            return ToolResult(
+                output="(no responder: no interactive UI is attached to answer)",
+                exit_code=0,
+            )
 
         event_id = f"ask_{uuid4().hex[:12]}"
         event = OutputEvent(
@@ -109,7 +107,7 @@ class AskUserTool(BaseTool):
         return ToolResult(output=text, exit_code=0)
 
     async def _stdin_fallback(self, question: str) -> ToolResult:
-        """Pre-Phase-B stdin behaviour for callers without a router."""
+        """Read a reply from stdin when no output router is available."""
         try:
             sys.stderr.write(f"\n[Agent Question] {question}\n> ")
             sys.stderr.flush()

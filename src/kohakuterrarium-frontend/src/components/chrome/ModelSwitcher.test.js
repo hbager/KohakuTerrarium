@@ -35,6 +35,7 @@ import { LAYOUT_EVENTS } from "@/utils/layoutEvents"
 const mountedWrappers = []
 
 beforeEach(() => {
+  globalThis.useRoute = () => ({ params: {} })
   setActivePinia(createPinia())
   mockCurrentInstance.value = { id: "agent-1", type: "creature", llm_name: "openai/gpt" }
   vi.clearAllMocks()
@@ -43,6 +44,7 @@ beforeEach(() => {
 afterEach(() => {
   mountedWrappers.splice(0).forEach((wrapper) => wrapper.unmount())
   vi.unstubAllGlobals()
+  delete globalThis.useRoute
 })
 
 async function flushPromises() {

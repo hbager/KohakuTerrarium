@@ -25,9 +25,10 @@ config under `tools:` by bare name.
 
 ### Shell and scripting
 
-**`bash`**: Run a shell command. Picks the first available of `bash`,
-`zsh`, `sh`, `fish`, `pwsh`. Respects `KT_SHELL_PATH`. Captures stdout
-and stderr, truncated to a cap. Direct execution.
+**`bash`**: Run a shell command. Uses `bash` by default on every platform
+(Git Bash on Windows). Pass `type="..."` to select another supported shell:
+`bash`, `zsh`, `sh`, `fish`, `pwsh`, or `powershell`. Captures stdout and
+stderr, truncated to a cap. Direct execution.
 
 - Args: `command` (str), `working_dir` (str, optional),
   `timeout` (float, optional).
@@ -106,8 +107,9 @@ timeout. Direct.
 
 - Args: `url`.
 
-**`web_search`**: DuckDuckGo search returning markdown-formatted
-results. Direct.
+**`web_search`**: Web search with a DuckDuckGo default and an optional
+DeepSeek Responses backend. DeepSeek requires `kt config key set deepseek`;
+switch per creature with `/module set web_search backend deepseek`. Direct.
 
 - Args: `query`, `max_results` (int), `region` (str).
 

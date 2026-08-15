@@ -40,7 +40,6 @@ import { defineStore } from "pinia"
 
 import { acquireScope, releaseScope } from "@/composables/useScope"
 import { attachAPI } from "@/utils/api"
-import { useChatStore } from "@/stores/chat"
 import { parseTabId } from "@/utils/tabsUrl"
 import {
   firstLeafId,
@@ -63,12 +62,6 @@ const DASHBOARD_ID = "dashboard"
 
 function isDashboard(id) {
   return id === DASHBOARD_ID
-}
-
-function _activeTargetModel(tab) {
-  if (!tab?.target || !["attach", "inspector"].includes(tab.kind)) return ""
-  const chat = useChatStore(tab.target)
-  return chat.sessionInfo?.llmName || chat.modelDisplay || chat.sessionInfo?.model || ""
 }
 
 /** Read pinned ids from localStorage on store init. */
@@ -607,7 +600,6 @@ export const useTabsStore = defineStore("tabs", {
       attachMode = "chat",
       alsoOpenInspector = false,
       onNode = "_host",
-      llm = "",
     }) {
       const { useInstancesStore } = await import("@/stores/instances")
       const instances = useInstancesStore()
@@ -615,15 +607,27 @@ export const useTabsStore = defineStore("tabs", {
       if (kind === "resume") {
         if (!sessionName) throw new Error("createSession: sessionName required for resume")
         const { sessionAPI } = await import("@/utils/api")
-        const result = await sessionAPI.resume(sessionName, { onNode })
+        const { prepareWorkspaceResume } = await import("@/utils/workdirPrompt")
+        const prepared = await prepareWorkspaceResume(sessionName, { onNode })
+        if (prepared.action === "history") {
+          const { openSavedSessionHistory } = await import("@/utils/workdirPrompt")
+          openSavedSessionHistory(sessionName)
+          return null
+        }
+        if (prepared.action !== "resume") return null
+        const result = await sessionAPI.resume(sessionName, {
+          onNode,
+          members: prepared.members,
+          workspaceOverrides: prepared.workspaceOverrides,
+          memberWorkspaceOverrides: prepared.memberWorkspaceOverrides,
+          memberPwdOverrides: prepared.memberPwdOverrides,
+          pwd: prepared.pwd,
+        })
         id = result.instance_id
       } else {
         if (!configPath) throw new Error("createSession: configPath required")
         if (!pwd) throw new Error("createSession: pwd required")
-        const inheritedLlm = llm || _activeTargetModel(this.activeTab)
-        const createOpts = { onNode }
-        if (inheritedLlm) createOpts.llm = inheritedLlm
-        id = await instances.create(kind, configPath, pwd, name, createOpts)
+        id = await instances.create(kind, configPath, pwd, name, { onNode })
       }
       let inst = null
       try {

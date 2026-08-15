@@ -18,6 +18,10 @@ tags:
 概念入门：[记忆与压缩](../concepts/modules/memory-and-compaction.md)、
 [会话与环境](../concepts/modules/session-and-environment.md)。
 
+### 压缩后的编辑与重新生成
+
+压缩会改变实时提示并写入快速恢复快照，但不会删除追加式事件日志。Studio 使用持久化的 `event_id`、`turn_index` 和 `branch_id` 定位可编辑用户消息。保存并重新运行或重新生成时，新分支从所选消息之前的原始事件前缀重建，并忽略压缩摘要和快照；旧分支及其后续事件仍可切换和恢复。定位缺失、歧义、指向回合中注入输入或与所选分支冲突时，操作会在不修改历史的情况下失败。
+
 ## `.kohakutr` 文件
 
 `.kohakutr` 是一个 SQLite 数据库（经 KohakuVault），有九张表：
@@ -110,6 +114,22 @@ graph_id = await engine.adopt_session("runs/other.kohakutr")
 （重命名生物、删掉它正在用的工具）可能导致回放错误；需要完美保真
 时，把会话钉死在它原来的配置上。
 
+## Web UI 中的开放对话
+
+Conversations Rail 只显示当前仍附加 runtime 的对话。持久化对话的生命周期仍是独立维度：
+
+- **在线且开放：** runtime 已附加，因此对话显示在 Rail 中。
+- **休眠且开放：** 当前没有附加 runtime。保存的对话仍可从 Sessions 访问，但不会渲染在 Rail 中。
+- **已结束：** 用户显式结束对话。保存的历史仍可在 Sessions 中查看。
+
+关闭 Chat 或 Inspector 标签页只会 detach 该视图，不会停止或结束对话，因此仍在线的 runtime 会保留在 Rail 中。后端将已停止或断线的 Creature 报告为非活跃后，对应行会在下一次刷新时消失。Sessions 历史页继续保持只读，并沿用现有的 **View** 与 **Resume** 操作。
+
+每个新持久化的对话都有稳定的 `conversation_id`。runtime graph ID 在重启或恢复后可以变化，文件也可以移动或重命名，但这些变化不会产生重复记录。`GET /api/sessions/open` 使用该 identity 聚合在线 runtime 与带开放 marker 的已保存 session，并让在线行优先；Rail 只渲染 `is_live: true` 的行。Session index 与查询按已认证用户的 session directory 隔离，因此一个用户的索引不会返回另一个用户的数据。
+
+保存的生命周期 marker 是显式的。引入 marker 之前创建的旧 session 仍可在历史中访问。普通 runtime Stop 保留开放 marker，并记录 paused/dormant 状态；显式 **End** 清除 marker 并记录 terminal 状态。本地、远程与 cluster 操作都会在 Rail 刷新前同步保存文件中的 marker。
+
+Resume 按保存对话执行 singleflight：两个浏览器同时请求时只执行一次服务端恢复；取消一个等待者不会取消共享恢复，失败后仍可重试。Cluster resume 采用 all-or-error 语义：任何成员恢复失败或保存的连接无法重建时，服务端会补偿已恢复成员、清理 partial runtime metadata、保留原始保存生命周期，并返回非成功响应，而不是留下 degraded partial cluster。
+
 ## 中断与恢复工作流
 
 ```bash
@@ -177,6 +197,16 @@ await engine.apply_recipe("@kt-biome/terrariums/swe_team", session="runs/team.ko
 
 恢复根据会话元数据里记录的配置路径（包括 `@pkg` 引用）重建拓扑，
 并使用每个 Agent 各自的工作目录，不会对你的进程 `os.chdir`。
+恢复会在创建 writer store、runtime、lifecycle 或 adoption 之前执行只读
+工作目录预检。目录失效时必须选择新目录、只看历史或取消，不会静默回退到
+KohakuTerrarium 进程目录。使用 `workspace_overrides={"creature-id":
+"/new/path"}` 只替换确认的成员；共享失效路径也可以使用预检返回的
+`gap_id` 成组替换。标量 `pwd=` 仅保留为显式全队兼容覆盖，不能与
+`workspace_overrides` 同时使用。成功替换会永久写回 manifest；远程和集群
+会在实际 worker 上校验路径，并在第一次 adoption 前完成全成员预检。集群
+API 还可按成员会话 ID 限定替换，让不同 worker 上相同的 creature 或路径组
+目标选择不同目录。若回滚无法持久化，会话会标记为 `partial_dirty`；后续预检
+和恢复会失败关闭，直到会话修复。
 
 ### 读取：`SessionReader`
 

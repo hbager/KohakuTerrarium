@@ -1,18 +1,7 @@
-"""
-Python code execution tool.
+"""Execute Python in a subprocess, with an embedded-runtime fallback.
 
-On desktop: spawns ``sys.executable -c <code>`` as a subprocess
-(standard isolation, separate process state per call).  On the
-mobile profile (Android / Chaquopy): runs ``exec()`` inside the
-host interpreter — there is no standalone CPython on PATH and
-spawning ``sys.executable`` as a subprocess triggers the Android
-Runtime to write to ``/data/dalvik-cache/``, which apps don't have
-permission for ("error changing dalvik-cache ownership: Permission
-denied" before the user code ever runs).
-
-Helpers are shared with :mod:`kohakuterrarium.builtins.tools.bash`
-to keep timeout / context / runner-resolution behaviour identical
-between the two tools.
+Mobile profiles run code in the host interpreter because they cannot spawn a
+standalone CPython process. Timeout handling is shared with the shell tool.
 """
 
 import asyncio
@@ -25,27 +14,30 @@ from typing import Any
 
 from kohakuterrarium.builtins.tools.bash import (
     _format_timeout,
-    _resolve_timeout_arg,
     _subprocess_runner,
     _wait_timeout,
 )
 from kohakuterrarium.builtins.tools.registry import register_builtin
+from kohakuterrarium.builtins.tools.subprocess.shell_utils import (
+    windows_process_kwargs,
+)
 from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
+from kohakuterrarium.utils.timeouts import resolve_timeout_arg
 from kohakuterrarium.utils.logging import get_logger
 from kohakuterrarium.utils.mobile_sandbox import is_mobile_profile
 
 logger = get_logger(__name__)
 
 
-@register_builtin("run_python")
+@register_builtin("python")
 class PythonTool(BaseTool):
-    """Tool for executing Python code in a subprocess."""
+    """Execute Python code and capture its combined output and exit status."""
 
     needs_context = True
 
     @property
     def tool_name(self) -> str:
-        return "run_python"
+        return "python"
 
     @property
     def description(self) -> str:
@@ -74,7 +66,7 @@ class PythonTool(BaseTool):
         code = args.get("code", "")
         if not code:
             return ToolResult(error="No code provided")
-        timeout, timeout_error = _resolve_timeout_arg(args, self.config.timeout)
+        timeout, timeout_error = resolve_timeout_arg(args, self.config.timeout)
         if timeout_error is not None:
             return ToolResult(error=timeout_error)
 
@@ -85,23 +77,8 @@ class PythonTool(BaseTool):
         else:
             cwd = self.config.working_dir or os.getcwd()
 
-        # Mobile profile (Android): there is no standalone CPython
-        # binary on PATH — ``sys.executable`` is the Chaquopy stub
-        # for the *current* embedded interpreter, and spawning it
-        # as a subprocess triggers the Android Runtime to
-        # initialise a new ART process, which writes to
-        # ``/data/dalvik-cache/``.  Apps run as a non-root user
-        # without access to that path, so the subprocess dies with
-        #     error changing dalvik-cache ownership: Permission
-        #     denied
-        # before the user code even runs.
-        #
-        # Solution: execute the code in-process via ``exec()``
-        # against an isolated namespace, capturing stdout / stderr.
-        # The trade-off is no isolation between python-tool calls —
-        # but that's already the case for every other tool on
-        # mobile (everything is one process), and the alternative
-        # is "python tool unavailable on Android".
+        # Embedded Android runtimes cannot spawn ``sys.executable`` without ART
+        # permission failures, so isolation is traded for tool availability.
         if is_mobile_profile():
             return await self._execute_in_process(code, cwd, timeout)
 
@@ -135,6 +112,7 @@ class PythonTool(BaseTool):
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     cwd=cwd,
+                    **windows_process_kwargs(),
                 )
 
                 try:
@@ -153,6 +131,13 @@ class PythonTool(BaseTool):
                         exit_code=-1,
                         metadata={"timeout": timeout},
                     )
+                except asyncio.CancelledError:
+                    # The hidden-window child no longer shares the parent
+                    # console, so console signals cannot end it for us.
+                    with contextlib.suppress(ProcessLookupError):
+                        process.kill()
+                    await process.wait()
+                    raise
 
                 output = stdout.decode("utf-8", errors="replace") if stdout else ""
                 exit_code = process.returncode or 0
@@ -173,18 +158,7 @@ class PythonTool(BaseTool):
     async def _execute_in_process(
         self, code: str, cwd: str, timeout: float
     ) -> ToolResult:
-        """Run ``code`` via in-process ``exec()`` — the only viable
-        path on Android, where spawning ``sys.executable`` triggers
-        the dalvik-cache permission error.
-
-        Runs on a thread (via ``asyncio.to_thread``) so the event
-        loop stays responsive and a runaway script doesn't block
-        websocket streaming.  ``timeout`` cancels the wait but
-        cannot interrupt the underlying CPU-bound exec — operators
-        should treat the tool as cooperative on this platform.
-        ``cwd`` is applied as a transient ``os.chdir`` around the
-        exec and restored afterwards.
-        """
+        """Execute in the host interpreter with cooperative timeout semantics."""
         loop = asyncio.get_running_loop()
 
         def _run() -> tuple[str, int, str | None]:
@@ -199,8 +173,7 @@ class PythonTool(BaseTool):
                 try:
                     os.chdir(cwd)
                 except OSError:
-                    # If cwd is bogus, fall through with current dir;
-                    # surface the error in the captured output below.
+                    # A missing working directory must not prevent code execution.
                     pass
                 try:
                     with (
@@ -209,9 +182,7 @@ class PythonTool(BaseTool):
                     ):
                         exec(compile(code, "<python_tool>", "exec"), namespace)
                 except SystemExit as exc:
-                    # ``sys.exit(N)`` is a legitimate way for a script
-                    # to signal status; propagate the code rather
-                    # than treating it as an error.
+                    # ``sys.exit`` communicates process-style status rather than failure.
                     code_val = (
                         exc.code
                         if isinstance(exc.code, int)

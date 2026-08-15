@@ -1,9 +1,4 @@
-"""
-TUI session: shared state between input and output modules.
-
-Standalone mode: single chat area.
-Terrarium mode: tabbed chat (root + creatures + channels) + terrarium panel.
-"""
+"""Share Textual UI state between input and output modules."""
 
 import asyncio
 from typing import Any
@@ -40,27 +35,15 @@ from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Default widget limits (configurable via TUISession)
-DEFAULT_MAX_CHAT_WIDGETS = 80  # Cull when exceeding this
-DEFAULT_CULL_KEEP = 50  # Keep this many after cull
-DEFAULT_LOAD_BATCH = 30  # Load this many when "Load older" clicked
-CULL_KEEP = DEFAULT_CULL_KEEP  # Module-level for import by output.py
-
-
-# ────────────────────────────────────────────────────────────────
-# TUISession
-# ────────────────────────────────────────────────────────────────
+DEFAULT_MAX_CHAT_WIDGETS = 80
+DEFAULT_CULL_KEEP = 50
+DEFAULT_LOAD_BATCH = 30
+# Shared with output history restore so live and resumed chats keep the same window.
+CULL_KEEP = DEFAULT_CULL_KEEP
 
 
 class TUISession(TabModelRegistryMixin):
-    """Shared TUI state between input and output modules.
-
-    In terrarium mode, each tab (root, creature, channel) has its own
-    chat scroll. Widgets are routed to the correct tab via `target`.
-    The per-tab model registry (``agent_for_tab`` / ``update_target_model``
-    / ``refresh_model_for_tab``) comes from :class:`TabModelRegistryMixin`;
-    its backing state is initialised below.
-    """
+    """Coordinate tab-routed widgets and lifecycle state shared by TUI input/output."""
 
     def __init__(
         self,
@@ -73,99 +56,93 @@ class TUISession(TabModelRegistryMixin):
         self.running = False
         self._app: AgentTUI | None = None
         self._stop_event = asyncio.Event()
-        self._streaming_widgets: dict[str, StreamingText] = {}  # target -> widget
-        # target -> agent_name -> block (supports parallel sub-agents on same target)
+        # Streaming widgets are keyed by target because tabs may stream concurrently.
+        self._streaming_widgets: dict[str, StreamingText] = {}
+        # Target and job IDs disambiguate parallel sub-agents with identical names.
         self._current_subagents: dict[str, dict[str, SubAgentBlock]] = {}
-        # Terrarium mode
         self._terrarium_tabs: list[str] | None = None
-        self._active_target: str = ""  # which tab output is currently targeting
-        # Widget culling config
+        self._active_target: str = ""
         self._max_chat_widgets = max_chat_widgets
         self._cull_keep = cull_keep
         self._load_batch = load_batch
-        # "Load older" system: stores widgets that were culled or not mounted
-        # on resume. Keyed by target. Each is a list of widgets (oldest first).
-        self._older_widgets: dict[str, list] = {}  # target -> [widget, ...]
-        self._culled_count: dict[str, int] = {}  # target -> count of culled widgets
-        # Job cancel callback: Callable[[str, str], None] or None
-        # Signature: (job_id, job_name) -> None
+        # Older widgets remain ordered so batches can be prepended chronologically.
+        self._older_widgets: dict[str, list] = {}
+        self._culled_count: dict[str, int] = {}
+        # Callbacks receive (job_id, job_name) for cancellation and job_id for
+        # background promotion.
         self.on_cancel_job: Any = None
         self.on_promote_job: Any = None
-        # Live agent reference, wired by ``TUIInput.set_user_commands``
-        # so modal screens (Modules, etc.) can mutate state without
-        # round-tripping the slash-command pipeline.
+        # Modal screens mutate the live agent without re-entering slash commands.
         self.host_agent: Any = None
-        # Optional resolver installed by the engine runner: tab name →
-        # live agent. Lets the F2/F3 modals and the ``/model`` slash
-        # intercept act on the ACTIVE tab's creature instead of always
-        # the host/focus agent. ``None`` (standalone TUI) falls back to
-        # ``host_agent``.
+        # Duck typing keeps this package independent of terrarium.service.
+        self.engine: Any = None
+        self.drive_service: Any = None
+        # Terrarium actions resolve against the active tab; standalone mode falls
+        # back to the host agent.
         self.resolve_tab_agent: Any = None
-        # Per-tab model registry (terrarium mode). ``session_info``
-        # events carry the emitting creature via TUIOutput's target;
-        # the panel's ``Model:`` line must follow the ACTIVE tab, not
-        # whichever creature emitted last.
+        # Target-keyed state keeps sibling creature events from replacing the
+        # active tab's model and context details.
         self._model_by_target: dict[str, str] = {}
         self._context_by_target: dict[str, tuple[int, int]] = {}
-        # Widget mutations scheduled BEFORE ``app.is_running`` flips
-        # True (early-startup activities from the agent's controller
-        # task). Replayed on the first ``_safe_call`` invocation that
-        # finds the app running. Avoids the previous silent-drop where
-        # mid-turn injection widget mounts vanished because the agent
-        # got there before Textual's ``on_mount`` did.
+        self._command_hint_watches: set[tuple[str, int]] = set()
+        self.command_hint_fallback: dict[str, Any] = {}
+        # Buffer mutations until Textual mounts so startup events are not lost.
         self._pending_safe_calls: list[tuple[Any, tuple[Any, ...]]] = []
 
     def set_terrarium_tabs(self, tabs: list[str]) -> None:
-        """Configure terrarium mode before start()."""
-        self._terrarium_tabs = tabs
-        if tabs:
-            self._active_target = tabs[0]
+        """Configure terrarium tabs and reconcile a running application."""
+        normalized = list(dict.fromkeys(tabs))
+        active = self.get_active_tab() if self._app else self._active_target
+        self._terrarium_tabs = normalized
+        self._active_target = (
+            active if active in normalized else normalized[0] if normalized else ""
+        )
+        if not self._app:
+            return
+        if not self._app.is_running:
+            self._app._terrarium_tabs = normalized
+            return
+        self._safe_call(self._app.reconcile_terrarium_tabs, normalized)
 
     def set_active_target(self, target: str) -> None:
-        """Set which tab receives new output widgets."""
+        """Set the tab that receives new output widgets."""
         self._active_target = target
 
     def get_active_tab(self) -> str:
-        """Get the user's currently visible tab."""
+        """Return the currently visible tab."""
         if self._app:
             return self._app.get_active_tab_name()
         return self._active_target
 
-    # ── Safe widget operations ──────────────────────────────────
-
     def _safe_call(self, fn: Any, *args: Any) -> None:
-        # ``app.is_running`` flips False during startup (before
-        # ``on_mount``) and at shutdown. Previously this silently
-        # dropped the callback — now we buffer it so widget mutations
-        # scheduled from the controller task before the app is fully
-        # mounted replay AFTER it's ready. Without this, mid-turn
-        # ``user_input_injected`` events that race a tab switch / fresh
-        # boot landed in the void with no log.
+        # Startup callbacks must wait for Textual's mounted application context.
         if not self._app:
             return
         if not self._app.is_running:
             self._pending_safe_calls.append((fn, args))
             return
-        # Drain anything that arrived while the app wasn't running yet.
         if self._pending_safe_calls:
             pending = self._pending_safe_calls[:]
             self._pending_safe_calls.clear()
             for pfn, pargs in pending:
                 try:
                     self._app.call_later(pfn, *pargs)
-                except Exception:  # pragma: no cover - defensive
+                except Exception:  # pragma: no cover - shutdown race
+                    # A pending callback may target a widget removed during shutdown.
                     pass
         try:
             self._app.call_later(fn, *args)
         except Exception as e:
-            _ = e  # call_later failed, try call_from_thread
+            _ = e
+            # Some callers originate outside Textual's loop; use its thread-safe
+            # scheduler when message-queue scheduling is unavailable.
             try:
                 self._app.call_from_thread(fn, *args)
             except Exception as e:
                 logger.warning("TUI safe_call failed", error=str(e), exc_info=True)
 
     def _get_chat_scroll_id(self, target: str = "") -> str:
-        """Get the chat scroll widget ID for a target."""
+        """Return the chat scroll widget ID for a target."""
         if not self._terrarium_tabs:
             return "chat-scroll"
         t = target or self._active_target
@@ -175,6 +152,7 @@ class TUISession(TabModelRegistryMixin):
         if not self._app or not self._app.is_running:
             return
         scroll_id = self._get_chat_scroll_id(target)
+        target_key = target or self._active_target or "_default"
 
         def _do():
             try:
@@ -182,14 +160,14 @@ class TUISession(TabModelRegistryMixin):
                 chat.mount(widget)
                 if scroll:
                     chat.scroll_end(animate=False)
-                self._cull_chat_widgets(chat)
+                self._cull_chat_widgets(chat, target_key)
             except Exception as e:
                 logger.warning("TUI safe_mount failed", error=str(e), exc_info=True)
 
         self._safe_call(_do)
 
-    def _cull_chat_widgets(self, chat: VerticalScroll) -> None:
-        """Remove old widgets when chat has too many, keeping recent ones."""
+    def _cull_chat_widgets(self, chat: VerticalScroll, target: str) -> None:
+        """Cull old widgets while retaining the configured recent window."""
         children = list(chat.children)
         if len(children) <= self._max_chat_widgets:
             return
@@ -197,18 +175,15 @@ class TUISession(TabModelRegistryMixin):
         remove_count = len(children) - self._cull_keep
         to_remove = children[:remove_count]
 
-        target = self._active_target or "_default"
         self._culled_count[target] = self._culled_count.get(target, 0) + remove_count
 
         for w in to_remove:
             w.remove()
 
-        # Update or add LoadOlderButton at top
         self._update_load_older_button(chat, target)
 
     def _update_load_older_button(self, chat: VerticalScroll, target: str) -> None:
-        """Add/update the 'Load older' button at the top of chat."""
-        # How many widgets can we load from the stored older_widgets?
+        """Update the control that represents hidden chat history."""
         available = len(self._older_widgets.get(target, []))
         culled = self._culled_count.get(target, 0)
         total_hidden = available + culled
@@ -216,13 +191,11 @@ class TUISession(TabModelRegistryMixin):
         if total_hidden <= 0:
             return
 
-        # Remove existing button
         for child in list(chat.children):
             if isinstance(child, LoadOlderButton):
                 child.remove()
                 break
 
-        # Only show button if there are stored widgets to load
         if available > 0:
             btn = LoadOlderButton(available)
             first = list(chat.children)
@@ -231,7 +204,6 @@ class TUISession(TabModelRegistryMixin):
             else:
                 chat.mount(btn)
         elif culled > 0:
-            # Culled live messages (no stored data to reload)
             header = Static(
                 f"[{culled} earlier messages not available]",
                 classes="cull-header",
@@ -241,11 +213,11 @@ class TUISession(TabModelRegistryMixin):
                 chat.mount(header, before=first[0])
 
     def store_older_widgets(self, target: str, widgets: list) -> None:
-        """Store widgets for 'Load older' (from resume truncation)."""
+        """Store truncated history widgets for later loading."""
         self._older_widgets[target] = widgets
 
     def load_older_batch(self, target: str = "") -> None:
-        """Load a batch of older widgets into the chat."""
+        """Prepend one batch of stored history widgets to the chat."""
         target = target or self._active_target or "_default"
         stored = self._older_widgets.get(target, [])
         if not stored:
@@ -253,7 +225,6 @@ class TUISession(TabModelRegistryMixin):
 
         scroll_id = self._get_chat_scroll_id(target)
         batch_size = self._load_batch
-        # Take from the end of stored (most recent of the older messages)
         batch = stored[-batch_size:]
         self._older_widgets[target] = (
             stored[:-batch_size] if batch_size < len(stored) else []
@@ -262,12 +233,10 @@ class TUISession(TabModelRegistryMixin):
         def _do():
             try:
                 chat = self._app.query_one(f"#{scroll_id}", VerticalScroll)
-                # Remove the LoadOlderButton
                 for child in list(chat.children):
                     if isinstance(child, LoadOlderButton):
                         child.remove()
                         break
-                # Prepend the batch
                 first = list(chat.children)
                 if first:
                     for w in reversed(batch):
@@ -275,7 +244,6 @@ class TUISession(TabModelRegistryMixin):
                 else:
                     for w in batch:
                         chat.mount(w)
-                # Add new button if more available
                 self._update_load_older_button(chat, target)
             except Exception as e:
                 logger.warning(
@@ -284,15 +252,13 @@ class TUISession(TabModelRegistryMixin):
 
         self._safe_call(_do)
 
-    # ── Chat area ───────────────────────────────────────────────
-
     def add_user_message(self, text: str, target: str = "") -> None:
         self._safe_mount(UserMessage(text), target=target)
 
     def add_system_notice(
         self, text: str, command: str = "", error: bool = False, target: str = ""
     ) -> None:
-        """Add a non-collapsible system notice (for command results)."""
+        """Add a non-collapsible system notice."""
         self._safe_mount(
             SystemNotice(text, command=command, error=error), target=target
         )
@@ -300,7 +266,7 @@ class TUISession(TabModelRegistryMixin):
     def add_error_block(
         self, error_type: str, error_msg: str, target: str = ""
     ) -> None:
-        """Add a processing error block (red, prominent)."""
+        """Add a prominent processing error notice."""
         text = f"{error_type}: {error_msg}"
         self.add_system_notice(
             text, command="Processing Error", error=True, target=target
@@ -318,12 +284,7 @@ class TUISession(TabModelRegistryMixin):
         on_action=None,
         target: str = "",
     ) -> None:
-        """Mount a Phase B ``card`` event as an inline widget.
-
-        When ``on_action`` is provided and ``payload.actions`` is
-        non-empty, the card renders interactive Buttons that call
-        ``on_action(event_id, action_id)`` on click.
-        """
+        """Mount a card event with optional interactive actions."""
         self._safe_mount(
             CardBlock(payload, event_id=event_id, on_action=on_action),
             target=target,
@@ -339,12 +300,7 @@ class TUISession(TabModelRegistryMixin):
         complete: bool = False,
         target: str = "",
     ) -> None:
-        """Phase B ``progress`` event renderer.
-
-        Mounts a new ``ProgressBlock`` on first call for ``widget_id``;
-        on subsequent calls (events with ``update_target=widget_id``)
-        mutates the existing widget in place.
-        """
+        """Create or update the progress block identified by ``widget_id``."""
         progress_map: dict[str, ProgressBlock]
         progress_map = getattr(self, "_progress_blocks", None) or {}
         existing = progress_map.get(widget_id)
@@ -374,7 +330,6 @@ class TUISession(TabModelRegistryMixin):
         self._progress_blocks = progress_map
         self._safe_mount(block, target=target)
         if complete:
-            # First-emit-also-complete edge case.
             try:
                 block.update_progress(
                     label=label,
@@ -384,12 +339,13 @@ class TUISession(TabModelRegistryMixin):
                     complete=True,
                 )
             except Exception:
+                # Completion may arrive before the newly mounted progress widget.
                 pass
 
     def add_compact_summary(
         self, round_num: int, summary: str, target: str = ""
     ) -> None:
-        """Add a compact summary accordion to the chat (shows immediately)."""
+        """Add a compact summary accordion to the chat."""
         block = CompactSummaryBlock(summary)
         self._last_compact_block = block
         self._safe_mount(block, target=target)
@@ -397,7 +353,7 @@ class TUISession(TabModelRegistryMixin):
     def update_compact_summary(
         self, round_num: int, summary: str, target: str = ""
     ) -> None:
-        """Update the current compact block with final summary (amber -> aquamarine)."""
+        """Complete the current compact summary block."""
         block = getattr(self, "_last_compact_block", None)
         if block:
 
@@ -420,7 +376,7 @@ class TUISession(TabModelRegistryMixin):
         total: int = 0,
         cached_tokens: int = 0,
     ) -> None:
-        """Update session info with per-call token usage (accumulated)."""
+        """Accumulate one call's token usage in the session panel."""
         if not self._app or not self._app.is_running:
             return
 
@@ -438,7 +394,7 @@ class TUISession(TabModelRegistryMixin):
     def restore_token_usage(
         self, total_in: int, total_out: int, last_prompt: int, total_cached: int = 0
     ) -> None:
-        """Restore cumulative token totals from session history (on resume)."""
+        """Restore cumulative token totals from session history."""
         if not self._app or not self._app.is_running:
             return
 
@@ -464,8 +420,8 @@ class TUISession(TabModelRegistryMixin):
         key = target or "_default"
         sa_dict = self._current_subagents.get(key, {})
         sa = sa_dict.get(agent_id) if agent_id else None
-        # Fallback: if no agent_id given, use the last/only active sub-agent
         if sa is None and sa_dict:
+            # Legacy activities without a job ID route to the newest active sub-agent.
             sa = list(sa_dict.values())[-1]
         if sa:
 
@@ -499,6 +455,7 @@ class TUISession(TabModelRegistryMixin):
         sa_dict = self._current_subagents.get(key, {})
         sa = sa_dict.get(agent_id) if agent_id else None
         if sa is None and sa_dict:
+            # Legacy activities without a job ID route to the newest active sub-agent.
             sa = list(sa_dict.values())[-1]
 
         def _do():
@@ -536,7 +493,7 @@ class TUISession(TabModelRegistryMixin):
         key = target or "_default"
         if key not in self._current_subagents:
             self._current_subagents[key] = {}
-        # Key by agent_id (job_id) for unique routing, not by name
+        # Job IDs are stable for parallel same-name sub-agents; names support legacy events.
         sa_key = agent_id or agent_name
         self._current_subagents[key][sa_key] = block
         self._safe_mount(block, target=target)
@@ -556,7 +513,7 @@ class TUISession(TabModelRegistryMixin):
         sa_dict = self._current_subagents.get(key, {})
         sa = sa_dict.pop(agent_id, None) if agent_id else None
         if sa is None and sa_dict:
-            # Fallback: pop any sub-agent
+            # Legacy completion events without IDs close the newest active block.
             _, sa = sa_dict.popitem()
         if not sa:
             return
@@ -564,7 +521,6 @@ class TUISession(TabModelRegistryMixin):
             sa.mark_error(error)
         else:
             sa.mark_done(output, tools_used, turns, duration)
-        # Clean up empty dict
         if not sa_dict:
             self._current_subagents.pop(key, None)
 
@@ -574,8 +530,6 @@ class TUISession(TabModelRegistryMixin):
         for sa in sa_dict.values():
             sa.mark_interrupted()
         self._current_subagents.pop(key, None)
-
-    # ── Streaming text ──────────────────────────────────────────
 
     def begin_streaming(self, target: str = "") -> None:
         key = target or "_default"
@@ -607,6 +561,7 @@ class TUISession(TabModelRegistryMixin):
         if not widget:
             return
         scroll_id = self._get_chat_scroll_id(target)
+        target_key = target or self._active_target or "_default"
 
         def _do():
             try:
@@ -614,25 +569,19 @@ class TUISession(TabModelRegistryMixin):
                 if not text:
                     return
                 chat = self._app.query_one(f"#{scroll_id}", VerticalScroll)
-                # Check if user is at bottom before replacing
                 at_bottom = (
                     chat.max_scroll_y == 0 or chat.scroll_y >= chat.max_scroll_y - 2
                 )
-                # Replace StreamingText with Textual Markdown (selectable)
                 md = Markdown(text)
                 chat.mount(md, after=widget)
                 widget.remove()
-                # Keep scroll at bottom if user was there
                 if at_bottom:
                     chat.scroll_end(animate=False)
-                # Cull old widgets if too many
-                self._cull_chat_widgets(chat)
+                self._cull_chat_widgets(chat, target_key)
             except Exception as e:
                 logger.warning("TUI end_streaming failed", error=str(e), exc_info=True)
 
         self._safe_call(_do)
-
-    # ── Right panel ─────────────────────────────────────────────
 
     def update_running(
         self,
@@ -687,7 +636,7 @@ class TUISession(TabModelRegistryMixin):
     def update_session_info(
         self, session_id: str = "", model: str = "", agent_name: str = ""
     ) -> None:
-        # Buffer for deferred apply (session_info fires before TUI app mounts)
+        # Session information may arrive before the application mounts.
         self._pending_session_info = (session_id, model, agent_name)
         if not self._app or not self._app.is_running:
             return
@@ -721,11 +670,11 @@ class TUISession(TabModelRegistryMixin):
         self._safe_call(_do)
 
     def set_compact_threshold(self, threshold_tokens: int) -> None:
-        """Backward compat — prefer set_context_limits()."""
+        """Set identical context and compaction limits for compatibility."""
         self.set_context_limits(threshold_tokens, threshold_tokens)
 
     def apply_pending_session_info(self) -> None:
-        """Apply buffered session info after TUI app is ready."""
+        """Apply session information buffered before application startup."""
         info = getattr(self, "_pending_session_info", None)
         if info:
             self.update_session_info(*info)
@@ -748,7 +697,7 @@ class TUISession(TabModelRegistryMixin):
         self._safe_call(_do)
 
     def update_terrarium(self, creatures: list[dict], channels: list[dict]) -> None:
-        """Update the terrarium overview panel."""
+        """Update the terrarium overview."""
         if not self._app or not self._app.is_running:
             return
 
@@ -764,19 +713,16 @@ class TUISession(TabModelRegistryMixin):
         self._safe_call(_do)
 
     def write_log(self, text: str) -> None:
-        pass  # Logs go to session DB
-
-    # ── Processing animation ────────────────────────────────────
+        # Framework logs are persisted by session output instead of rendered in chat.
+        pass
 
     def start_thinking(self) -> None:
         if self._app and self._app.is_running:
             self._app._is_processing = True
-            # Move queued messages from queue area into chat (promoted to UserMessage style)
             if self._app._queued_widgets:
                 chat = self._app._get_active_chat()
                 for qw in self._app._queued_widgets:
                     try:
-                        # Remove from queue area, mount as UserMessage in chat
                         text = qw.message_text
                         qw.remove()
                         if chat:
@@ -814,14 +760,11 @@ class TUISession(TabModelRegistryMixin):
             except Exception as e:
                 logger.warning("TUI set_idle failed", error=str(e), exc_info=True)
 
-    # ── Lifecycle ───────────────────────────────────────────────
-
     async def wait_ready(self, timeout: float = 5.0) -> bool:
         if not self._app:
             return False
         try:
             await asyncio.wait_for(self._app._mounted_event.wait(), timeout)
-            # Apply any session info buffered before the app was ready
             self.apply_pending_session_info()
             return True
         except asyncio.TimeoutError:
@@ -839,12 +782,12 @@ class TUISession(TabModelRegistryMixin):
         self._stop_event.clear()
 
     def _handle_cancel_job(self, job_id: str, job_name: str) -> None:
-        """Relay cancel request from the TUI app to the registered callback."""
+        """Relay a job cancellation to the registered callback."""
         if self.on_cancel_job:
             self.on_cancel_job(job_id, job_name)
 
     def _handle_promote_job(self, job_id: str) -> None:
-        """Relay [→bg] promote request from the TUI app to the registered callback."""
+        """Relay a background-promotion request to the registered callback."""
         if self.on_promote_job:
             self.on_promote_job(job_id)
 
@@ -858,7 +801,18 @@ class TUISession(TabModelRegistryMixin):
         finally:
             self.running = False
             self._stop_event.set()
-            self._app._input_queue.put_nowait("")  # unblock get_input
+            self._signal_input_shutdown()
+
+    def _signal_input_shutdown(self) -> None:
+        """Discard pending submissions and wake the runner with shutdown."""
+        if not self._app:
+            return
+        while True:
+            try:
+                self._app._input_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._app._input_queue.put_nowait("")
 
     async def get_input(self, prompt: str = "You: ") -> str:
         if not self._app:
@@ -868,12 +822,7 @@ class TUISession(TabModelRegistryMixin):
     async def show_selection_modal(
         self, title: str, options: list[dict], current: str = ""
     ) -> str | None:
-        """Show a selection modal and return chosen value or None.
-
-        Safe to call from any async context. Uses ``call_later`` to
-        delegate ``push_screen`` to the app's message loop where
-        ``active_app`` ContextVar is set.
-        """
+        """Show a selection modal and return its selected value."""
         if not self._app or not self._app.is_running:
             return None
 
@@ -884,13 +833,12 @@ class TUISession(TabModelRegistryMixin):
             if not result_future.done():
                 result_future.set_result(value)
 
-        # call_later posts to the app's message queue — the callback
-        # executes inside the app's _context() where active_app is set.
+        # Modal screens must be pushed from Textual's application context.
         self._app.call_later(lambda: self._app.push_screen(modal, callback=_on_dismiss))
         return await result_future
 
     async def show_confirm_modal(self, message: str) -> bool:
-        """Show a confirm modal and return True/False."""
+        """Show a confirmation modal and return its result."""
         if not self._app or not self._app.is_running:
             return False
 
@@ -905,41 +853,32 @@ class TUISession(TabModelRegistryMixin):
         return await result_future
 
     async def show_model_picker_modal(self, agent: Any) -> None:
-        """Push the model-picker modal screen.
-
-        Used by the F3 keybinding and the ``/model`` (no-args)
-        slash-command intercept.
-        """
+        """Open the model picker for an agent."""
         if not self._app or not self._app.is_running:
             return
         self._app.call_later(lambda: self._app.push_screen(ModelPickerModal(agent)))
 
     async def show_modules_modal(self, agent: Any) -> None:
-        """Push the Modules modal screen.
-
-        Fire-and-forget — the modal manages its own dismiss; we don't
-        block on the result. Used by both the F2 keybinding and the
-        ``/module`` slash-command intercept in :class:`TUIInput`.
-        """
+        """Open the module manager without waiting for dismissal."""
         if not self._app or not self._app.is_running:
             return
         self._app.call_later(lambda: self._app.push_screen(ModulesModal(agent)))
 
-    async def show_module_edit_modal(self, agent: Any, name: str) -> bool:
-        """Resolve ``name`` to a module record and push the edit modal.
+    async def show_drive_panel(self) -> None:
+        """Open the drive records and settings panel."""
+        if not self._app or not self._app.is_running:
+            return
+        self._app.call_later(self._app.action_open_drives)
 
-        Returns ``True`` if the modal was pushed, ``False`` if the
-        name didn't resolve (caller may then fall through to the
-        text-mode "not found" error from the slash command).
-        """
+    async def show_module_edit_modal(self, agent: Any, name: str) -> bool:
+        """Open a named module's editor if it resolves uniquely."""
         if not self._app or not self._app.is_running:
             return False
         try:
             inventory = _list_modules(agent)
-        except Exception as exc:  # pragma: no cover — defensive
+        except Exception as exc:  # pragma: no cover - defensive boundary
             logger.warning("show_module_edit_modal inventory failed", error=str(exc))
             return False
-        # Accept ``type/name`` or bare ``name``.
         target = None
         if "/" in name:
             type_part, _, name_part = name.partition("/")
@@ -962,7 +901,7 @@ class TUISession(TabModelRegistryMixin):
         self.running = False
         self._stop_event.set()
         if self._app:
-            self._app._input_queue.put_nowait("")  # unblock get_input
+            self._signal_input_shutdown()
             if self._app.is_running:
                 self._app.exit()
 

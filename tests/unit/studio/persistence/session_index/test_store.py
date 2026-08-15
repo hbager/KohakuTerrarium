@@ -1,5 +1,7 @@
 """Unit tests for ``session_index.store`` — every code path."""
 
+import logging
+
 import pytest
 
 from kohakuterrarium.studio.persistence.session_index.entry import (
@@ -26,6 +28,7 @@ def _entry(
     created_at: str = "2026-01-01T00:00:00",
     node_id: str = "",
     agents: list[str] | None = None,
+    conversation_id: str | None = None,
 ) -> SessionIndexEntry:
     return SessionIndexEntry(
         filename=filename,
@@ -42,6 +45,7 @@ def _entry(
         created_at=created_at,
         format_version=2,
         node_id=node_id,
+        conversation_id=conversation_id,
     )
 
 
@@ -67,6 +71,32 @@ def idx(tmp_path):
 class TestSchema:
     def test_first_open_sets_version(self, idx):
         assert idx.meta_get("schema_version") == SCHEMA_VERSION
+
+    def test_entry_roundtrips_conversation_id(self, idx):
+        idx.upsert(
+            _entry(
+                filename="alice.kohakutr",
+                conversation_id="conversation-123",
+            )
+        )
+        assert idx.get("alice.kohakutr")["conversation_id"] == "conversation-123"
+        assert list(idx.iter_entries())[0]["conversation_id"] == "conversation-123"
+
+    def test_schema_version_mismatch_clears_sidecar_even_when_columns_match(
+        self, tmp_path
+    ):
+        side = tmp_path / ".kt-index.kvault"
+        i1 = SessionIndex(side)
+        i1.upsert(_entry(filename="alice.kohakutr"))
+        i1.meta_put("schema_version", SCHEMA_VERSION - 1)
+        i1.close()
+
+        i2 = SessionIndex(side)
+        try:
+            assert i2.list().total == 0
+            assert i2.meta_get("schema_version") == SCHEMA_VERSION
+        finally:
+            i2.close()
 
     def test_schema_bump_clears_sidecar(self, tmp_path):
         side = tmp_path / ".kt-index.kvault"
@@ -393,6 +423,32 @@ class TestSchema:
 
     def test_path_property(self, idx, tmp_path):
         assert idx.path == str(tmp_path / ".kt-index.kvault")
+
+    def test_close_logs_no_warning_for_fts_vault(self, tmp_path):
+        # The FTS ``_search`` TextVault has no ``close()``; close() must release
+        # it via the del-pattern without logging a "close table failed" warning
+        # on every teardown. (Framework loggers set propagate=False, so attach a
+        # handler directly rather than relying on caplog.)
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        log = logging.getLogger(
+            "kohakuterrarium.studio.persistence.session_index.store"
+        )
+        handler = _Capture(level=logging.WARNING)
+        log.addHandler(handler)
+        try:
+            i = SessionIndex(tmp_path / ".kt-index.kvault")
+            i.upsert(_entry(filename="a.kohakutr"))
+            i.close()
+        finally:
+            log.removeHandler(handler)
+        assert not any("close table failed" in r.getMessage() for r in records), [
+            r.getMessage() for r in records
+        ]
 
 
 # ── Mutations ─────────────────────────────────────────────────────

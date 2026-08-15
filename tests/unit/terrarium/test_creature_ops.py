@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from kohakuterrarium.modules.user_command.base import UserCommandResult
 from kohakuterrarium.terrarium import creature_ops as co
 
 # ── _redact_env / agent_env ───────────────────────────────────
@@ -294,7 +295,10 @@ class _PMgr:
         self.enabled = set(p for p, _ in self._plugins.items())
 
     def list_plugins(self):
-        return [p for _, p in self._plugins.items()]
+        # Match the real PluginManager contract: list of dicts.
+        return [
+            {"name": name, "enabled": p.enabled} for name, p in self._plugins.items()
+        ]
 
     def list_plugins_with_options(self):
         return [
@@ -480,6 +484,21 @@ class TestExecuteCommand:
         with pytest.raises(ValueError, match="Unknown command"):
             await co.agent_execute_command(ag, "no-such-cmd")
 
+    async def test_live_command_alias_resolves(self):
+        async def execute(args, context):
+            return UserCommandResult(output=args)
+
+        command = SimpleNamespace(aliases=["objective"], execute=execute)
+        ag = SimpleNamespace(
+            session=None,
+            list_user_commands=lambda: {"goal": command},
+        )
+
+        result = await co.agent_execute_command(ag, "objective", "set X")
+
+        assert result["success"] is True
+        assert result["output"] == "set X"
+
 
 # ── chat_history_for ───────────────────────────────────────────
 
@@ -538,14 +557,28 @@ class TestChatHistoryFor:
         assert out["events"] == []
         assert out["is_processing"] is False
 
-    def test_branches_callable(self):
-        agent = SimpleNamespace(list_branches=lambda: [{"branch": "main"}])
+    def test_branches_project_session_events(self):
+        store = SimpleNamespace()
+        store.get_resumable_events = lambda _name, **_kwargs: [
+            {"event_id": 1, "type": "user_message", "turn_index": 1, "branch_id": 1},
+            {"event_id": 2, "type": "processing_end", "turn_index": 1, "branch_id": 1},
+        ]
+        agent = SimpleNamespace(
+            config=SimpleNamespace(name="agent"),
+            session_store=store,
+            _direct_job_meta={},
+        )
         eng = _Engine(creatures={"c1": _Creature(agent)})
         out = co.chat_branches_for(eng, "c1")
-        assert out == [{"branch": "main"}]
+        assert out[0]["turn_index"] == 1
+        assert out[0]["latest"] == 1
+        assert out[0]["selected"] == 1
+        assert out[0]["branches"] == [
+            {"branch_id": 1, "parent_branch_paths": [[]], "selected": True}
+        ]
 
-    def test_branches_no_method(self):
-        agent = SimpleNamespace()
+    def test_branches_without_store(self):
+        agent = SimpleNamespace(session_store=None, _direct_job_meta={})
         eng = _Engine(creatures={"c1": _Creature(agent)})
         assert co.chat_branches_for(eng, "c1") == []
 

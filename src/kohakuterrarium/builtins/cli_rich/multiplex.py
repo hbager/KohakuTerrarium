@@ -27,21 +27,11 @@ from kohakuterrarium.utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-# Handler signature: ``async def handler(creature_id, event_kind, payload) -> None``.
-# ``event_kind`` is one of ``"emit"`` (full OutputEvent), ``"text"`` (raw
-# streamed chunk), ``"processing_start"`` / ``"processing_end"`` (turn
-# lifecycle), or ``"activity"`` (legacy callback shape).
 EventHandler = Callable[[str, str, dict[str, Any]], Awaitable[None]]
 
 
 class MultiplexedRichOutput(BaseOutputModule):
-    """``OutputModule`` that stamps every event with ``creature_id``.
-
-    Mounted once per creature by ``run_engine_with_rich_cli`` to
-    replace each creature's ``output_router.default_output``. Forwards
-    to a single ``handler`` (typically ``RichCLIApp._handle_creature_event``)
-    that owns all the per-creature state.
-    """
+    """Forward output events with their originating creature identifier."""
 
     def __init__(
         self,
@@ -54,8 +44,21 @@ class MultiplexedRichOutput(BaseOutputModule):
         self.handler = handler
         self.creature_id = creature_id
         self.creature_name = creature_name or creature_id
+        try:
+            self._owner_loop: asyncio.AbstractEventLoop | None = (
+                asyncio.get_running_loop()
+            )
+        except RuntimeError:
+            self._owner_loop = None
+
+    async def _on_start(self) -> None:
+        self._owner_loop = asyncio.get_running_loop()
+
+    async def _on_stop(self) -> None:
+        self._owner_loop = None
 
     async def _dispatch(self, kind: str, payload: dict[str, Any]) -> None:
+        self._owner_loop = asyncio.get_running_loop()
         try:
             await self.handler(self.creature_id, kind, payload)
         except Exception as e:  # pragma: no cover - defensive
@@ -65,8 +68,6 @@ class MultiplexedRichOutput(BaseOutputModule):
                 kind=kind,
                 error=str(e),
             )
-
-    # ── Stream + lifecycle ─────────────────────────────────────────
 
     async def write(self, content: str) -> None:
         if content:
@@ -86,11 +87,8 @@ class MultiplexedRichOutput(BaseOutputModule):
         await self._dispatch("processing_end", {})
 
     async def on_user_input(self, text: str) -> None:
-        # CLI composer prints user input itself; preserve the
-        # single-creature no-op behavior from RichCLIOutput.
+        # Composer submissions are already rendered by the app.
         return
-
-    # ── Legacy activity callbacks (sync) ───────────────────────────
 
     def on_activity(self, activity_type: str, detail: str) -> None:
         self.on_activity_with_metadata(activity_type, detail, {})
@@ -98,36 +96,33 @@ class MultiplexedRichOutput(BaseOutputModule):
     def on_activity_with_metadata(
         self, activity_type: str, detail: str, metadata: dict[str, Any]
     ) -> None:
-        try:
-            self.handler  # for type-check + early failure
-        except AttributeError:
+        # Synchronous callbacks may arrive from worker threads, where Python 3.12
+        # deliberately provides no implicit event loop. Schedule construction of
+        # the coroutine back on the loop which owns this sink.
+        loop = self._owner_loop
+        if loop is None:
+            try:
+                loop = asyncio.get_running_loop()
+                self._owner_loop = loop
+            except RuntimeError:
+                return
+        if loop.is_closed():
             return
-        # Fire-and-forget: the async handler runs on the loop the
-        # router started us with. Use run_coroutine_threadsafe so a
-        # sync callback from a worker thread doesn't block.
-        try:
-            loop = asyncio.get_event_loop()
-        except RuntimeError:
-            return
-        coro = self._dispatch(
-            "activity",
-            {
-                "activity_type": activity_type,
-                "detail": detail,
-                "metadata": dict(metadata) if metadata else {},
-            },
-        )
-        try:
-            asyncio.run_coroutine_threadsafe(coro, loop)
-        except RuntimeError:
-            # Loop not running — drop silently; the router teardown
-            # path covers final flushes.
-            return
+        payload = {
+            "activity_type": activity_type,
+            "detail": detail,
+            "metadata": dict(metadata) if metadata else {},
+        }
 
-    # ── Typed event consumer (preferred path) ──────────────────────
+        def _schedule_dispatch() -> None:
+            asyncio.create_task(self._dispatch("activity", payload))
+
+        try:
+            loop.call_soon_threadsafe(_schedule_dispatch)
+        except RuntimeError:
+            return
 
     async def emit(self, event: OutputEvent) -> None:
-        # Forward the full event so the app can inspect type / payload.
         await self._dispatch(
             "emit",
             {"event": event},

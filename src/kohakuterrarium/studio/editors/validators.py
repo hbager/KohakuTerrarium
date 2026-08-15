@@ -1,9 +1,8 @@
 """Pydantic mirror of ``core.config_types.AgentConfig``.
 
-Used at the HTTP boundary to validate creature-save bodies. Not
-the runtime representation — the framework continues to load
-configs through its own dataclass system. Keep fields + defaults
-in sync with ``kohakuterrarium/core/config_types.py``.
+These models validate creature-save payloads at the HTTP boundary. Runtime
+configuration continues to use the core dataclass system, so fields and defaults
+must remain aligned with ``kohakuterrarium/core/config_types.py``.
 """
 
 from typing import Any
@@ -50,6 +49,9 @@ class SubAgentConfigItemIn(BaseModel):
     tools: list[str] = Field(default_factory=list)
     can_modify: bool = False
     interactive: bool = False
+    # Empty values inherit the parent model. Config parsing moves this selector
+    # into ``options`` because subagent bootstrap reads it there.
+    model: str = ""
     options: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -72,7 +74,7 @@ class OutputConfigIn(BaseModel):
 
 
 class AgentConfigIn(BaseModel):
-    """Validate a creature config being saved via the studio API."""
+    """Validate a complete creature configuration submitted through Studio."""
 
     model_config = ConfigDict(extra="allow")
 
@@ -124,5 +126,5 @@ class AgentConfigIn(BaseModel):
 
 
 def canonical_order() -> list[str]:
-    """Canonical top-level key order for YAML serialization."""
+    """Return the canonical top-level order for creature YAML serialization."""
     return list(AgentConfigIn.model_fields.keys())

@@ -74,7 +74,6 @@ class _MockAgent:
 
     def switch_model(self, model):
         self.config.model = model
-        return model
 
 
 class _MockCreature:
@@ -266,7 +265,8 @@ class TestPerCreatureOps:
     async def test_regenerate(self):
         svc, c = _build_service()
         out = await svc.regenerate("cid", turn_index=1)
-        assert out["status"] == "regenerating"
+        assert out["status"] == "completed"
+        assert out["request_id"]
         c.agent.regenerate_last_response.assert_awaited()
 
     async def test_edit_message(self):
@@ -276,7 +276,8 @@ class TestPerCreatureOps:
         svc, c = _build_service()
         out = await svc.edit_message("cid", 2, "new content")
         assert isinstance(out, dict)
-        assert out["status"] == "edited"
+        assert out["status"] == "completed"
+        assert out["request_id"]
         c.agent.edit_and_rerun.assert_awaited()
 
     async def test_edit_message_rejected_target_returns_false(self):
@@ -285,8 +286,8 @@ class TestPerCreatureOps:
         # dict shape here would mask the failure.
         svc, c = _build_service()
         c.agent.edit_and_rerun.return_value = False
-        out = await svc.edit_message("cid", 2, "new content")
-        assert out is False
+        with pytest.raises(ValueError, match="cannot be edited"):
+            await svc.edit_message("cid", 2, "new content")
 
     async def test_rewind(self):
         svc, c = _build_service()
@@ -352,12 +353,6 @@ class TestPerCreatureOps:
         out = await svc.switch_model("cid", "new-model")
         assert out == "new-model"
         assert c.agent.config.model == "new-model"
-
-    async def test_switch_model_returns_resolved_identifier_from_agent(self):
-        svc, c = _build_service()
-        c.agent.switch_model = MagicMock(return_value="new-model@reasoning=xhigh")
-        out = await svc.switch_model("cid", "new-model")
-        assert out == "new-model@reasoning=xhigh"
 
     async def test_switch_model_fallback(self):
         svc, c = _build_service()
@@ -459,8 +454,9 @@ class TestWiring:
 
     async def test_wire_output(self):
         svc, _ = _build_service()
-        out = await svc.wire_output("cid", "to-name")
+        out = await svc.wire_output("cid", "root")
         assert out["edge_id"] == "edge-1"
+        svc._engine.wire_output.assert_awaited_once_with("cid", {"to": "root"})
 
     async def test_unwire_output(self):
         svc, _ = _build_service()

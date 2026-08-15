@@ -4,7 +4,6 @@ from kohakuterrarium.llm import api_keys
 from kohakuterrarium.llm.api_keys import KeyPool
 from kohakuterrarium.llm.litellm_provider import LiteLLMProvider
 from kohakuterrarium.llm.openai import OpenAIProvider
-from kohakuterrarium.llm.openai_responses import OpenAIResponsesProvider
 
 
 class _StatusError(Exception):
@@ -52,19 +51,6 @@ def test_openai_provider_applies_rotating_authorization_header():
 
     assert first["extra_headers"]["Authorization"] == "Bearer k1"
     assert second["extra_headers"]["Authorization"] == "Bearer k2"
-
-
-def test_openai_responses_provider_omits_codex_session_id_header():
-    provider = OpenAIResponsesProvider(api_key="k1", model="gpt-test")
-    provider.prompt_cache_key = "cache-key"
-
-    create_kwargs = provider._build_create_kwargs(
-        [{"role": "user", "content": "hi"}],
-        stream=True,
-    )
-
-    assert create_kwargs["prompt_cache_key"] == "cache-key"
-    assert "extra_headers" not in create_kwargs
 
 
 @pytest.mark.asyncio

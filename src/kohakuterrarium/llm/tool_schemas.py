@@ -1,19 +1,9 @@
 """Builtin tool parameter schemas.
 
-Pure-data module — one entry per built-in tool, keyed by tool_name.
-Used by llm/tools.py:build_tool_schemas when constructing the
-native function-calling schema list passed to the LLM.
+Define native function-calling schemas for built-in tools.
 
-This file intentionally lives standalone and is exempt from the file-
-size guard: every new builtin tool adds an entry here, and inlining
-the dict in tools.py made the dispatch logic hard to read once the
-catalogue grew past ~30 entries.
-
-If a tool is missing from this dict, build_tool_schemas falls back
-to a generic {content: string} schema — which silently strips
-structured arguments. The regression test
-tests/unit/test_tool_schemas_complete.py enforces every registered
-builtin tool has an entry here.
+Every registered built-in tool must have an entry so structured arguments are
+preserved instead of falling back to a generic content string.
 """
 
 _BUILTIN_SCHEMAS: dict[str, dict] = {
@@ -27,12 +17,22 @@ _BUILTIN_SCHEMAS: dict[str, dict] = {
             },
             "timeout": {
                 "type": "number",
-                "description": "Maximum execution time in seconds (0 = no timeout).",
+                "description": (
+                    "Maximum total call time in seconds, including lock waiting "
+                    "(0 = no timeout)."
+                ),
+            },
+            "allow_concurrent": {
+                "type": "boolean",
+                "description": (
+                    "Skip the unsafe-tool concurrency lock only when it is safe "
+                    "to run concurrently."
+                ),
             },
         },
         "required": ["command"],
     },
-    "run_python": {
+    "python": {
         "type": "object",
         "properties": {
             "code": {"type": "string", "description": "Python code to execute"},
@@ -355,6 +355,25 @@ _BUILTIN_SCHEMAS: dict[str, dict] = {
         "type": "object",
         "properties": {
             "question": {"type": "string", "description": "Question to ask the user"},
+            "placeholder": {
+                "type": "string",
+                "description": "Optional grey hint text shown inside the input box.",
+            },
+            "multiline": {
+                "type": "boolean",
+                "description": "Render a multi-line text area instead of a single line.",
+            },
+            "timeout_s": {
+                "type": "number",
+                "description": (
+                    "Seconds to wait for a reply. Default null = wait forever."
+                ),
+            },
+            "surface": {
+                "type": "string",
+                "enum": ["chat", "modal"],
+                "description": "Where to render the prompt. Default 'chat'.",
+            },
         },
         "required": ["question"],
     },

@@ -1,13 +1,8 @@
-"""Engine-backed session lifecycle.
+"""Manage Studio sessions backed by Terrarium graphs.
 
-Replaces ``KohakuManager.agent_create / agent_list / agent_status /
-agent_stop`` plus the ``terrarium_create / list / status / stop`` and
-``creature_add / list / remove`` clusters.
-
-A *session* is a Terrarium engine *graph*.  ``start_creature`` mints a
-fresh 1-creature graph; ``start_terrarium`` applies a recipe into one
-graph holding every creature.  Per-creature operations live in
-``creature_*.py`` siblings and accept ``(session_id, creature_id)``.
+A standalone creature starts in a new single-creature graph, while a terrarium
+recipe populates one graph with all configured creatures. Per-creature behavior
+is implemented by the sibling ``creature_*.py`` modules.
 """
 
 from datetime import datetime, timezone
@@ -15,7 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from kohakuterrarium.session.store import SessionStore
-from kohakuterrarium.studio.sessions import cluster_fold, remote_meta, stop as _stop
+from kohakuterrarium.terrarium.graph_identity import ensure_graph_name_available
+from kohakuterrarium.studio.sessions import (
+    cluster_fold,
+    remote_meta,
+    remote_terrarium,
+    stop as _stop,
+)
 from kohakuterrarium.studio.sessions import index_hooks as _index_hooks
 from kohakuterrarium.studio.sessions.find import (
     apply_creature_name,
@@ -43,18 +44,17 @@ from kohakuterrarium.terrarium.config import (
 from kohakuterrarium.studio._runtime import as_engine, host_engine_or_none
 from kohakuterrarium.terrarium import TerrariumService
 from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.terrarium.multi_node_service import MultiNodeTerrariumService
 from kohakuterrarium.utils.logging import get_logger
 from kohakuterrarium.utils.mobile_sandbox import default_workdir
 
 logger = get_logger(__name__)
 
 
-# Session bookkeeping (meta + attached stores) is INSTANCE-scoped: it
-# lives on the runtime (engine / multi-node service) via
-# ``studio.sessions.registry`` — see ``meta_for`` / ``stores_for``.
-# Two services or engines in one process no longer cross-contaminate.
+# Session metadata and stores are scoped to the runtime anchor so independent
+# engines or services in one process cannot share bookkeeping.
 
-# Legacy private aliases — tests reach in via these names.
+# Preserve private aliases used by compatibility callers and tests.
 _cluster_groups = cluster_fold.cluster_groups
 _sid_to_primary = cluster_fold.sid_to_primary
 _fold_session_listings = cluster_fold.fold_session_listings
@@ -83,13 +83,8 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# Legacy private alias — internal callers + tests use the old name.
+# Preserve the private timestamp alias used by existing callers.
 _now_iso = now_iso
-
-
-# ---------------------------------------------------------------------------
-# start_creature — mint a fresh 1-creature graph
-# ---------------------------------------------------------------------------
 
 
 async def start_creature(
@@ -113,29 +108,18 @@ async def start_creature(
     ``config_path`` for a remote spawn should be the worker-side
     absolute path returned by the deploy call.
     """
-    # B5: _normalize_pwd stats the HOST filesystem — only valid for
-    # host-targeted spawns. Remote spawns trust the caller's pwd and let
-    # the worker engine's add_creature validate against its own disk.
+    # Only host-targeted paths can be validated against the host filesystem;
+    # remote workers validate their own paths during creature creation.
     if on_node == "_host":
         pwd = _normalize_pwd(pwd)
-        # Lab-host mode (service exposes connected_nodes) runs NO agents
-        # on the host — reject host-targeted spawns; caller must pick a
-        # worker. Silent host-engine spawn would wedge the cluster.
+        # Lab hosts coordinate workers but do not run agents themselves.
         if hasattr(service, "connected_nodes"):
             raise ValueError(
                 "lab-host mode runs no agents on the host — spawn on a "
                 "worker node (pass on_node=<worker name>)"
             )
-        # Standalone path — direct engine call.  ``strict=False``: Studio
-        # spawns keep degrade-and-continue (dashboard rebinds models);
-        # ``@pkg/...`` refs pass through — ``load_agent_config`` resolves.
-        # ``name=`` MUST travel through add_creature (not be applied
-        # post-hoc): the engine's autosession may attach a SessionStore
-        # during add_creature, and the SessionOutput event-key prefix is
-        # baked from ``config.name`` at attach time.  A post-hoc rename
-        # left agent events keyed under the config name while the chat
-        # WS wrote user events under the display name — history (read by
-        # display name) then showed ONLY the user's prompts.
+        # The engine must receive the display name before autosession attaches;
+        # persisted event keys are derived from the configured name at attach time.
         engine = as_engine(service)
         if config_path:
             creature = await engine.add_creature(
@@ -145,7 +129,6 @@ async def start_creature(
                 is_privileged=True,
                 strict=False,
                 name=name,
-                io="none",
             )
         elif config is not None:
             creature = await engine.add_creature(
@@ -155,7 +138,6 @@ async def start_creature(
                 is_privileged=True,
                 strict=False,
                 name=name,
-                io="none",
             )
         else:
             raise ValueError("Must provide config_path or config")
@@ -173,16 +155,12 @@ async def start_creature(
         logger.info("Creature session started", session_id=sid, creature_id=cid)
         return _build_session_handle(engine, sid, meta_for(service))
 
-    # Remote-node path: route through the service's add_creature with
-    # ``on_node=...``.  The controller's _home registry tracks the
-    # creature; we return a synthesised Session handle with a
-    # placeholder graph_id from the response.  Session-store attach
-    # happens on the worker via ``WorkerSessionAttacher``.
+    # Remote creation is service-routed; the worker attaches its session store
+    # and the controller synthesizes a Session from the returned identity.
     spawn_payload: Any = config if config is not None else config_path
     if spawn_payload is None:
         raise ValueError("Must provide config_path or config")
-    # ``@pkg/...`` refs travel verbatim — the WORKER resolves them
-    # against its own installed packages.
+    # Package references are resolved against the worker's installed packages.
     info = await service.add_creature(
         spawn_payload,
         is_privileged=True,
@@ -192,21 +170,39 @@ async def start_creature(
         name=name.strip() if name and name.strip() else None,
     )
     sid = info.graph_id
+    remote_session_path = ""
+    conversation_id = ""
+    host = getattr(service, "_host", None)
+    if host is not None:
+        try:
+            response = await host.request(
+                to_node=on_node,
+                namespace="terrarium.session",
+                type="stores",
+                body={"session_id": sid},
+                timeout=30.0,
+            )
+            stores = response.get("stores") if isinstance(response, dict) else None
+            if isinstance(stores, list) and stores:
+                remote_session_path = str(stores[0].get("path") or "")
+                conversation_id = str(stores[0].get("conversation_id") or "")
+        except Exception as exc:
+            logger.warning(
+                "Failed to discover remote session store",
+                session_id=sid,
+                error=str(exc),
+            )
     meta_for(service)[sid] = {
         "name": info.name,
         "config_path": config_path or "",
         "pwd": pwd or "",
         "created_at": _now_iso(),
         "on_node": on_node,
-        # Track the worker-side creature_id so subsequent
-        # ``get_session`` calls can re-synthesise the Session with the
-        # real id (the host has no engine handle to walk for remote).
+        # The host needs the worker identity to reconstruct remote Session handles.
         "creature_id": info.creature_id,
-        # Cache the resolved model + llm_name so subsequent host-side
-        # reads (``get_session`` / ``list_creatures`` remote branch)
-        # surface a non-empty model chip even when the worker is
-        # briefly unreachable.  Without these the UI flips to
-        # "No model" on the next read after spawn (B3 / B4).
+        "remote_session_path": remote_session_path,
+        "conversation_id": conversation_id,
+        # Cached model metadata keeps remote status readable during brief outages.
         "model": str(getattr(info, "model", "") or ""),
         "llm_name": str(getattr(info, "llm_name", "") or ""),
         "is_privileged": bool(getattr(info, "is_privileged", False)),
@@ -218,10 +214,7 @@ async def start_creature(
         creature_id=info.creature_id,
         on_node=on_node,
     )
-    # Synthesise a minimal Session — listing endpoints union via
-    # service.list_creatures(). Both session-level and per-creature
-    # ``home_node`` MUST carry ``on_node`` so the frontend renders the
-    # site chip, PTY badge, and cluster routing correctly.
+    # Session and creature home-node fields must agree for routing and site UI.
     return Session(
         session_id=sid,
         name=info.name,
@@ -232,35 +225,20 @@ async def start_creature(
                 "home_node": on_node,
                 "running": info.is_running,
                 "is_privileged": info.is_privileged,
-                # Surface the resolved model so the frontend's spawn
-                # path renders the model chip without a follow-up status
-                # fetch.  Empty string when the agent ended up with a
-                # ``DeferredLLMProvider`` — that is the "no model
-                # configured yet, user must switch_model" state.
+                # An empty model denotes a deferred provider awaiting model selection.
                 "model": getattr(info, "model", "") or "",
-                # The canonical identifier (e.g. ``"openai/gpt-4o"``).
-                # ModelSwitcher.vue prefers this over ``model`` — without
-                # it the model chip falls back to "No model" the moment
-                # the next read happens (B3).
+                # The canonical LLM identifier takes precedence over the display model.
                 "llm_name": getattr(info, "llm_name", "") or "",
             }
         ],
         channels=[],
-        # ``has_root`` is the recipe-level flag (only ``start_terrarium``
-        # sets it); single-creature spawn has no recipe so no root — do
-        # NOT conflate with ``is_privileged`` or the frontend addresses
-        # chat via literal ``"root"`` and 404s (B9).
+        # ``has_root`` describes recipe structure, not creature privilege.
         has_root=False,
         pwd=pwd or "",
         created_at=_now_iso(),
         config_path=config_path or "",
         home_node=on_node,
     )
-
-
-# ---------------------------------------------------------------------------
-# start_terrarium — apply a recipe into a single graph
-# ---------------------------------------------------------------------------
 
 
 def _resolve_engine_for_recipe(service: "TerrariumService") -> Terrarium:
@@ -294,6 +272,7 @@ async def start_terrarium(
     pwd: str | None = None,
     name: str | None = None,
     llm: str | None = None,
+    on_node: str = "_host",
 ) -> Session:
     """Apply a recipe into a fresh graph; start every creature.
 
@@ -310,31 +289,34 @@ async def start_terrarium(
     that engine, and it is gated on the lab-host's explicit
     presence of one.
     """
+    if isinstance(service, MultiNodeTerrariumService):
+        return await _start_remote_terrarium(
+            service,
+            config_path=config_path,
+            name=name,
+            pwd=pwd,
+            llm=llm,
+            on_node=on_node,
+        )
+
     engine = _resolve_engine_for_recipe(service)
     pwd = _normalize_pwd(pwd)
     if config_path:
-        # ``@pkg/...`` refs resolve inside ``load_terrarium_config``.
+        # The config loader resolves package references.
         cfg = load_terrarium_config(config_path)
     elif config is not None:
         cfg = config
     else:
         raise ValueError("Must provide config_path or config")
 
-    # ``session=False``: Studio mints its own richer store below
-    # (terrarium_name / terrarium_channels / terrarium_creatures meta
-    # the resume + viewer paths read).  Under autosession
-    # (``Terrarium(session_dir=...)``) ``apply_recipe`` would otherwise
-    # mint a store at the SAME ``<graph_id>.kohakutr`` path first; the
-    # Studio store then re-opens that file as a second live handle and
-    # the engine-minted handle leaks — on Windows the lingering handle
-    # locks the file, so deleting the saved session after stop 409s
-    # with WinError 32.
+    # Studio owns the richer recipe metadata store. Disabling autosession avoids
+    # two live handles for the same path, which would prevent deletion on Windows.
     graph = await engine.apply_recipe(
         cfg, pwd=pwd, llm=llm, strict=False, session=False
     )
     sid = graph.graph_id
 
-    # Session-store auto-attach.
+    # Recipe sessions persist Studio-specific topology metadata.
     try:
         sess_dir = _session_dir()
         Path(sess_dir).mkdir(parents=True, exist_ok=True)
@@ -380,9 +362,24 @@ async def start_terrarium(
     return _build_session_handle(engine, sid, meta_for(service))
 
 
-# ---------------------------------------------------------------------------
-# query / stop
-# ---------------------------------------------------------------------------
+async def _start_remote_terrarium(
+    service: MultiNodeTerrariumService,
+    *,
+    config_path: str | None,
+    name: str | None,
+    pwd: str | None,
+    llm: str | None,
+    on_node: str,
+) -> Session:
+    """Delegate remote recipe startup to its worker-specific lifecycle."""
+    return await remote_terrarium.start_remote_terrarium(
+        service,
+        config_path=config_path,
+        name=name,
+        pwd=pwd,
+        llm=llm,
+        on_node=on_node,
+    )
 
 
 def list_sessions(service: "TerrariumService") -> list[SessionListing]:
@@ -404,9 +401,7 @@ def list_sessions(service: "TerrariumService") -> list[SessionListing]:
     fold — without it the user sees two rail entries after a cross-
     node connect.
     """
-    # Lab-host mode runs no host engine — ``host_engine_or_none``
-    # returns ``None`` and we go straight to the remote ``_meta``
-    # branch.  Standalone walks its host-local graphs as before.
+    # Standalone services expose local graphs; lab hosts rely on remote metadata.
     engine = host_engine_or_none(service)
     meta_registry = meta_for(service)
     out: list[SessionListing] = []
@@ -423,26 +418,12 @@ def list_sessions(service: "TerrariumService") -> list[SessionListing]:
             )
         )
         seen.add(graph.graph_id)
-    # Remote sessions — tracked by remote-spawn but invisible to the
-    # local engine.  Without this branch the new ``on_node`` spawn
-    # path successfully creates a creature on a worker but the
-    # listing endpoints never show it.
-    #
-    # Liveness is NOT assumed: a ``_meta`` entry only proves the session
-    # was spawned, not that its worker is still connected. We cross-check
-    # against the service's currently-connected nodes (a sync read on
-    # ``MultiNodeTerrariumService``) and PURGE the stale entry when the
-    # worker is gone — otherwise a disconnected worker leaves a zombie
-    # session listed ``running`` forever.
+    # Remote metadata makes worker sessions visible, but membership still
+    # determines liveness so disconnected workers do not leave zombie listings.
     connected: set[str] = set()
     connected_fn = getattr(service, "connected_nodes", None)
-    # ``have_membership`` distinguishes "the service can tell me which
-    # workers are connected" from "an empty connected set".  An empty
-    # set is a LEGITIMATE state — every worker disconnected — and MUST
-    # still purge zombie ``_meta`` entries.  Gating the purge on a
-    # *non-empty* ``connected`` (the old behaviour, which worked only
-    # because ``_host`` was always in the set) left the last worker's
-    # session listed ``running`` forever after it left.
+    # An empty membership set is authoritative when the service supports the
+    # query; it means every worker is disconnected, not that liveness is unknown.
     have_membership = callable(connected_fn)
     if have_membership:
         try:
@@ -456,8 +437,7 @@ def list_sessions(service: "TerrariumService") -> list[SessionListing]:
             continue
         node = meta.get("on_node")
         if have_membership and node not in connected:
-            # The worker hosting this session disconnected — drop the
-            # stale meta so the listing self-heals on the next poll.
+            # Purge metadata once its owning worker leaves membership.
             meta_registry.pop(sid, None)
             continue
         out.append(
@@ -480,11 +460,9 @@ def get_session(service: "TerrariumService", session_id: str) -> Session:
     looked up in ``_meta`` and re-synthesised from there since the
     controller has no engine handle to walk.
     """
-    # S6-1: redirect live non-primary cluster sid to primary before
-    # meta lookup; the trailing fallback only fires for purged meta.
+    # Cluster sessions are addressed through their primary member.
     session_id = cluster_fold.sid_to_primary(service).get(session_id, session_id)
-    # Standalone walks its host engine; lab-host has none — fall
-    # straight through to the remote ``_meta`` branch.
+    # Lab hosts reconstruct sessions from metadata because they have no agent engine.
     engine = host_engine_or_none(service)
     meta_registry = meta_for(service)
     if engine is not None and session_id in {g.graph_id for g in engine.list_graphs()}:
@@ -492,13 +470,8 @@ def get_session(service: "TerrariumService", session_id: str) -> Session:
     meta = meta_registry.get(session_id)
     if meta is not None and meta.get("on_node"):
         home = meta.get("on_node", "_host") or "_host"
-        # Cross-node cluster fold: when ``session_id`` is the primary
-        # of a cluster recorded in ``service._cluster_links``, union
-        # creatures from every member so the single Session handle
-        # exposes both alpha + bravo (preserving each creature's
-        # per-member ``home_node``). Without this, opening the primary
-        # cluster sid returns only the primary's own creature and the
-        # frontend can't render the multi-site chat tab.
+        # A cluster Session exposes every member creature while preserving each
+        # creature's home node.
         clustered = cluster_fold.fold_session_creatures(
             service, session_id, meta_registry
         )
@@ -514,8 +487,7 @@ def get_session(service: "TerrariumService", session_id: str) -> Session:
                 config_path=meta.get("config_path", ""),
                 home_node=home,
             )
-        # Real worker-side creature_id was stored at spawn time; the
-        # session_id fallback is only used for pre-1.5.0 meta entries.
+        # Older metadata may lack the worker-side creature identity.
         cid = meta.get("creature_id") or session_id
         return Session(
             session_id=session_id,
@@ -525,10 +497,7 @@ def get_session(service: "TerrariumService", session_id: str) -> Session:
                     "creature_id": cid,
                     "name": meta.get("name", ""),
                     "home_node": home,
-                    # B3/B4: surface the cached model + llm_name (kept
-                    # in sync at spawn + on switch_model) so the model
-                    # chip survives tab close / reopen and never shows
-                    # "No model" while the worker is reachable.
+                    # Model metadata is cached at spawn and model switches.
                     "model": str(meta.get("model", "") or ""),
                     "llm_name": str(meta.get("llm_name", "") or ""),
                     "running": bool(meta.get("running", True)),
@@ -536,15 +505,14 @@ def get_session(service: "TerrariumService", session_id: str) -> Session:
                 }
             ],
             channels=[],
-            # Recipe-only flag (B9) — read cached recipe flag, not privilege.
+            # Root presence is a recipe property rather than a privilege flag.
             has_root=bool(meta.get("has_root", False)),
             pwd=meta.get("pwd", ""),
             created_at=meta.get("created_at", ""),
             config_path=meta.get("config_path", ""),
             home_node=home,
         )
-    # S6-1 top-of-function redirect already mapped non-primary cluster
-    # sids → primary; if we reach here the sid is genuinely unknown.
+    # Non-primary cluster IDs were normalized above, so this ID is unknown.
     raise KeyError(f"session {session_id!r} not found")
 
 
@@ -592,17 +560,15 @@ async def get_session_async(service: "TerrariumService", session_id: str) -> Ses
         pass
     await refresh_remote_creature_meta(service, session_id)
     sess = get_session(service, session_id)
-    # CF-12: re-fold the cluster with a live service.list_creatures()
-    # roster so freshly spawned peers surface before _meta catches up.
+    # Prefer the live cluster roster so newly spawned peers appear before metadata sync.
     live = await cluster_fold.refresh_cluster_creatures_live(service, session_id)
     if live:
         pid = cluster_fold.sid_to_primary(service).get(session_id, session_id)
         folded = _fold_session_creatures(service, pid, live_creatures=live)
         if folded:
             sess.creatures = folded
-    # B10: union channels across cluster members. Standalone reads channels
-    # live from env.shared_channels; multi-node has no host-side env so we
-    # fan out to each member via service.list_channels and dedupe by name.
+    # Multi-node clusters have no shared host environment, so channel discovery
+    # fans out across members and deduplicates by name.
     primary = cluster_fold.sid_to_primary(service).get(session_id, session_id)
     groups = cluster_fold.cluster_groups(service)
     member_sids = groups.get(primary, {primary})
@@ -665,7 +631,7 @@ def rename_session(service: "TerrariumService", session_id: str, name: str) -> S
                 apply_creature_name(creature, name)
                 break
         return _build_session_handle(engine, session_id, meta_registry)
-    # Lab-host / remote-session path — meta-only update.
+    # Remote sessions can update only host-side metadata until rename is service-routed.
     meta = meta_registry.get(session_id)
     if meta is None:
         raise KeyError(f"session {session_id!r} not found")
@@ -694,6 +660,20 @@ def rename_creature(service: "TerrariumService", creature_id: str, name: str) ->
     meta_registry = meta_for(service)
     if engine is not None:
         creature = engine.get_creature(creature_id)
+        topology = getattr(engine, "_topology", None)
+        graph_id = (
+            topology.creature_to_graph.get(creature.creature_id)
+            if topology is not None
+            else None
+        )
+        if graph_id is not None:
+            ensure_graph_name_available(
+                engine._topology,
+                engine._creatures,
+                graph_id=graph_id,
+                name=name,
+                exclude_id=creature.creature_id,
+            )
         apply_creature_name(creature, name)
         sid = creature.graph_id
         graph = next(
@@ -705,8 +685,7 @@ def rename_creature(service: "TerrariumService", creature_id: str, name: str) ->
             if meta is not None:
                 meta["name"] = name
         return creature.get_status()
-    # Lab-host path — find the session this creature belongs to via
-    # the home registry and update host-side meta only.
+    # Remote rename updates host metadata after resolving ownership.
     home_lookup = getattr(service, "_home", None)
     if not isinstance(home_lookup, dict) or creature_id not in home_lookup:
         raise KeyError(f"creature {creature_id!r} not found")
@@ -733,10 +712,7 @@ def _persist_cluster_members_to_mirror(service, session_id):
 
 
 async def stop_session(service: "TerrariumService", session_id: str) -> None:
-    """Thin delegator — see :func:`studio.sessions.stop.stop_session`.
-
-    Passes the lifecycle-owned registries by reference.
-    """
+    """Stop a runtime while keeping the conversation open and dormant."""
     await _stop.stop_session(
         service,
         session_id,
@@ -747,9 +723,17 @@ async def stop_session(service: "TerrariumService", session_id: str) -> None:
     )
 
 
-# ---------------------------------------------------------------------------
-# creature add / remove inside a running session (hot-plug)
-# ---------------------------------------------------------------------------
+async def end_session(service: "TerrariumService", session_id: str) -> None:
+    """Explicitly end a conversation and remove its runtime."""
+    await _stop.stop_session(
+        service,
+        session_id,
+        meta=meta_for(service),
+        session_stores=stores_for(service),
+        mirror_dir=Path(_session_dir()) / "mirror",
+        index_hooks=_index_hooks.registry(),
+        end_conversation=True,
+    )
 
 
 async def add_creature(
@@ -767,24 +751,17 @@ async def add_creature(
     this branch the helper would call ``as_engine(service)`` and 500
     in lab-host mode (the host runs no agent engine).
     """
-    # Standalone path — direct engine call so session-store attach and
-    # graph membership behave exactly as the existing tests expect.
+    # Local additions use the engine so graph membership and store attachment agree.
     engine = host_engine_or_none(service)
     if engine is not None:
         if session_id not in {g.graph_id for g in engine.list_graphs()}:
             raise KeyError(f"session {session_id!r} not found")
         creature = await engine.add_creature(config, graph=session_id)
-        # Reuse the graph-level store (always present here — the session
-        # already exists).  ``config_type`` must be a resumable literal:
-        # this call used to pass ``"creature"``, which ``init_meta``
-        # accepted and resume then rejected as an unknown session type.
+        # The existing graph store is reused, and its config type must be resumable.
         attach_session_store_for_creature(service, creature, config_type="agent")
         return creature.creature_id
 
-    # Lab-host / remote-session path — the session was spawned via the
-    # remote branch of ``start_creature`` and tracked in ``_meta`` with
-    # an ``on_node`` field.  Route the hot-plug through the service so
-    # the worker hosting the session gets the new creature.
+    # Remote additions route to the worker recorded in session metadata.
     meta = meta_for(service).get(session_id)
     if meta is None or not meta.get("on_node"):
         raise KeyError(f"session {session_id!r} not found")
@@ -813,8 +790,7 @@ def list_creatures(service: "TerrariumService", session_id: str) -> list[dict]:
     and we synthesise a one-creature listing from it.  Without this
     fallback the route 404s for every worker-spawned session.
     """
-    # Standalone walks its host engine; lab-host has none — drop
-    # straight to the remote ``_meta`` fallback.
+    # Lab hosts skip local graph lookup and use remote metadata.
     engine = host_engine_or_none(service)
     graph = None
     if engine is not None:
@@ -840,8 +816,7 @@ def list_creatures(service: "TerrariumService", session_id: str) -> list[dict]:
             out.append(status)
         return out
 
-    # Remote-graph fallback — the host engine doesn't know about it
-    # but ``_meta`` was populated at remote-spawn time.
+    # Remote-spawn metadata supplies the listing when no local graph exists.
     meta = meta_for(service).get(session_id)
     if meta is not None and meta.get("on_node"):
         home = meta.get("on_node", "_host") or "_host"
@@ -854,10 +829,7 @@ def list_creatures(service: "TerrariumService", session_id: str) -> list[dict]:
                 "running": bool(meta.get("running", True)),
                 "home_node": home,
                 "is_privileged": bool(meta.get("is_privileged", False)),
-                # B3/B4: surface the cached model + llm_name so the
-                # per-session creatures listing surfaces a non-empty
-                # model chip after spawn / switch_model — without these
-                # the modal renders "No model" on every read.
+                # Cached model metadata keeps remote creature listings informative.
                 "model": str(meta.get("model", "") or ""),
                 "llm_name": str(meta.get("llm_name", "") or ""),
             }
@@ -886,9 +858,7 @@ async def remove_creature(
         await engine.remove_creature(creature_id)
         return True
 
-    # Lab-host / remote-session path.  Validate the session is one we
-    # tracked at remote-spawn time; route the removal through the
-    # service so it reaches the creature's home worker.
+    # Remote removal requires tracked ownership and service routing to the worker.
     meta = meta_for(service).get(session_id)
     if meta is None or not meta.get("on_node"):
         raise KeyError(f"session {session_id!r} not found")
@@ -897,11 +867,6 @@ async def remove_creature(
     except KeyError:
         return False
     return True
-
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
 
 
 def _build_session_handle(

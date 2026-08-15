@@ -18,6 +18,7 @@ from kohakuterrarium.llm.base import (
     ChatResponse,
     LLMConfig,
     NativeToolCall,
+    OverflowRecoveryState,
     ToolSchema,
 )
 from kohakuterrarium.llm.codex_format import fix_tool_call_pairing, to_responses_input
@@ -197,6 +198,26 @@ class OpenAIResponsesProvider(BaseLLMProvider):
         headers["Authorization"] = f"Bearer {key}"
         create_kwargs["extra_headers"] = headers
 
+    def _api_key_failover_limit(self) -> int:
+        return min(5, len(self._api_key_pool.keys)) if self._api_key_pool else 0
+
+    def _should_failover_api_key(self, error_class: ErrorClass, failures: int) -> bool:
+        return (
+            bool(self._api_key_pool)
+            and error_class in {ErrorClass.USER_ERROR, ErrorClass.RATE_LIMIT}
+            and failures < self._api_key_failover_limit()
+        )
+
+    def _log_api_key_failover(
+        self, error_class: ErrorClass, failure_number: int, exc: Exception
+    ) -> None:
+        logger.warning(
+            "provider_api_key_failover",
+            attempt=failure_number,
+            error_class=error_class.value,
+            error=str(exc),
+        )
+
     def _sanitize_extra_body(self, extra: dict[str, Any]) -> dict[str, Any]:
         """Drop KT-internal knobs that are not Responses API fields."""
         return {k: v for k, v in extra.items() if k != "disable_prompt_caching"}
@@ -317,7 +338,7 @@ class OpenAIResponsesProvider(BaseLLMProvider):
         current = messages
         attempt = 0
         api_key_failures = 0
-        overflow_recovered = False
+        overflow_state = OverflowRecoveryState()
         while True:
             try:
                 async for chunk in self._raw_stream_chat(
@@ -327,17 +348,12 @@ class OpenAIResponsesProvider(BaseLLMProvider):
                 return
             except Exception as exc:
                 cls = classify_openai_error(exc)
-                if cls is ErrorClass.OVERFLOW and not overflow_recovered:
-                    dropped, recovered = drop_last_tool_round(current)
-                    if dropped:
-                        overflow_recovered = True
-                        current = recovered
-                        self._notify_emergency_drop(recovered)
-                        logger.warning(
-                            "provider_emergency_drop",
-                            dropped=dropped,
-                            recovered_messages=len(recovered),
-                        )
+                if cls is ErrorClass.OVERFLOW:
+                    replacement = await self._recover_from_overflow(
+                        current, overflow_state
+                    )
+                    if replacement is not None:
+                        current = replacement
                         continue
                 if cls is not ErrorClass.OVERFLOW:
                     api_key_failures += 1
@@ -405,23 +421,18 @@ class OpenAIResponsesProvider(BaseLLMProvider):
         current = messages
         attempt = 0
         api_key_failures = 0
-        overflow_recovered = False
+        overflow_state = OverflowRecoveryState()
         while True:
             try:
                 return await self._raw_complete_chat(current, **kwargs)
             except Exception as exc:
                 cls = classify_openai_error(exc)
-                if cls is ErrorClass.OVERFLOW and not overflow_recovered:
-                    dropped, recovered = drop_last_tool_round(current)
-                    if dropped:
-                        overflow_recovered = True
-                        current = recovered
-                        self._notify_emergency_drop(recovered)
-                        logger.warning(
-                            "provider_emergency_drop",
-                            dropped=dropped,
-                            recovered_messages=len(recovered),
-                        )
+                if cls is ErrorClass.OVERFLOW:
+                    replacement = await self._recover_from_overflow(
+                        current, overflow_state
+                    )
+                    if replacement is not None:
+                        current = replacement
                         continue
                 if cls is not ErrorClass.OVERFLOW:
                     api_key_failures += 1

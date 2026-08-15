@@ -1,9 +1,7 @@
 """Engine launcher for ``--mode cli`` (the rich inline CLI).
 
-The pre-unification rich CLI mode was removed in commit ab256f72 with a
-"deferred" placeholder warning ("``cli`` / ``plain`` variants will
-return in a follow-up"). This module is that follow-up: it mounts
-:class:`RichCLIApp` on top of a running :class:`Terrarium` engine so
+This module mounts :class:`RichCLIApp` on top of a running
+:class:`Terrarium` engine so
 ``kt run --mode cli`` produces an inline prompt with bordered input
 + live region instead of the full-screen Textual TUI.
 
@@ -134,11 +132,14 @@ async def run_engine_with_rich_cli(
         for c in all_creatures:
             app.mount_creature_sink(c)
     else:
+        # Single-creature still needs engine/service/focus wired so /drives and
+        # live settings apply resolve the runtime (multi setup adds roster only).
+        app.setup_single_creature(engine, focus_creature_id)
         rich_output = RichCLIOutput(app)
         agent.output_router.default_output = rich_output
 
     if not focus_creature.is_running:
-        await focus_creature.start()
+        await engine.start(focus_creature)
 
     if is_multi:
         # Engine subscription starts after the focus creature is up so

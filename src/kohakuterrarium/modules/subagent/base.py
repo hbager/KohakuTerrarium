@@ -1,9 +1,4 @@
-"""
-Sub-agent base class.
-
-A sub-agent is a nested agent with its own controller, limited tool access,
-and configurable output routing.
-"""
+"""Run nested agents with isolated conversations and limited tool access."""
 
 import asyncio
 from datetime import datetime
@@ -25,7 +20,7 @@ from kohakuterrarium.modules.plugin.base import (
 )
 from kohakuterrarium.modules.plugin.manager import PluginManager
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
-from kohakuterrarium.modules.subagent.result import (  # noqa: F401 – re-exported for backward compat
+from kohakuterrarium.modules.subagent.result import (  # noqa: F401
     SUBAGENT_FRAMEWORK_HINTS,
     SubAgentJob,
     SubAgentResult,
@@ -40,11 +35,7 @@ logger = get_logger(__name__)
 
 
 class SubAgent:
-    """Nested agent with limited capabilities.
-
-    A sub-agent runs with its own controller and tool access, but returns
-    results to the parent controller (unless output_to=external).
-    """
+    """Run a nested controller whose tools and output routing are constrained."""
 
     def __init__(
         self,
@@ -69,55 +60,44 @@ class SubAgent:
             self.compact_manager._llm = self.llm
             self.compact_manager._agent_name = config.name
 
-        # Optional callback for reporting tool activity to parent
         self.on_tool_activity: Any = None
 
-        # Parent's tool context builder (inherited environment, working_dir, etc.)
         self._build_tool_context: Any = None
 
-        # Optional session store for persisting sub-agent conversations
         self._session_store: Any = None
         self._parent_name: str = ""
         self._run_index: int = 0
 
-        # Shared iteration budget — set by SubAgentManager.spawn() based on
-        # parent's budget and this config's budget_inherit / budget_allocation
-        # fields. ``None`` means "no budget enforcement" (today's behavior).
+        # A shared budget coordinates parent and child iteration limits when configured.
         self.iteration_budget: IterationBudget | None = None
 
-        # Create limited registry with only allowed tools
         self.registry = self._create_limited_registry()
 
-        # Create executor for this sub-agent
         self.executor = Executor()
         for tool_name in self.registry.list_tools():
             tool = self.registry.get_tool(tool_name)
             if tool:
                 self.executor.register_tool(tool)
 
-        # Conversation for this sub-agent
         self.conversation = Conversation()
 
-        # Token usage tracking
+        # Messages are admitted between turns without changing task completion semantics.
+        self._inbox: asyncio.Queue = asyncio.Queue()
+
         self._total_tokens = 0
         self._prompt_tokens = 0
         self._completion_tokens = 0
-        # Wave B: track prompt-cache hits so the parent's
-        # ``subagent_done`` event can record them (audit finding A).
         self._cached_tokens = 0
 
-        # Resolve tool call format for the parser
         self._is_native = tool_format == "native"
         parser_tool_format = self._resolve_parser_format(tool_format)
 
-        # Stream parser with known tools from registry
         self._parser_config = ParserConfig(
             known_tools=set(self.registry.list_tools()),
             tool_format=parser_tool_format,
         )
         self._parser = StreamParser(self._parser_config)
 
-        # State
         self._running = False
         self._cancelled = False
         self._start_time: datetime | None = None
@@ -250,10 +230,6 @@ class SubAgent:
         finally:
             self._running = False
 
-    # ------------------------------------------------------------------
-    # Internal run logic (split into focused helpers)
-    # ------------------------------------------------------------------
-
     async def _run_internal(self, task: str) -> SubAgentResult:
         """Internal run logic. Runs conversation loop with tool execution."""
         self._setup_conversation(task)
@@ -279,10 +255,9 @@ class SubAgent:
                     cached_tokens=self._cached_tokens,
                     metadata={"tools_used": tools_used},
                 )
-            # Charge one unit against the shared iteration budget before
-            # spending an LLM call. On exhaustion we return a failed
-            # SubAgentResult so the parent controller sees a tool-result
-            # error and can decide how to proceed.
+            # Admit live messages before spending the next model call.
+            self._drain_inbox_into_conversation()
+            # Budget exhaustion must be visible to the parent as a failed result.
             if self.iteration_budget is not None:
                 exhausted = self._charge_budget_or_fail(tools_used)
                 if exhausted is not None:
@@ -312,16 +287,20 @@ class SubAgent:
                     metadata={"tools_used": tools_used},
                 )
 
-            if not tool_calls:
-                logger.info(
-                    "Sub-agent no tools called, finishing",
-                    subagent_name=self.config.name,
-                )
-                break
+            if tool_calls:
+                tools_used.extend(tc.name for tc in tool_calls)
+                tool_results = await self._execute_and_report_tools(tool_calls)
+                self._append_tool_results(tool_calls, tool_results)
+                continue
 
-            tools_used.extend(tc.name for tc in tool_calls)
-            tool_results = await self._execute_and_report_tools(tool_calls)
-            self._append_tool_results(tool_calls, tool_results)
+            # A message arriving during the turn requires one more response cycle.
+            if self._inbox_has_pending():
+                continue
+            logger.info(
+                "Sub-agent no tools called, finishing",
+                subagent_name=self.config.name,
+            )
+            break
 
         return self._build_result(output_parts, tools_used)
 
@@ -335,7 +314,7 @@ class SubAgent:
     async def _run_single_turn(
         self, native_tool_schemas: Any
     ) -> tuple[list[ToolCallEvent], list[str]]:
-        """Run one LLM turn. Returns (tool_calls, output_text_parts)."""
+        """Run one model turn and return tool calls with emitted text parts."""
         messages = self.conversation.to_messages()
         if self.plugins:
             messages = await self.plugins.run_pre_hooks(
@@ -483,15 +462,8 @@ class SubAgent:
             self._prompt_tokens += usage.get("prompt_tokens", 0)
             self._completion_tokens += usage.get("completion_tokens", 0)
             self._total_tokens += usage.get("total_tokens", 0)
-            # Wave B audit finding A: provider fills
-            # ``last_usage["cached_tokens"]`` (see llm/openai.py:242
-            # and codex_provider.py:555), but the sub-agent used to
-            # drop it. Track it so the parent's ``subagent_done``
-            # event carries the real cached-tokens count.
             self._cached_tokens += usage.get("cached_tokens", 0)
-        # Auto-compact is handled by the opt-in compact.auto plugin so
-        # sub-agents without that pack do not get hidden runtime behaviour.
-        # Emit running token totals to parent
+        # Compaction remains opt-in; token totals are still reported to the parent.
         if self.on_tool_activity and self._total_tokens > 0:
             self.on_tool_activity(
                 "token_update",
@@ -515,7 +487,9 @@ class SubAgent:
             preview=preview + ("..." if len(assistant_content) > 200 else ""),
         )
 
-    async def _execute_and_report_tools(self, tool_calls: list[ToolCallEvent]) -> str:
+    async def _execute_and_report_tools(
+        self, tool_calls: list[ToolCallEvent]
+    ) -> list[str]:
         """Execute tools, notifying parent of start/done via callback."""
         logger.info(
             "Sub-agent executing tools",
@@ -535,39 +509,32 @@ class SubAgent:
 
         tool_results = await self._execute_tools(tool_calls)
 
-        # Emit per-tool done/error events with result previews
         if self.on_tool_activity:
-            for tc in tool_calls:
-                # Find the matching result block in tool_results
+            # Results are positional: attribute each preview to its own call so
+            # several calls to the same tool don't all report the first block.
+            for tc, result in zip(tool_calls, tool_results):
                 prefix = f"[{tc.name}]"
-                for block in tool_results.split("\n\n"):
-                    if block.startswith(prefix):
-                        if "Error:" in block:
-                            error_msg = block.split("Error:", 1)[-1].strip()[:100]
-                            self.on_tool_activity("tool_error", tc.name, error_msg)
-                        else:
-                            preview = block[len(prefix) :].strip()[:100]
-                            self.on_tool_activity("tool_done", tc.name, preview)
-                        break
+                if result.startswith(prefix):
+                    if result.startswith(f"{prefix} Error:"):
+                        error_msg = result.split("Error:", 1)[-1].strip()[:100]
+                        self.on_tool_activity("tool_error", tc.name, error_msg)
+                    else:
+                        preview = result[len(prefix) :].strip()[:100]
+                        self.on_tool_activity("tool_done", tc.name, preview)
                 else:
                     self.on_tool_activity("tool_done", tc.name, "")
 
         return tool_results
 
     def _append_tool_results(
-        self, tool_calls: list[ToolCallEvent], tool_results: str
+        self, tool_calls: list[ToolCallEvent], tool_results: list[str]
     ) -> None:
         """Add tool results to conversation in the appropriate format."""
         if self._is_native:
-            for tc in tool_calls:
+            for tc, result_text in zip(tool_calls, tool_results):
                 tool_call_id = tc.args.get("_tool_call_id", "")
-                result_text = ""
-                for r in tool_results.split("\n\n") if tool_results else []:
-                    if r.startswith(f"[{tc.name}]"):
-                        result_text = r
-                        break
                 if not result_text:
-                    result_text = tool_results or "(no output)"
+                    result_text = "(no output)"
                 if tool_call_id:
                     self.conversation.append(
                         "tool",
@@ -577,7 +544,7 @@ class SubAgent:
                     )
         else:
             if tool_results:
-                self.conversation.append("user", tool_results)
+                self.conversation.append("user", "\n\n".join(tool_results))
 
     def _build_result(
         self, output_parts: list[str], tools_used: list[str]
@@ -625,12 +592,8 @@ class SubAgent:
             metadata={"tools_used": tools_used},
         )
 
-    # ------------------------------------------------------------------
-    # Tool execution
-    # ------------------------------------------------------------------
-
-    async def _execute_tools(self, tool_calls: list[ToolCallEvent]) -> str:
-        """Execute tool calls and return formatted results."""
+    async def _execute_tools(self, tool_calls: list[ToolCallEvent]) -> list[str]:
+        """Execute tool calls and return one formatted result per call."""
         results: list[str] = []
 
         for tool_call in tool_calls:
@@ -656,10 +619,7 @@ class SubAgent:
                 context = (
                     self._build_tool_context() if self._build_tool_context else None
                 )
-                # Plugin pre/post_tool_execute hooks fire here, scoped
-                # to this sub-agent's plugin manager only — never
-                # rebind ``tool.execute`` because the tool instance is
-                # shared with the parent's registry.
+                # Per-call wrapping prevents child hooks from leaking onto shared tools.
                 exec_fn = tool.execute
                 if self.plugins is not None:
                     exec_fn = self.plugins.wrap_method(
@@ -679,7 +639,7 @@ class SubAgent:
                         tool_name=tool_call.name,
                     )
                     continue
-                # Guard against tools that return str instead of ToolResult
+                # Preserve compatibility with tools predating the ToolResult contract.
                 if isinstance(result, str):
                     results.append(f"[{tool_call.name}]\n{result}")
                     continue
@@ -711,7 +671,7 @@ class SubAgent:
                     error=str(e),
                 )
 
-        return "\n\n".join(results)
+        return results
 
     def _calculate_duration(self) -> float:
         """Calculate elapsed time."""
@@ -743,9 +703,7 @@ class SubAgent:
         )
 
     def _charge_budget_or_fail(self, tools_used: list[str]) -> SubAgentResult | None:
-        """Consume one unit of the shared budget. Return a failed result
-        when the budget is drained, or ``None`` when the caller may proceed.
-        """
+        """Consume one shared iteration or return a budget-exhausted result."""
         budget = self.iteration_budget
         if budget is None:
             return None
@@ -775,6 +733,32 @@ class SubAgent:
                     "budget": budget.snapshot(),
                 },
             )
+
+    def push_message(self, content: str) -> None:
+        """Queue a live user message without changing task completion semantics."""
+        if content:
+            self._inbox.put_nowait({"role": "user", "content": content})
+
+    def _drain_inbox_into_conversation(self) -> int:
+        """Append queued inbox messages as user turns and return their count."""
+        count = 0
+        while True:
+            try:
+                message = self._inbox.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            content = (
+                message.get("content", "")
+                if isinstance(message, dict)
+                else str(message)
+            )
+            if content:
+                self.conversation.append("user", content)
+                count += 1
+        return count
+
+    def _inbox_has_pending(self) -> bool:
+        return not self._inbox.empty()
 
     def cancel(self) -> None:
         """Request cancellation. Checked during LLM streaming and between turns."""

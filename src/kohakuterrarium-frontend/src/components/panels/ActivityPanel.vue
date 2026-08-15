@@ -23,7 +23,7 @@
         <div class="relative flex-1 h-1.5 rounded-full bg-warm-100 dark:bg-warm-800 overflow-hidden">
           <div class="absolute left-0 top-0 h-full rounded-full transition-all duration-300" :class="contextPct >= 80 ? 'bg-coral' : contextPct >= 60 ? 'bg-amber' : 'bg-aquamarine'" :style="{ width: Math.min(contextPct, 100) + '%' }" />
         </div>
-        <span class="font-mono shrink-0"> {{ formatTokens(chat.activeTokenUsage.lastPrompt) }}/{{ formatTokens(maxContext) }} ({{ contextPct }}%) </span>
+        <span class="font-mono shrink-0"> {{ formatTokens(totals.lastPrompt) }}/{{ formatTokens(maxContext) }} ({{ contextPct }}%) </span>
       </div>
     </div>
 
@@ -91,17 +91,19 @@ const totals = computed(() => {
   let prompt = 0
   let completion = 0
   let cached = 0
+  let lastPrompt = 0
   for (const u of Object.values(chat.tokenUsage || {})) {
     prompt += u.prompt || 0
     completion += u.completion || 0
     cached += u.cached || 0
+    if ((u.lastPrompt || 0) > lastPrompt) lastPrompt = u.lastPrompt
   }
-  return { prompt, completion, cached }
+  return { prompt, completion, cached, lastPrompt }
 })
 
 const contextPct = computed(() => {
   if (!maxContext.value) return 0
-  return Math.round((chat.activeTokenUsage.lastPrompt / maxContext.value) * 100)
+  return Math.round((totals.value.lastPrompt / maxContext.value) * 100)
 })
 
 function formatTokens(n) {

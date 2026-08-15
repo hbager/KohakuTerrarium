@@ -1,8 +1,8 @@
 """Builtin catalog read-side helpers.
 
-Single source of truth for both the studio catalog routes and the
-``kt extension`` CLI formatter — listing builtin tools, sub-agents,
-universal triggers, plus per-package extension modules.
+Builds the shared catalog payloads used by Studio, HTTP routes, and the
+``kt extension`` CLI for built-in tools, sub-agents, universal triggers, Drive
+registrations, and package extension declarations.
 """
 
 from kohakuterrarium.builtin_skills import (
@@ -17,12 +17,33 @@ from kohakuterrarium.builtins.tool_catalog import get_builtin_tool, list_builtin
 from kohakuterrarium.modules.trigger.universal import list_universal_trigger_classes
 from kohakuterrarium.packages.walk import get_package_modules, list_packages
 
-_EXTENSION_MODULE_TYPES = ("tools", "plugins", "llm_presets")
+_EXTENSION_MODULE_TYPES = ("tools", "plugins", "llm_presets", "drive_registrations")
 
-
-# ----------------------------------------------------------------------
-# Catalog route data — builtins for tools / subagents / triggers
-# ----------------------------------------------------------------------
+# Keep Drive registration metadata static so lightweight catalog and CLI calls do
+# not import the Terrarium engine. Tests pin these records to the authoritative
+# descriptors; only the opt-in ``goal`` registration needs an import target.
+_BUILTIN_DRIVE_REGISTRATIONS: tuple[dict, ...] = (
+    {
+        "name": "generic",
+        "kind": "generic",
+        "schema_version": 1,
+        "source": "builtin",
+        "type": "drive-registration",
+        "module": None,
+        "class_name": None,
+        "description": "Opaque-spec drive with manual terminal proposals.",
+    },
+    {
+        "name": "goal",
+        "kind": "goal",
+        "schema_version": 1,
+        "source": "builtin",
+        "type": "drive-registration",
+        "module": "kohakuterrarium.terrarium.drive.goal",
+        "class_name": "GoalDriveRegistration",
+        "description": "Durable objective pursuit policy.",
+    },
+)
 
 
 def list_builtin_tool_entries() -> list[dict]:
@@ -100,26 +121,26 @@ def list_universal_trigger_entries() -> list[dict]:
     return out
 
 
+def list_builtin_drive_registration_entries() -> list[dict]:
+    """Return copy-isolated catalog entries for built-in Drive registrations."""
+    return [dict(e) for e in _BUILTIN_DRIVE_REGISTRATIONS]
+
+
 def get_tool_doc(name: str) -> str | None:
-    """Return the builtin skill doc for *name* (or None)."""
+    """Return the built-in tool documentation for *name*, if available."""
     return get_builtin_tool_doc(name)
 
 
 def get_subagent_doc(name: str) -> str | None:
-    """Return the builtin skill doc for sub-agent *name* (or None)."""
+    """Return the built-in sub-agent documentation for *name*, if available."""
     return get_builtin_subagent_doc(name)
 
 
-# ----------------------------------------------------------------------
-# CLI extension formatter data
-# ----------------------------------------------------------------------
-
-
 def list_extension_packages() -> list[dict]:
-    """Return every installed package with its raw manifest dict.
+    """Return installed package manifests for presentation by CLI adapters.
 
-    Used by ``kt extension list`` — the CLI just formats the output
-    rather than re-implementing list/walk semantics.
+    Keeping package traversal here prevents each consumer from implementing
+    subtly different discovery rules.
     """
     return list_packages()
 
@@ -134,17 +155,11 @@ def extension_module_types() -> tuple[str, ...]:
     return _EXTENSION_MODULE_TYPES
 
 
-# ----------------------------------------------------------------------
-# Programmatic Studio dispatch — kind-aware list / info aggregators
-# ----------------------------------------------------------------------
-
-
 def list_builtins(kind: str | None = None) -> list[dict]:
-    """List builtin catalog entries by *kind*.
+    """List built-in catalog entries for a supported kind.
 
-    *kind* is one of ``"tools"``, ``"subagents"``, ``"triggers"`` —
-    or ``None`` for the union of all three.  Used by
-    :class:`kohakuterrarium.studio.Studio` and the catalog HTTP route.
+    ``None`` returns the default union of tools, sub-agents, and triggers; Drive
+    registrations remain opt-in because their payload shape is distinct.
     """
     match kind:
         case "tools" | "tool":
@@ -153,6 +168,8 @@ def list_builtins(kind: str | None = None) -> list[dict]:
             return list_builtin_subagent_entries()
         case "triggers" | "trigger":
             return list_universal_trigger_entries()
+        case "drive_registrations" | "drive_registration" | "drive-registration":
+            return list_builtin_drive_registration_entries()
         case None:
             return (
                 list_builtin_tool_entries()
@@ -162,14 +179,15 @@ def list_builtins(kind: str | None = None) -> list[dict]:
         case _:
             raise ValueError(
                 f"Unknown builtin kind: {kind!r} "
-                "(expected tools / subagents / triggers / None)"
+                "(expected tools / subagents / triggers / drive_registrations / None)"
             )
 
 
 def builtin_info(name: str) -> dict | None:
-    """Return the catalog entry for builtin *name*, or ``None``.
+    """Return the first built-in catalog entry matching *name*.
 
-    Searches tools, then sub-agents, then universal triggers.
+    Lookup order is tools, sub-agents, triggers, then Drive registrations, making
+    collisions deterministic across heterogeneous catalogs.
     """
     for entry in list_builtin_tool_entries():
         if entry["name"] == name:
@@ -178,6 +196,9 @@ def builtin_info(name: str) -> dict | None:
         if entry["name"] == name:
             return entry
     for entry in list_universal_trigger_entries():
+        if entry["name"] == name:
+            return entry
+    for entry in list_builtin_drive_registration_entries():
         if entry["name"] == name:
             return entry
     return None

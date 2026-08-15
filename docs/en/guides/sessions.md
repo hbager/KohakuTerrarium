@@ -33,6 +33,10 @@ Concept primer: [memory and compaction](../concepts/modules/memory-and-compactio
 
 The format is append-only for event data and versioned through KohakuVault's auto-pack. Binary artifacts can also live in a sibling `<session>.artifacts/` directory, so when a run generated images or other binary outputs, archive the `.kohakutr` file and its artifacts directory together.
 
+### Edit and regenerate after compaction
+
+Compaction changes the live prompt and writes a fast-resume snapshot, but it does not erase the append-only event log. Studio identifies editable user messages with the persisted `event_id`, `turn_index`, and `branch_id`. Save & Rerun and Regenerate rebuild the new branch from the selected message's original event prefix, ignoring compact summaries and snapshots. The previous branch and every later event remain available for branch navigation and resume. If the locator is missing, ambiguous, points to injected mid-turn input, or conflicts with the selected branch, the operation fails without changing history.
+
 ## Where sessions live
 
 ```
@@ -80,9 +84,33 @@ graph_id = await engine.adopt_session("runs/other.kohakutr")
 ```
 
 Both accept a path or a `SessionStore`; `llm=` is an optional selector
-string override. A file that exists but cannot be resumed (unknown
-saved-session type, missing config path in the metadata) raises a
-`ValueError`.
+string override. Modern graph sessions persist one working directory per
+creature. Resume performs a read-only workspace preflight before acquiring a
+writer store, constructing a runtime, registering lifecycle state, or adopting
+a creature. If a saved directory is unavailable, callers must either provide a
+replacement, open the read-only history, or cancel; there is no silent fallback
+to the KohakuTerrarium process directory.
+
+Use `workspace_overrides={"creature-id": "/new/path"}` for targeted
+replacement. A grouped missing path may also be addressed by the preflight
+`gap_id`, replacing only the members in that group. The scalar `pwd=` argument
+is retained as an explicit compatibility override and broadcasts one directory
+to every member. It is mutually exclusive with `workspace_overrides`.
+
+After successful adoption, confirmed replacements are written back to the
+authoritative graph manifest and legacy metadata projection, so later resumes
+keep them. If the persistence checkpoint fails, resume restores the old
+workspace metadata; an incomplete restoration is recorded as
+`partial_dirty` instead of being reported as clean; later preflight and resume
+fail closed until that session is repaired. Remote and clustered
+sessions validate paths on the worker that will execute each member, and all
+cluster members are preflighted before the first adoption. Cluster API callers
+can scope replacements by member session ID, so identical creature or path-group
+targets on different workers may resolve to different directories.
+
+A file that exists but cannot be resumed (unknown saved-session type, missing
+config path or unresolved workspace in the metadata) raises a typed session
+resume error.
 
 What resume does:
 
@@ -93,6 +121,45 @@ What resume does:
 5. Starts the controller fresh; previous events are in context.
 
 This means small config drift is fine (swapping an LLM, changing a prompt). Structural drift (renaming the creature, removing a tool it was actively using) can cause replay errors; pin a session to its original config if you need perfect fidelity.
+
+## Open conversations in the web UI
+
+The Conversations rail lists only conversations whose runtime is currently
+attached. The persisted conversation lifecycle remains a separate concern:
+
+- **Live and open:** a runtime is attached, so the conversation appears in the rail.
+- **Dormant and open:** no runtime is attached. The saved conversation remains
+  available from Sessions but is not rendered in the rail.
+- **Ended:** the user explicitly ended the conversation. Its saved history remains
+  available from Sessions.
+
+Closing a Chat or Inspector tab only detaches that view. It never stops or ends
+the conversation, so a still-live runtime remains in the rail. After the backend
+reports a stopped or disconnected creature as inactive, the row disappears on
+the next refresh. The Sessions history page remains read-only and keeps its
+existing **View** and **Resume** actions.
+
+Every newly persisted conversation has a stable `conversation_id`. Runtime graph
+IDs may change after restart or resume, and filenames may be moved or renamed,
+but those changes do not create duplicate records. `GET /api/sessions/open`
+merges live runtimes with saved open markers using this identity and lets the
+live row win; the rail renders only rows with `is_live: true`. Session indexes
+and lookups are scoped to the authenticated session directory, so one user's
+index cannot supply another user's rows.
+
+The saved lifecycle marker is explicit. Sessions created before this marker was
+introduced are still available in history. A normal runtime stop preserves the
+open marker and records a paused/dormant state. Explicit **End** clears the
+marker and records a terminal state. Local, remote, and clustered operations
+synchronize this marker with the saved store before the rail refreshes.
+
+Resume is singleflight per saved conversation: concurrent browser requests share
+one server operation, while cancellation of one waiter does not cancel the
+shared resume. A failed operation can be retried. Cluster resume is all-or-error:
+if any member cannot resume or any saved link cannot be restored, the server
+compensates already resumed members, removes partial runtime metadata, preserves
+the original saved lifecycle, and returns a non-success response rather than a
+degraded partial cluster.
 
 ## Interrupt and resume workflow
 

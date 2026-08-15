@@ -1,10 +1,7 @@
-"""Null output module — discards everything.
+"""Discard module-level output for headless and batch execution.
 
-The output-side mirror of :class:`builtins.inputs.none.NoneInput`.
-Used by headless / batch runs (``io="headless"``) where agent text is
-consumed through the typed event stream or a session store, and any
-console writes would just interleave garbage across N concurrent
-agents.
+Router observers and session stores still receive events; only the default sink
+is suppressed to prevent concurrent console interleaving.
 """
 
 from kohakuterrarium.modules.output.base import BaseOutputModule
@@ -14,12 +11,10 @@ logger = get_logger(__name__)
 
 
 class NoneOutput(BaseOutputModule):
-    """Output module that silently discards all writes.
+    """Discard sink writes without suppressing router-level observers."""
 
-    Observers (session stores, attach streams, ``run_stream``
-    consumers) tap the output *router*, not the default module — so a
-    NoneOutput default loses nothing except console spam.
-    """
+    # No prompt can be rendered, so interactive tools must not wait for replies.
+    supports_interactive: bool = False
 
     async def _on_start(self) -> None:
         logger.debug("None output started (all writes discarded)")
@@ -34,4 +29,4 @@ class NoneOutput(BaseOutputModule):
         """Discard a streaming chunk."""
 
     async def flush(self) -> None:
-        """Nothing buffered — nothing to flush."""
+        """Complete the no-op flush contract."""

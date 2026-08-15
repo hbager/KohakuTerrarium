@@ -1,8 +1,6 @@
 """Anthropic-compatible Messages API provider using the official SDK.
 
-KohakuTerrarium stores conversation history in an OpenAI-shaped internal
-format. This provider is the translation boundary to Anthropic's native
-Messages API while preserving Anthropic content blocks for later round-trip.
+Translate internal conversations to Anthropic Messages while preserving blocks.
 """
 
 import asyncio
@@ -12,12 +10,11 @@ try:
     from anthropic import AsyncAnthropic, Omit
 
     HAS_ANTHROPIC = True
-except ImportError:  # pragma: no cover - exercised when dependency absent
+except ImportError:  # pragma: no cover - optional dependency path
     AsyncAnthropic = None  # type: ignore[assignment,misc]
     Omit = None  # type: ignore[assignment,misc]
     HAS_ANTHROPIC = False
 
-from kohakuterrarium.llm.api_keys import KeyPool
 from kohakuterrarium.llm.anthropic_format import (
     ANTHROPIC_KNOWN_BODY_FIELDS,
     INTERNAL_EXTRA_KEYS,
@@ -42,6 +39,7 @@ from kohakuterrarium.llm.base import (
     ChatResponse,
     LLMConfig,
     NativeToolCall,
+    OverflowRecoveryState,
     ToolSchema,
 )
 from kohakuterrarium.llm.openai_sanitize import log_request_shape, strip_surrogates
@@ -50,7 +48,6 @@ from kohakuterrarium.llm.recovery import (
     RetryPolicy,
     backoff_delay,
     classify_openai_error,
-    drop_last_tool_round,
 )
 from kohakuterrarium.utils.logging import get_logger
 
@@ -64,7 +61,7 @@ class AnthropicProvider(BaseLLMProvider):
 
     def __init__(
         self,
-        api_key: str | KeyPool | None = None,
+        api_key: str | None = None,
         model: str = "",
         base_url: str | None = ANTHROPIC_BASE_URL,
         *,
@@ -90,9 +87,7 @@ class AnthropicProvider(BaseLLMProvider):
             raise ImportError(
                 "anthropic not installed. Install with: pip install anthropic"
             )
-        api_key_pool = api_key if isinstance(api_key, KeyPool) else None
-        api_key_for_client = api_key.first if isinstance(api_key, KeyPool) else api_key
-        if not api_key_for_client:
+        if not api_key:
             raise ValueError(
                 "API key is required. Set ANTHROPIC_API_KEY or configure a "
                 "provider key with 'kt login <provider>'."
@@ -100,8 +95,7 @@ class AnthropicProvider(BaseLLMProvider):
 
         self.extra_body = dict(extra_body or {})
         self._retry_policy = RetryPolicy.from_value(retry_policy)
-        self._api_key_pool = api_key_pool
-        self._api_key = api_key_for_client
+        self._api_key = api_key
         self.base_url = base_url or ANTHROPIC_BASE_URL
         self._timeout = timeout
         self._extra_headers = dict(extra_headers or {})
@@ -119,17 +113,12 @@ class AnthropicProvider(BaseLLMProvider):
         if auth_as_bearer is None and looks_like_bearer_endpoint(self.base_url):
             self.auth_as_bearer = True
 
-        default_headers = {
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-            **self._extra_headers,
-        }
+        default_headers = dict(self._extra_headers)
         if self.auth_as_bearer:
             default_headers.setdefault("X-Api-Key", Omit())
         self._client = AsyncAnthropic(
-            api_key=None if self.auth_as_bearer else api_key_for_client,
-            auth_token=api_key_for_client if self.auth_as_bearer else None,
+            api_key=None if self.auth_as_bearer else api_key,
+            auth_token=api_key if self.auth_as_bearer else None,
             base_url=self.base_url,
             timeout=timeout,
             max_retries=max_retries,
@@ -161,7 +150,6 @@ class AnthropicProvider(BaseLLMProvider):
         )
         clone.extra_body = dict(self.extra_body)
         clone._retry_policy = self._retry_policy
-        clone._api_key_pool = self._api_key_pool
         clone._api_key = self._api_key
         clone.base_url = self.base_url
         clone._timeout = self._timeout
@@ -187,45 +175,16 @@ class AnthropicProvider(BaseLLMProvider):
         return clone
 
     def reload_credentials(self) -> bool:
-        """Re-resolve the API key + rebuild the SDK client in place.
-
-        Mirrors :meth:`OpenAIProvider.reload_credentials` for the
-        native Anthropic Messages path. Honours the same bearer-vs-
-        x-api-key wiring decision the constructor made — we keep
-        ``self.auth_as_bearer`` and re-emit ``X-Api-Key: Omit()`` on
-        the bearer route so the rebuilt client matches the original
-        auth shape.
-
-        Credential lookup uses :attr:`_credential_provider` (the
-        backend NAME — same key the boot path used) when set, falling
-        back to :attr:`provider_name`. Built-in backends leave
-        ``provider_name`` empty, so the credential field is what
-        actually rotates keys for the common openrouter/anthropic
-        paths.
-        """
+        """Rotate credentials while preserving the endpoint's original auth shape."""
         lookup_key = getattr(self, "_credential_provider", "") or self.provider_name
         if not lookup_key:
             return False
-        new_key_pool = get_api_key(lookup_key)
-        if not new_key_pool:
-            return False
-        new_key = new_key_pool.first
-        current_pool = self._api_key_pool or KeyPool([self._api_key or ""])
-        if new_key_pool == current_pool:
+        new_key = get_api_key(lookup_key)
+        if not new_key or new_key == self._api_key:
             return False
         old = self._client
-        self._api_key_pool = new_key_pool if new_key_pool.is_pool else None
         self._api_key = new_key
-        default_headers = {
-            "anthropic-version": "2023-06-01",
-            "Content-Type": "application/json",
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/147.0.0.0 Safari/537.36"
-            ),
-            **self._extra_headers,
-        }
+        default_headers = dict(self._extra_headers)
         if self.auth_as_bearer:
             default_headers.setdefault("X-Api-Key", Omit())
         self._client = AsyncAnthropic(
@@ -255,11 +214,10 @@ class AnthropicProvider(BaseLLMProvider):
         provider_native_tools: list[Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        """Stream a native Anthropic Messages response with KT retries."""
+        """Stream Anthropic output with classified retries and overflow recovery."""
         current = messages
         attempt = 0
-        api_key_failures = 0
-        overflow_recovered = False
+        overflow_state = OverflowRecoveryState()
         while True:
             try:
                 async for chunk in self._raw_stream_chat(
@@ -269,25 +227,13 @@ class AnthropicProvider(BaseLLMProvider):
                 return
             except Exception as exc:
                 cls = classify_openai_error(exc)
-                if cls is ErrorClass.OVERFLOW and not overflow_recovered:
-                    dropped, recovered = drop_last_tool_round(current)
-                    if dropped:
-                        overflow_recovered = True
-                        current = recovered
-                        self._notify_emergency_drop(recovered)
-                        logger.warning(
-                            "provider_emergency_drop",
-                            dropped=dropped,
-                            recovered_messages=len(recovered),
-                        )
+                if cls is ErrorClass.OVERFLOW:
+                    replacement = await self._recover_from_overflow(
+                        current, overflow_state
+                    )
+                    if replacement is not None:
+                        current = replacement
                         continue
-                if cls is not ErrorClass.OVERFLOW:
-                    api_key_failures += 1
-                    if self._should_failover_api_key(cls, api_key_failures - 1):
-                        self._log_api_key_failover(cls, api_key_failures, exc)
-                        continue
-                    if self._api_key_failover_limit() > 1:
-                        raise
                 if (
                     cls in self._retry_policy.retry_classes
                     and attempt < self._retry_policy.max_retries
@@ -386,32 +332,19 @@ class AnthropicProvider(BaseLLMProvider):
     ) -> ChatResponse:
         current = messages
         attempt = 0
-        api_key_failures = 0
-        overflow_recovered = False
+        overflow_state = OverflowRecoveryState()
         while True:
             try:
                 return await self._raw_complete_chat(current, **kwargs)
             except Exception as exc:
                 cls = classify_openai_error(exc)
-                if cls is ErrorClass.OVERFLOW and not overflow_recovered:
-                    dropped, recovered = drop_last_tool_round(current)
-                    if dropped:
-                        overflow_recovered = True
-                        current = recovered
-                        self._notify_emergency_drop(recovered)
-                        logger.warning(
-                            "provider_emergency_drop",
-                            dropped=dropped,
-                            recovered_messages=len(recovered),
-                        )
+                if cls is ErrorClass.OVERFLOW:
+                    replacement = await self._recover_from_overflow(
+                        current, overflow_state
+                    )
+                    if replacement is not None:
+                        current = replacement
                         continue
-                if cls is not ErrorClass.OVERFLOW:
-                    api_key_failures += 1
-                    if self._should_failover_api_key(cls, api_key_failures - 1):
-                        self._log_api_key_failover(cls, api_key_failures, exc)
-                        continue
-                    if self._api_key_failover_limit() > 1:
-                        raise
                 if (
                     cls in self._retry_policy.retry_classes
                     and attempt < self._retry_policy.max_retries
@@ -464,20 +397,6 @@ class AnthropicProvider(BaseLLMProvider):
             usage=self._last_usage,
             model=getattr(response, "model", None) or create_kwargs["model"],
         )
-
-    def _apply_request_api_key(self, create_kwargs: dict[str, Any]) -> None:
-        """Attach per-request auth headers when a key pool is configured."""
-        if not self._api_key_pool:
-            return
-        key = self._api_key_pool.next()
-        if not key:
-            return
-        headers = dict(create_kwargs.get("extra_headers") or {})
-        if self.auth_as_bearer:
-            headers["Authorization"] = f"Bearer {key}"
-        else:
-            headers["X-Api-Key"] = key
-        create_kwargs["extra_headers"] = headers
 
     def _log_token_usage(self) -> None:
         if not self._last_usage:
@@ -546,5 +465,4 @@ class AnthropicProvider(BaseLLMProvider):
             create_kwargs = self._with_prompt_cache_markers(create_kwargs)
         if merged_extra:
             create_kwargs["extra_body"] = merged_extra
-        self._apply_request_api_key(create_kwargs)
         return create_kwargs

@@ -15,6 +15,10 @@ const LAYOUT_EVENTS = Object.freeze({
   SAVE_AS_REQUESTED: "layout:save-as-requested",
   PALETTE_OPEN: "palette:open",
   MODEL_CONFIG_OPEN: "model:config-open",
+  // Deep-link into the Drives panel: {sessionId, driveId?}. An open Drives
+  // panel for that session focuses the record; when none is open this is a
+  // no-op (panels are never force-opened — see the "no empty chrome" rule).
+  OPEN_DRIVES: "drives:open",
   MODEL_CATALOG_CHANGED: "model:catalog-changed",
 })
 
@@ -37,6 +41,10 @@ export function firePaletteOpen(detail = {}) {
 
 export function fireModelConfigOpen(detail = {}) {
   _dispatch(LAYOUT_EVENTS.MODEL_CONFIG_OPEN, detail)
+}
+
+export function fireOpenDrives(detail = {}) {
+  _dispatch(LAYOUT_EVENTS.OPEN_DRIVES, detail)
 }
 
 export function fireModelCatalogChanged(detail = {}) {

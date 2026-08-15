@@ -15,6 +15,10 @@ tags:
 
 概念入門：[記憶與壓縮](../concepts/modules/memory-and-compaction.md)、[工作階段與環境](../concepts/modules/session-and-environment.md)。
 
+### 壓縮後的編輯與重新產生
+
+壓縮會改變即時提示並寫入快速恢復快照，但不會刪除追加式事件日誌。Studio 使用持久化的 `event_id`、`turn_index` 和 `branch_id` 定位可編輯的使用者訊息。儲存並重新執行或重新產生時，新分支會從所選訊息之前的原始事件前綴重建，並忽略壓縮摘要與快照；舊分支及其後續事件仍可切換與恢復。定位缺失、歧義、指向回合中注入輸入或與所選分支衝突時，操作會在不修改歷程的情況下失敗。
+
 ## `.kohakutr` 檔案
 
 `.kohakutr` 是一個 SQLite 資料庫 (透過 KohakuVault)，有九張表：
@@ -93,6 +97,22 @@ graph_id = await engine.adopt_session("runs/other.kohakutr")
 
 也就是說小幅的設定漂移沒問題 (換 LLM、改提示詞)。結構性漂移 (改生物名稱、移除一個它正在用的工具) 可能造成重播錯誤；需要完全一致就把工作階段釘在原始設定上。
 
+## Web UI 中的開放對話
+
+Conversations Rail 只顯示目前仍附加 runtime 的對話。持久化對話的生命週期仍是獨立維度：
+
+- **在線且開放：** runtime 已附加，因此對話顯示在 Rail 中。
+- **休眠且開放：** 目前沒有附加 runtime。儲存的對話仍可從 Sessions 存取，但不會渲染在 Rail 中。
+- **已結束：** 使用者明確結束對話。儲存的歷史仍可在 Sessions 中檢視。
+
+關閉 Chat 或 Inspector 分頁只會 detach 該檢視，不會停止或結束對話，因此仍在線的 runtime 會保留在 Rail 中。後端將已停止或斷線的 Creature 回報為非活躍後，對應列會在下一次重新整理時消失。Sessions 歷史頁維持唯讀，並沿用既有的 **View** 與 **Resume** 操作。
+
+每個新持久化的對話都有穩定的 `conversation_id`。runtime graph ID 在重新啟動或恢復後可以改變，檔案也可以移動或重新命名，但這些變化不會產生重複記錄。`GET /api/sessions/open` 使用此 identity 聚合在線 runtime 與帶開放 marker 的已儲存 session，並讓在線列優先；Rail 只渲染 `is_live: true` 的列。Session index 與查詢依已驗證使用者的 session directory 隔離，因此一位使用者的索引不會回傳另一位使用者的資料。
+
+儲存的生命週期 marker 是明確的。引入 marker 之前建立的舊 session 仍可在歷史中存取。一般 runtime Stop 會保留開放 marker，並記錄 paused/dormant 狀態；明確 **End** 會清除 marker 並記錄 terminal 狀態。本機、遠端與 cluster 操作都會在 Rail 重新整理前同步儲存檔中的 marker。
+
+Resume 依儲存對話執行 singleflight：兩個瀏覽器同時要求時只執行一次伺服器端恢復；取消其中一個等待者不會取消共享恢復，失敗後仍可重試。Cluster resume 採 all-or-error 語意：任何成員恢復失敗或儲存的連線無法重建時，伺服器會補償已恢復成員、清理 partial runtime metadata、保留原始儲存生命週期，並回傳非成功回應，而不是留下 degraded partial cluster。
+
 ## 中斷與恢復的工作流
 
 ```bash
@@ -157,7 +177,16 @@ await engine.apply_recipe("@kt-biome/terrariums/swe_team", session="runs/team.ko
 
 恢復從 session metadata 記錄的 config path (含 `@pkg` 參照)
 重建拓樸，並以各 agent 自己的工作目錄執行，不會對你的行程
-做 `os.chdir`。
+做 `os.chdir`。恢復會在建立 writer store、runtime、lifecycle 或
+adoption 前執行唯讀工作目錄預檢。目錄失效時必須選擇新目錄、只看歷史或
+取消，不會靜默退回 KohakuTerrarium 行程目錄。使用
+`workspace_overrides={"creature-id": "/new/path"}` 只替換確認的成員；
+共享失效路徑也可使用預檢回傳的 `gap_id` 成組替換。純量 `pwd=` 僅保留為
+明確的全隊相容覆寫，不能和 `workspace_overrides` 同時使用。成功替換會永久
+寫回 manifest；遠端與叢集會在實際 worker 上驗證路徑，並在第一次 adoption
+前完成全成員預檢。叢集 API 還可依成員 session ID 限定替換，讓不同 worker
+上相同的 creature 或路徑群組目標選擇不同目錄。若回滾無法持久化，session
+會標記為 `partial_dirty`；後續預檢與恢復會失敗關閉，直到 session 修復。
 
 ### 讀取：`SessionReader`
 

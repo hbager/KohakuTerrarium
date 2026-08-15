@@ -46,20 +46,28 @@
 </template>
 
 <script setup>
-import { computed, onUnmounted, watch } from "vue"
+import { computed, onUnmounted, ref, watch } from "vue"
 import { useRoute, useRouter } from "vue-router"
 
 import SessionDetail from "@/components/sessions/SessionDetail.vue"
 import SessionTreePane from "@/components/sessions/SessionTreePane.vue"
 import { provideScope } from "@/composables/useScope"
 import { useSessionDetailStore } from "@/stores/sessionDetail"
+import { drivesAPI } from "@/utils/drivesApi"
 import { useI18n } from "@/utils/i18n"
 
 const { t } = useI18n()
 // Optional prop — when this page is embedded as a SessionViewerTab in
 // the v2 macro shell, the route params are not available; the tab passes
 // the session name directly. Falls back to route.params.name in v1.
-const props = defineProps({ sessionNameProp: { type: String, default: null } })
+const props = defineProps({
+  sessionNameProp: { type: String, default: null },
+  // The inspector embeds this page for a LIVE session (addressed by its
+  // graph_id): the Drives tab must read the live route, since the saved
+  // sidecar read returns [] under the live writer lock. Saved viewers
+  // leave this false and read the persisted sidecar (UXI-01 / item 17).
+  live: { type: Boolean, default: false },
+})
 const route = useRoute()
 const router = useRouter()
 
@@ -78,14 +86,46 @@ provideScope(sessionName.value)
 // ``useScope.js``.)
 const detail = useSessionDetailStore(sessionName.value)
 
-const tabs = computed(() => [
-  { id: "overview", label: t("sessionViewer.tabs.overview"), icon: "i-carbon-dashboard" },
-  { id: "trace", label: t("sessionViewer.tabs.trace"), icon: "i-carbon-chart-line" },
-  { id: "conv", label: t("sessionViewer.tabs.conv"), icon: "i-carbon-chat" },
-  { id: "cost", label: t("sessionViewer.tabs.cost"), icon: "i-carbon-currency-dollar" },
-  { id: "find", label: t("sessionViewer.tabs.find"), icon: "i-carbon-search" },
-  { id: "diff", label: t("sessionViewer.tabs.diff"), icon: "i-carbon-compare" },
-])
+// Only surface the Drives tab when the session actually recorded Drives —
+// a session with none must look byte-identical to today (no new chrome).
+const hasDrives = ref(false)
+
+const tabs = computed(() => {
+  const base = [
+    { id: "overview", label: t("sessionViewer.tabs.overview"), icon: "i-carbon-dashboard" },
+    { id: "trace", label: t("sessionViewer.tabs.trace"), icon: "i-carbon-chart-line" },
+    { id: "conv", label: t("sessionViewer.tabs.conv"), icon: "i-carbon-chat" },
+    { id: "cost", label: t("sessionViewer.tabs.cost"), icon: "i-carbon-currency-dollar" },
+    { id: "find", label: t("sessionViewer.tabs.find"), icon: "i-carbon-search" },
+    { id: "diff", label: t("sessionViewer.tabs.diff"), icon: "i-carbon-compare" },
+  ]
+  if (hasDrives.value) base.push({ id: "drives", label: "Drives", icon: "i-carbon-flow" })
+  return base
+})
+
+// Bumped on every probe so a slow response for a previously-selected
+// session cannot commit to the shared ``hasDrives`` after the user has
+// switched tabs (mirrors the chat store's request-generation idiom).
+let probeGeneration = 0
+
+async function probeDrives(name) {
+  const generation = ++probeGeneration
+  hasDrives.value = false
+  if (!name) return
+  try {
+    // A live session (inspector) reads the live route — its saved sidecar
+    // read returns [] under the writer lock; a saved viewer reads the
+    // persisted sidecar (UXI-01 / item 17).
+    const data = props.live ? await drivesAPI.list(name) : await drivesAPI.savedList(name)
+    if (generation !== probeGeneration) return
+    const items = Array.isArray(data) ? data : data.drives || data.items || []
+    hasDrives.value = items.length > 0
+  } catch {
+    // No persisted Drives (or session file missing) — the tab stays hidden.
+    if (generation !== probeGeneration) return
+    hasDrives.value = false
+  }
+}
 
 // In v1 (page-routed) we deep-link the inner tab via ``?tab=trace`` etc.
 // In v2 (embedded as a SessionViewerTab) the URL is owned by the macro
@@ -123,7 +163,11 @@ watch(
   sessionName,
   (name) => {
     if (!name) return
+    // Publish the live/saved source on the shared scoped store BEFORE
+    // load so the Drives tab (grandchild) picks the matching route.
+    detail.live = props.live
     detail.load(name)
+    probeDrives(name)
   },
   { immediate: true },
 )

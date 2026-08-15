@@ -1,37 +1,54 @@
-"""APP extension adapter for ``terrarium.session``.
+"""Expose a worker's live session stores through ``terrarium.session``.
 
-Worker-side handler exposing session operations on the worker's
-local :class:`SessionStore`.  Live sessions live in
-``engine._session_stores`` (keyed by graph_id); on-disk sessions can
-be opened on demand from the worker's session dir.
-
-Ops shipped:
-
-- ``history``  — paginated event read for one session/agent
-- ``search``   — FTS5 / vector query
-- ``stores``   — list known session ids on the worker
-- ``resume``   — adopt a previously-pushed ``.kohakutr`` file at a
-  worker-side path and bring its session live on the worker's engine.
-  The controller drives the workflow: read the .kohakutr bytes from
-  its mirror, push via ``terrarium.files.write`` to the worker's
-  ``config://`` scope, then call this op with the resulting path.
-
-Fork stays deferred: it's a file-only op the controller can perform
-on its mirror directly without round-tripping.
-
-Errors translate to the standard structured envelope.
+The adapter supports history, search, store discovery, and adoption of a
+``.kohakutr`` file that the controller has already copied to the worker.
 """
 
+import os
+import time
 from pathlib import Path
 from typing import Any
 
 from kohakuterrarium.laboratory._internal.app import AppMessage
+from kohakuterrarium.laboratory.adapters.file_scopes import resolve_in_scope
 from kohakuterrarium.laboratory.protocols import LabRegistrar
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.terrarium.graph_manifest import parse_manifest
+from kohakuterrarium.terrarium.workspace_resume import (
+    preflight_session_workspaces,
+    WorkspaceResumeError,
+    plan_workspace_resume,
+    preflight_to_dict,
+    preflight_workspace_resume,
+)
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+_RESUME_TOKEN_TTL_SECONDS = 300.0
+_MAX_RESUME_TOKENS = 256
+
+
+def _path_key(path: str | Path) -> str:
+    return os.path.normcase(str(Path(path).expanduser().resolve(strict=False)))
+
+
+def _transfer_path(engine: Terrarium, raw_path: object) -> Path:
+    """Resolve a controller-uploaded session path within config/resume."""
+    if not isinstance(raw_path, str) or not raw_path:
+        raise ValueError("session_path is required")
+    path = Path(raw_path).expanduser().resolve(strict=False)
+    transfer_root = resolve_in_scope("config://", "resume", engine)
+    try:
+        path.relative_to(transfer_root)
+    except ValueError as exc:
+        raise ValueError(
+            "session_path must be inside the config resume transfer directory"
+        ) from exc
+    if path.suffix != ".kohakutr":
+        raise ValueError("session_path must identify a .kohakutr transfer")
+    return path
 
 
 class TerrariumSessionAdapter:
@@ -42,6 +59,7 @@ class TerrariumSessionAdapter:
     def __init__(self, engine: Terrarium, lab_node: LabRegistrar) -> None:
         self._engine = engine
         self._node = lab_node
+        self._resume_tokens: dict[str, tuple[str, str, float]] = {}
         lab_node.register_app_extension(self.NAMESPACE, self._dispatch)
         logger.info("lab adapter registered", namespace=self.NAMESPACE)
 
@@ -68,8 +86,16 @@ class TerrariumSessionAdapter:
                 return self._op_search(msg.body)
             case "stores":
                 return self._op_stores(msg.body)
+            case "workspace_preflight":
+                return self._op_workspace_preflight(msg.body)
             case "resume":
                 return await self._op_resume(msg.body)
+            case "set_lifecycle":
+                return self._op_set_lifecycle(msg.body)
+            case "rollback_resume":
+                return await self._op_rollback_resume(msg.body)
+            case "delete_transfer":
+                return self._op_delete_transfer(msg.body)
             case _:
                 return {
                     "error": {
@@ -77,10 +103,6 @@ class TerrariumSessionAdapter:
                         "message": f"unsupported terrarium.session type: {msg.type!r}",
                     }
                 }
-
-    # ------------------------------------------------------------------
-    # Ops
-    # ------------------------------------------------------------------
 
     def _op_history(self, body: dict[str, Any]) -> dict[str, Any]:
         session_id = body.get("session_id")
@@ -112,61 +134,262 @@ class TerrariumSessionAdapter:
         return {"hits": hits}
 
     def _op_stores(self, body: dict[str, Any]) -> dict[str, Any]:
-        # Returns the session_ids of currently-attached live stores on
-        # the engine.  Useful for the controller's mirror to discover
-        # what sessions the worker thinks it owns.
+        # Only attached stores are authoritative for sessions owned by this worker.
         stores = getattr(self._engine, "_session_stores", {}) or {}
-        return {"session_ids": sorted(stores.keys())}
+        session_id = str(body.get("session_id") or "")
+        details = []
+        for graph_id, store in stores.items():
+            if session_id and session_id not in {str(graph_id), str(store.session_id)}:
+                continue
+            details.append(
+                {
+                    "session_id": str(graph_id),
+                    "path": str(store.path),
+                    "conversation_id": str(store.meta.get("conversation_id") or ""),
+                }
+            )
+        result: dict[str, Any] = {"session_ids": sorted(stores.keys())}
+        if session_id:
+            result["stores"] = details
+        return result
 
-    async def _op_resume(self, body: dict[str, Any]) -> dict[str, Any]:
-        """Adopt a previously-pushed ``.kohakutr`` file on this worker.
+    def _op_set_lifecycle(self, body: dict[str, Any]) -> dict[str, Any]:
+        path = Path(str(body.get("session_path") or body.get("path") or ""))
+        if not path.is_file():
+            raise ValueError("set_lifecycle requires an existing session_path")
+        is_open = bool(body.get("conversation_open"))
+        status = str(body.get("status") or ("running" if is_open else "completed"))
+        stores = getattr(self._engine, "_session_stores", {}) or {}
+        store = next(
+            (item for item in stores.values() if Path(item.path) == path),
+            None,
+        )
+        owns_store = store is None
+        if store is None:
+            store = SessionStore(path)
+        try:
+            store.set_conversation_open(is_open)
+            store.update_status(status)
+            store.checkpoint()
+        finally:
+            if owns_store:
+                store.close(update_status=False)
+        return {"ok": True, "session_path": str(path)}
 
-        The controller pushes the file bytes via
-        ``terrarium.files.write`` to a known worker-side path (under
-        ``config://`` scope), then calls this op with that path.  This
-        side just calls ``engine.adopt_session`` — which reads the
-        recipe + config snapshot, runs ``add_creature``, and replays
-        events from the file.  The resulting graph_id is returned so
-        the controller can register it in its ``_meta`` map.
+    def _op_delete_transfer(self, body: dict[str, Any]) -> dict[str, Any]:
+        path = _transfer_path(self._engine, body.get("session_path"))
+        stores = getattr(self._engine, "_session_stores", {}) or {}
+        if any(_path_key(store.path) == _path_key(path) for store in stores.values()):
+            raise ValueError("delete_transfer refuses an active session store")
+        for candidate in (path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+            candidate.unlink(missing_ok=True)
+        return {"ok": True, "session_path": str(path)}
 
-        Body shape::
+    def _remember_resume_token(self, token: str, graph_id: str, path: Path) -> None:
+        now = time.monotonic()
+        self._resume_tokens = {
+            key: value for key, value in self._resume_tokens.items() if value[2] > now
+        }
+        while len(self._resume_tokens) >= _MAX_RESUME_TOKENS:
+            self._resume_tokens.pop(next(iter(self._resume_tokens)))
+        self._resume_tokens[token] = (
+            graph_id,
+            _path_key(path),
+            now + _RESUME_TOKEN_TTL_SECONDS,
+        )
 
-            {
-                "path": "<worker-side absolute path to .kohakutr>",
-                "pwd_override": str | None,
-                "llm": str | None,
+    def _resolve_resume_token(self, token: str, path: Path) -> str:
+        claim = self._resume_tokens.get(token)
+        if claim is None or claim[2] <= time.monotonic():
+            self._resume_tokens.pop(token, None)
+            return ""
+        if claim[1] != _path_key(path):
+            raise ValueError("resume_token does not match session_path")
+        return claim[0]
+
+    def _forget_graph_tokens(self, graph_id: str) -> None:
+        for token, claim in list(self._resume_tokens.items()):
+            if claim[0] == graph_id:
+                self._resume_tokens.pop(token, None)
+
+    async def _op_rollback_resume(self, body: dict[str, Any]) -> dict[str, Any]:
+        graph_id = str(body.get("graph_id") or "")
+        requested_path = str(body.get("session_path") or "")
+        if not graph_id and not requested_path:
+            raise ValueError("rollback_resume requires graph_id or session_path")
+        stores = getattr(self._engine, "_session_stores", {}) or {}
+        if not graph_id:
+            token = body.get("resume_token")
+            if not isinstance(token, str) or not token:
+                raise ValueError("path rollback requires resume_token")
+            transfer_path = _transfer_path(self._engine, requested_path)
+            requested_path = str(transfer_path)
+            graph_id = self._resolve_resume_token(token, transfer_path)
+            if not graph_id:
+                return self._op_delete_transfer({"session_path": requested_path})
+        store = stores.get(graph_id)
+        session_path = (
+            Path(store.path)
+            if store is not None
+            else (Path(requested_path) if requested_path else None)
+        )
+        if store is not None and stores.get(graph_id) is store:
+            # Detach before removals so topology changes cannot split the
+            # just-adopted store into fresh persisted sessions.
+            stores.pop(graph_id, None)
+            owned_sessions = getattr(self._engine, "_owned_sessions", None)
+            if isinstance(owned_sessions, set):
+                owned_sessions.discard(graph_id)
+        creature_ids = [
+            creature.creature_id
+            for creature in self._engine.list_creatures()
+            if creature.graph_id == graph_id
+        ]
+        for creature_id in reversed(creature_ids):
+            await self._engine.remove_creature(creature_id)
+        if store is not None:
+            try:
+                store.close(update_status=False)
+            except Exception:
+                pass
+        self._forget_graph_tokens(graph_id)
+        if session_path is not None:
+            for candidate in (
+                session_path,
+                Path(f"{session_path}-wal"),
+                Path(f"{session_path}-shm"),
+            ):
+                candidate.unlink(missing_ok=True)
+        return {"ok": True, "removed": creature_ids}
+
+    def _op_workspace_preflight(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Validate saved paths on the worker without creating a runtime."""
+        raw_manifest = body.get("manifest")
+        if raw_manifest is not None:
+            manifest = parse_manifest(raw_manifest)
+            replacements = body.get("workspace_overrides")
+            pwd_override = body.get("pwd_override")
+            if pwd_override is not None and replacements:
+                raise ValueError(
+                    "pwd_override and workspace_overrides are mutually exclusive"
+                )
+            if pwd_override is not None:
+                replacements = {
+                    item.creature_id: pwd_override for item in manifest.creatures
+                }
+            try:
+                plan = plan_workspace_resume(
+                    manifest,
+                    replacements,
+                    allow_valid_targets=pwd_override is not None,
+                )
+            except WorkspaceResumeError as exc:
+                return {
+                    "legacy": False,
+                    "ready": False,
+                    "members": [],
+                    "gaps": [],
+                    "error": {"code": exc.code.value, "message": str(exc)},
+                }
+            preflight = preflight_workspace_resume(plan.manifest)
+            return {"legacy": False, **preflight_to_dict(preflight)}
+        saved_pwd = body.get("legacy_pwd")
+        if "legacy_pwd" in body:
+            effective_pwd = body.get("pwd_override") or saved_pwd
+            has_pwd = isinstance(effective_pwd, str) and bool(effective_pwd.strip())
+            ready = has_pwd and Path(effective_pwd).is_dir()
+            return {
+                "legacy": True,
+                "ready": ready,
+                "members": [],
+                "gaps": (
+                    []
+                    if ready
+                    else [
+                        {
+                            "gap_id": "legacy",
+                            "saved_pwd": (
+                                effective_pwd if isinstance(effective_pwd, str) else ""
+                            ),
+                            "status": "invalid",
+                            "creature_ids": [],
+                        }
+                    ]
+                ),
             }
-        """
         path = body.get("path")
         if not isinstance(path, str) or not path:
-            raise ValueError("path is required")
-        stores = getattr(self._engine, "_session_stores", {}) or {}
-        requested_sid = body.get("session_id")
-        if isinstance(requested_sid, str) and requested_sid in stores:
-            store = stores[requested_sid]
-            return {"session_id": requested_sid, "meta": dict(store.load_meta())}
+            raise ValueError("path, manifest, or legacy_pwd is required")
         local = Path(path)
         if not local.exists():
             raise FileNotFoundError(f"no .kohakutr at {path!r}")
-        resolved = local.resolve()
-        for sid, store in stores.items():
-            if Path(store.path).resolve() == resolved:
-                return {"session_id": sid, "meta": dict(store.load_meta())}
+        preflight = preflight_session_workspaces(local)
+        if preflight is None:
+            return {"legacy": True, "ready": True, "members": [], "gaps": []}
+        return {"legacy": False, **preflight_to_dict(preflight)}
+
+    async def _op_remove(self, body: dict[str, Any]) -> dict[str, Any]:
+        raise ValueError("remove is unsupported; use rollback_resume")
+
+    async def _op_resume(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Adopt a session file already present on the worker."""
+        scope = body.get("scope")
+        rel = body.get("rel")
+        if isinstance(scope, str) and scope:
+            if not isinstance(rel, str) or not rel:
+                raise ValueError("rel is required with scope")
+            local = resolve_in_scope(scope, rel, self._engine)
+        else:
+            path = body.get("path")
+            if not isinstance(path, str) or not path:
+                raise ValueError("path or scope+rel is required")
+            local = Path(path)
+        resume_token = body.get("resume_token")
+        if resume_token is not None and (
+            not isinstance(resume_token, str)
+            or not resume_token
+            or len(resume_token) > 128
+        ):
+            raise ValueError(
+                "resume_token must be a non-empty string of at most 128 chars"
+            )
+        workspace_overrides = body.get("workspace_overrides")
+        if body.get("pwd_override") is not None and workspace_overrides:
+            raise ValueError(
+                "pwd_override and workspace_overrides are mutually exclusive"
+            )
+        if not local.exists():
+            raise FileNotFoundError(f"no .kohakutr at {str(local)!r}")
         sid = await self._engine.adopt_session(
             local,
             pwd=body.get("pwd_override"),
+            workspace_overrides=workspace_overrides,
             llm=body.get("llm"),
         )
+        if isinstance(resume_token, str):
+            self._remember_resume_token(resume_token, sid, local)
         store = getattr(self._engine, "_session_stores", {}).get(sid)
         meta = store.load_meta() if store is not None else {}
+        creatures = [
+            {
+                "creature_id": str(creature.creature_id),
+                "name": str(getattr(creature, "name", creature.creature_id)),
+                "running": bool(getattr(creature, "is_running", True)),
+                "is_privileged": bool(getattr(creature, "is_privileged", False)),
+            }
+            for creature in self._engine.list_creatures()
+            if getattr(creature, "graph_id", None) == sid
+        ]
+        # Path validity must be evaluated here; the controller cannot stat the
+        # worker's filesystem.
+        saved_pwd = str(meta.get("pwd", "") or "")
         return {
             "session_id": sid,
+            "session_path": str(local),
             "meta": dict(meta),
+            "creatures": creatures,
+            "pwd_exists": (not saved_pwd) or os.path.isdir(saved_pwd),
         }
-
-    # ------------------------------------------------------------------
-    # Store lookup
-    # ------------------------------------------------------------------
 
     def _resolve_store(self, session_id: str) -> SessionStore:
         stores = getattr(self._engine, "_session_stores", {}) or {}

@@ -4,6 +4,8 @@
     {{ message.content }}
   </div>
 
+  <CommandResultMessage v-else-if="message.role === 'command_result'" :message="message" />
+
   <!-- Context cleared banner -->
   <div v-else-if="message.role === 'clear'" class="flex items-center gap-3 py-2">
     <div class="flex-1 border-t border-warm-300 dark:border-warm-600 border-dashed" />
@@ -16,7 +18,7 @@
     <div role="button" tabindex="0" :aria-expanded="!!expandedTools['compact_' + message.id]" class="flex items-center gap-2 py-1.5 px-3 cursor-pointer select-none" @click="toggleTool('compact_' + message.id)" @keydown.enter="toggleTool('compact_' + message.id)" @keydown.space.prevent="toggleTool('compact_' + message.id)">
       <span v-if="message.status === 'running'" class="w-1.5 h-1.5 rounded-full bg-amber kohaku-pulse shrink-0" />
       <span class="text-xs font-medium" :class="message.status === 'running' ? 'text-amber dark:text-amber-light' : 'text-iolite dark:text-iolite-light'">
-        {{ message.status === "running" ? "Compacting context..." : `Context Compacted (round ${message.round || "?"})` }}
+        {{ message.status === "running" ? "Compacting context..." : message.status === "skipped" ? `Compaction skipped${message.reason ? ` (${message.reason})` : ""}` : `Context Compacted (round ${message.round || "?"})` }}
       </span>
       <span v-if="message.messagesCompacted" class="text-[10px] text-warm-400"> {{ message.messagesCompacted }} messages summarized </span>
       <span class="flex-1" />
@@ -27,8 +29,15 @@
     </div>
   </div>
 
+  <!-- Background result delivered -->
+  <div v-else-if="message.role === 'bg_result'" class="flex items-center gap-2 py-0.5">
+    <div class="flex-1 border-t border-iolite/20 dark:border-iolite/25 border-dashed" />
+    <span class="text-xs text-iolite/80 dark:text-iolite-light/80 shrink-0"> <span class="i-carbon-arrow-down-left text-[10px] mr-0.5" />{{ message.kind === "subagent" ? t("chat.bgResultSubagent", { label: message.label }) : t("chat.bgResultTool", { label: message.label }) }} </span>
+    <div class="flex-1 border-t border-iolite/20 dark:border-iolite/25 border-dashed" />
+  </div>
+
   <!-- Processing error -->
-  <div v-else-if="message.role === 'error'" class="rounded-lg bg-coral/8 dark:bg-coral/12 border border-coral/25 dark:border-coral/30 overflow-hidden">
+  <div v-else-if="message.role === 'error'" class="rounded-lg bg-coral/8 dark:bg-coral/12 border border-coral/25 dark:border-coral/30 overflow-hidden chat-cv">
     <div role="button" tabindex="0" :aria-expanded="errorExpanded" class="flex items-center gap-2 py-2 px-3 cursor-pointer select-none hover:bg-coral/12 dark:hover:bg-coral/18" @click="errorExpanded = !errorExpanded" @keydown.enter="errorExpanded = !errorExpanded" @keydown.space.prevent="errorExpanded = !errorExpanded">
       <span class="text-coral font-bold text-sm">&#x2717;</span>
       <span class="text-coral dark:text-coral-light font-semibold text-xs flex-1">
@@ -82,7 +91,7 @@
 
   <!-- User message -->
   <div v-else-if="message.role === 'user'" class="ml-auto group relative" :class="editing ? 'w-[min(760px,92%)] max-w-[92%]' : 'max-w-[80%]'">
-    <div class="user-message" :class="{ 'opacity-70': message.queued, 'user-message-editing': editing }">
+    <div class="user-message chat-cv" :class="{ 'opacity-70': message.queued, 'user-message-editing': editing }">
       <div class="text-xs text-warm-400 mb-1 flex items-center gap-1.5">
         <span>You</span>
         <span v-if="message.queued" class="px-1.5 py-0.5 rounded text-[9px] font-medium bg-amber/15 text-amber leading-none">Queued</span>
@@ -114,8 +123,8 @@
         <div class="flex flex-wrap items-center gap-2 text-xs">
           <span class="text-warm-400 dark:text-warm-500 mr-auto">Ctrl/Cmd+Enter to rerun · Esc to cancel</span>
           <button class="px-2.5 py-1 rounded hover:bg-warm-100 dark:hover:bg-warm-800 disabled:opacity-50" :disabled="editSaving" @click="cancelEdit">Cancel</button>
-          <button class="px-2.5 py-1 rounded bg-sapphire text-white hover:bg-sapphire-dark disabled:opacity-60" :disabled="editSaving || (!editText.trim() && editAttachments.length === 0)" @click="confirmEdit">
-            {{ editSaving ? "Saving..." : "Save & Rerun" }}
+          <button class="px-2.5 py-1 rounded bg-sapphire text-white hover:bg-sapphire-dark disabled:opacity-60" aria-label="Save and rerun" :disabled="editSaving || branchOperationBusy || (!editText.trim() && editAttachments.length === 0)" @click="confirmEdit">
+            {{ editSaving ? "Starting..." : "Save & Rerun" }}
           </button>
         </div>
       </div>
@@ -136,25 +145,26 @@
           <div class="whitespace-pre-wrap">{{ message.content }}</div>
         </template>
       </div>
+      <p v-if="editError || branchOperationError" class="mt-1 text-sm text-red-600 dark:text-red-400" role="alert">{{ editError || branchOperationError }}</p>
     </div>
     <!-- Hover actions for user messages -->
-    <div v-if="!editing && !message.queued && messageIdx != null" class="absolute -bottom-5 right-2 flex gap-1 items-center hover-only-action chat-msg-actions chat-msg-actions--right">
+    <div v-if="!editing && !message.queued && !message.injectedMidTurn && messageIdx != null" class="absolute -bottom-5 right-2 flex gap-1 items-center hover-only-action chat-msg-actions chat-msg-actions--right">
       <!-- Branch navigator on user message: shown only when this turn
            has multiple distinct user contents (i.e. an edit produced
            a sibling branch at this divergence point). -->
       <div v-if="hasUserGroups" class="flex items-center gap-0.5 mr-1 select-none">
-        <button class="msg-action-btn" title="Previous edit" aria-label="Previous user edit" :disabled="!hasPrevUserGroup" @click="goToPrevUserGroup">
+        <button class="msg-action-btn" title="Previous edit" aria-label="Previous user edit" :disabled="branchOperationBusy || !hasPrevUserGroup" :aria-busy="branchOperationBusy" @click="goToPrevUserGroup">
           <span class="i-carbon-chevron-left text-xs" />
         </button>
         <span class="text-[10px] tabular-nums text-warm-500 px-1">{{ message.currentUserGroupIdx + 1 }}/{{ message.userGroupCount }}</span>
-        <button class="msg-action-btn" title="Next edit" aria-label="Next user edit" :disabled="!hasNextUserGroup" @click="goToNextUserGroup">
+        <button class="msg-action-btn" title="Next edit" aria-label="Next user edit" :disabled="branchOperationBusy || !hasNextUserGroup" :aria-busy="branchOperationBusy" @click="goToNextUserGroup">
           <span class="i-carbon-chevron-right text-xs" />
         </button>
       </div>
       <button class="msg-action-btn" title="Copy" aria-label="Copy message" @click="copyMessage">
         <span class="i-carbon-copy text-xs" />
       </button>
-      <button class="msg-action-btn" title="Edit & rerun" aria-label="Edit and rerun message" @click="startEdit">
+      <button class="msg-action-btn" title="Edit & rerun" aria-label="Edit and rerun message" :disabled="branchOperationBusy" :aria-busy="branchOperationBusy" @click="startEdit">
         <span class="i-carbon-edit text-xs" />
       </button>
     </div>
@@ -167,26 +177,28 @@
        keyed on the first tool's id so streaming new tools into an
        in-progress batch doesn't reshuffle ``expandedTools`` state. -->
   <div v-else-if="message.role === 'assistant' && message.parts" class="max-w-[90%] group relative">
-    <template v-for="(group, gi) in renderGroups" :key="gi">
-      <!-- Pass-through part -->
-      <template v-if="group.type === 'part'">
-        <div v-if="group.part.type === 'text' && group.part.content" class="text-body mb-1">
-          <MarkdownRenderer :content="group.part.content" />
-        </div>
-        <div v-else-if="group.part.type === 'tool'" class="mb-1.5">
-          <ToolCallBlock :tc="group.part" :expanded="expandedTools[group.part.id]" @toggle="toggleTool(group.part.id)" />
-        </div>
-        <div v-else-if="group.part.type === 'image_url'" class="mb-1.5">
-          <img :src="group.part.image_url?.url" class="chat-inline-image" :alt="group.part.meta?.source_name || 'generated image'" />
-        </div>
-      </template>
-      <!-- Tool-batch group (collapsed by default; per-tool expand state
+    <div class="chat-cv">
+      <template v-for="(group, gi) in renderGroups" :key="groupKey(group, gi)">
+        <!-- Pass-through part -->
+        <template v-if="group.type === 'part'">
+          <div v-if="group.part.type === 'text' && group.part.content" class="text-body mb-1">
+            <MarkdownRenderer :content="group.part.content" />
+          </div>
+          <div v-else-if="group.part.type === 'tool'" class="mb-1.5">
+            <ToolCallBlock :tc="group.part" :expanded="expandedTools[group.part.id]" @toggle="toggleTool(group.part.id)" />
+          </div>
+          <div v-else-if="group.part.type === 'image_url'" class="mb-1.5">
+            <img :src="group.part.image_url?.url" class="chat-inline-image" :alt="group.part.meta?.source_name || 'generated image'" />
+          </div>
+        </template>
+        <!-- Tool-batch group (collapsed by default; per-tool expand state
            lives in the same ``expandedTools`` map keyed by tool id, so
            opening the batch doesn't open the tools and vice-versa). -->
-      <div v-else-if="group.type === 'tool-batch'" class="mb-1.5">
-        <ToolCallBatch :tools="group.tools" :expanded="!!expandedTools[group.id]" :tool-expanded="expandedTools" @toggle="toggleTool(group.id)" @tool-toggle="toggleTool" />
-      </div>
-    </template>
+        <div v-else-if="group.type === 'tool-batch'" class="mb-1.5">
+          <ToolCallBatch :tools="group.tools" :expanded="!!expandedTools[group.id]" :tool-expanded="expandedTools" @toggle="toggleTool(group.id)" @tool-toggle="toggleTool" />
+        </div>
+      </template>
+    </div>
     <!-- Hover actions -->
     <div class="absolute -bottom-5 left-2 flex gap-1 items-center hover-only-action chat-msg-actions chat-msg-actions--left">
       <!-- Branch navigator on the assistant bubble: shown only when
@@ -194,11 +206,11 @@
            alternative. Edit-only branching does NOT light this up —
            that's the user-side navigator's job. -->
       <div v-if="hasAssistantBranches" class="flex items-center gap-0.5 mr-1 select-none">
-        <button class="msg-action-btn" title="Previous regen" aria-label="Previous regen" :disabled="!hasPrevAssistantBranch" @click="goToPrevAssistantBranch">
+        <button class="msg-action-btn" title="Previous regen" aria-label="Previous regen" :disabled="branchOperationBusy || !hasPrevAssistantBranch" :aria-busy="branchOperationBusy" @click="goToPrevAssistantBranch">
           <span class="i-carbon-chevron-left text-xs" />
         </button>
         <span class="text-[10px] tabular-nums text-warm-500 px-1">{{ message.currentAssistantIdx + 1 }}/{{ message.assistantBranchCount }}</span>
-        <button class="msg-action-btn" title="Next regen" aria-label="Next regen" :disabled="!hasNextAssistantBranch" @click="goToNextAssistantBranch">
+        <button class="msg-action-btn" title="Next regen" aria-label="Next regen" :disabled="branchOperationBusy || !hasNextAssistantBranch" :aria-busy="branchOperationBusy" @click="goToNextAssistantBranch">
           <span class="i-carbon-chevron-right text-xs" />
         </button>
       </div>
@@ -209,14 +221,14 @@
            on assistant messages — the previous duplicate "Retry"
            button was identical and only hid the affordance when an
            interrupt left the turn in a non-"last" state. -->
-      <button class="msg-action-btn" title="Regenerate" aria-label="Regenerate response" @click="regenerate">
+      <button class="msg-action-btn" title="Regenerate" aria-label="Regenerate response" :disabled="branchOperationBusy" :aria-busy="branchOperationBusy" @click="regenerate">
         <span class="i-carbon-renew text-xs" />
       </button>
     </div>
   </div>
 
   <!-- Assistant message (legacy: content + tool_calls) -->
-  <div v-else-if="message.role === 'assistant'" class="max-w-[90%]">
+  <div v-else-if="message.role === 'assistant'" class="max-w-[90%] chat-cv">
     <div v-if="message.tool_calls?.length" class="mb-2 flex flex-col gap-1.5">
       <ToolCallBlock v-for="tc in message.tool_calls" :key="tc.id" :tc="tc" :expanded="expandedTools[tc.id]" @toggle="toggleTool(tc.id)" />
     </div>
@@ -226,7 +238,7 @@
   </div>
 
   <!-- Channel message (group chat style) -->
-  <div v-else-if="message.role === 'channel'" class="max-w-[90%]">
+  <div v-else-if="message.role === 'channel'" class="max-w-[90%] chat-cv">
     <div v-if="showSenderHeader" class="flex items-center gap-2 mb-1" :class="{ 'mt-2': !isFirst }">
       <span class="w-5 h-5 rounded-md flex items-center justify-center text-[10px] font-bold text-white" :style="{ background: senderGemColor }">
         {{ message.sender.charAt(0).toUpperCase() }}
@@ -260,6 +272,7 @@
 import { ElMessage } from "element-plus"
 
 import MarkdownRenderer from "@/components/common/MarkdownRenderer.vue"
+import CommandResultMessage from "@/components/chat/CommandResultMessage.vue"
 import ToolCallBatch from "@/components/chat/ToolCallBatch.vue"
 import ToolCallBlock from "@/components/chat/ToolCallBlock.vue"
 import UIEventBlock from "@/components/chat/UIEventBlock.vue"
@@ -307,6 +320,7 @@ const props = defineProps({
   isFirst: { type: Boolean, default: false },
   messageIdx: { type: Number, default: null },
   isLastAssistant: { type: Boolean, default: false },
+  tabId: { type: String, default: "" },
 })
 
 const expandedTools = reactive({})
@@ -318,12 +332,21 @@ const editing = ref(false)
 // threshold (default 3) render flat.  See utils/chatToolGrouping.js.
 const renderGroups = computed(() => computeRenderGroups(props.message.parts || []))
 
+// Batch groups carry a stable id (first tool's id); pass-through groups
+// key on the part's own id when it has one so appending tools mid-stream
+// doesn't reshuffle subsequent group keys.
+function groupKey(group, gi) {
+  if (group.type === "tool-batch") return group.id
+  return group.part?.id ?? `g_${gi}`
+}
+
 const editText = ref("")
 const editAttachments = ref([])
 const editTextareaEl = ref(null)
 const editImageInputEl = ref(null)
 const editFileInputEl = ref(null)
 const editSaving = ref(false)
+const editError = ref("")
 const errorExpanded = ref(false)
 
 const errorFirstLine = computed(() => {
@@ -365,6 +388,10 @@ const senderHomeNode = computed(() => {
 // ── Message actions (copy / edit / regenerate) ──
 
 const chat = useChatStore()
+const messageTab = computed(() => props.tabId || chat.activeTab)
+const branchOperation = computed(() => chat.branchOperationByTab[messageTab.value] || null)
+const branchOperationBusy = computed(() => branchOperation.value != null)
+const branchOperationError = computed(() => chat.branchOperationErrorByTab[messageTab.value] || "")
 
 function copyMessage() {
   const text = contentToText(props.message.contentParts || props.message.content)
@@ -432,46 +459,39 @@ function removeEditAttachment(index) {
 async function confirmEdit() {
   if (editSaving.value || (!editText.value.trim() && editAttachments.value.length === 0)) return
   editSaving.value = true
+  editError.value = ""
   let newContent
   try {
     newContent = await buildMessageParts(editText.value, editAttachments.value)
   } catch (err) {
-    console.error("Failed to prepare edited message:", err)
+    editError.value = err instanceof Error ? err.message : String(err)
     editSaving.value = false
     return
   }
-  // Close the editor IMMEDIATELY — the new branch is locked in the
-  // moment the user clicks Save & Rerun. Leaving the textarea on
-  // screen until the API + resync round-trip lands made it look
-  // like the rerun hadn't started yet; worse, the streaming reply
-  // appears underneath while the editor still covers the original
-  // bubble, hiding the user message that prompted it.
-  editing.value = false
-  const submittedText = editText.value
-  const submittedAttachments = editAttachments.value
-  editText.value = ""
-  editAttachments.value = []
-  try {
-    const ok = await chat.editMessage(props.messageIdx, newContent, {
-      turnIndex: props.message.turnIndex,
-      userPosition: props.message.userPosition,
-      latestBranch: props.message.latestBranch,
-    })
-    if (!ok) {
-      // Restore the draft so the user can retry — the rerun didn't
-      // land, so don't leave them with an empty edit buffer.
-      editText.value = submittedText
-      editAttachments.value = submittedAttachments
-      editing.value = true
-    }
-  } catch (err) {
-    console.error("Failed to prepare edited message:", err)
-    editText.value = submittedText
-    editAttachments.value = submittedAttachments
-    editing.value = true
-  } finally {
+  const operation = chat.editMessage(props.messageIdx, newContent, {
+    turnIndex: props.message.turnIndex,
+    userPosition: props.message.userPosition,
+    latestBranch: props.message.latestBranch,
+    attachments: editAttachments.value,
+    tabId: messageTab.value,
+  })
+  await nextTick()
+  if (branchOperation.value) {
     editSaving.value = false
+    editing.value = false
   }
+  const result = await operation
+  editSaving.value = false
+  if (result?.ok) {
+    editing.value = false
+    editText.value = ""
+    editAttachments.value = []
+    return
+  }
+  editing.value = true
+  editError.value = result?.error || branchOperationError.value || "Failed to start edit"
+  await nextTick()
+  editTextareaEl.value?.focus()
 }
 
 function regenerate() {
@@ -499,11 +519,12 @@ const hasPrevUserGroup = computed(() => hasUserGroups.value && (props.message.cu
 const hasNextUserGroup = computed(() => hasUserGroups.value && (props.message.currentUserGroupIdx ?? 0) < props.message.userGroupCount - 1)
 
 function _switchUserGroup(delta) {
+  if (branchOperationBusy.value) return
   const idx = props.message.currentUserGroupIdx ?? 0
   const target = idx + delta
   const groups = props.message.userGroupBranches || []
   if (target < 0 || target >= groups.length) return
-  chat.selectBranch(props.message.turnIndex, groups[target])
+  chat.selectBranch(props.message.turnIndex, groups[target], messageTab.value)
 }
 function goToPrevUserGroup() {
   if (hasPrevUserGroup.value) _switchUserGroup(-1)
@@ -517,11 +538,12 @@ const hasPrevAssistantBranch = computed(() => hasAssistantBranches.value && (pro
 const hasNextAssistantBranch = computed(() => hasAssistantBranches.value && (props.message.currentAssistantIdx ?? 0) < props.message.assistantBranchCount - 1)
 
 function _switchAssistantBranch(delta) {
+  if (branchOperationBusy.value) return
   const idx = props.message.currentAssistantIdx ?? 0
   const target = idx + delta
   const branches = props.message.assistantBranches || []
   if (target < 0 || target >= branches.length) return
-  chat.selectBranch(props.message.turnIndex, branches[target])
+  chat.selectBranch(props.message.turnIndex, branches[target], messageTab.value)
 }
 function goToPrevAssistantBranch() {
   if (hasPrevAssistantBranch.value) _switchAssistantBranch(-1)

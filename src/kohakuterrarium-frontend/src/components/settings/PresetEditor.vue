@@ -19,6 +19,7 @@
         <span class="i-carbon-checkmark-filled mr-1" />
         {{ preset?.is_default ? t("settings.models.isDefault") : t("settings.models.setAsDefault") }}
       </el-button>
+      <el-tag v-if="isEditing && preset?.is_default" type="success" size="small">{{ t("settings.models.isDefault") }}</el-tag>
     </div>
 
     <!-- Core section -->

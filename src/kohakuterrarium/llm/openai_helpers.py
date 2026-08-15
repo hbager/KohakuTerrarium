@@ -39,13 +39,7 @@ def delta_field(obj: Any, name: str) -> Any:
 
 
 def delta_field_present(obj: Any, name: str) -> bool:
-    """Return whether a provider-specific field was explicitly present.
-
-    Stateful reasoning protocols care about field presence, not just
-    truthiness: DeepSeek V4 thinking mode, for example, rejects later
-    tool-call turns when an assistant message omits ``reasoning_content``
-    even if the value would be an empty string.
-    """
+    """Detect explicit field presence, including empty stateful reasoning values."""
     extra = getattr(obj, "model_extra", None)
     if isinstance(extra, dict) and name in extra:
         return True
@@ -64,34 +58,7 @@ def merge_reasoning_detail_stream(
     accumulator: list[dict[str, Any]],
     piece: dict[str, Any],
 ) -> None:
-    """Merge one streaming ``reasoning_details`` delta into the accumulator.
-
-    OpenRouter (and other Anthropic-thinking proxies) emit the
-    ``reasoning_details`` field across many SSE deltas. Each delta
-    carries a list of partial entries sharing an ``index`` field that
-    identifies the logical reasoning block they belong to. Anthropic
-    emits the BLOCK TEXT incrementally (one or more text-chunk entries
-    with ``text`` set + ``signature`` absent), then emits the HMAC
-    ``signature`` in the FINAL delta as a separate entry (``text``
-    absent, same ``index``).
-
-    A naive ``accumulator.extend(piece)`` produces ~25 separate entries
-    for one logical thinking block. Sending that back on the next turn
-    is broken two ways:
-
-    1. OpenRouter's safety net strips entries that lack a non-empty
-       ``signature`` → 24 text entries vanish, leaving only the
-       signature-only entry with empty text.
-    2. Anthropic validates the signature against the FULL block content
-       — an empty thinking block with the previously-emitted signature
-       fails with ``Invalid signature in thinking block``.
-
-    Merge by ``(type, index)``: concatenate the incremental text /
-    thinking fields, retain the final non-empty signature / data, and
-    carry the first-seen ``format`` so the assistant message ends up
-    with one entry per logical block — byte-identical to what
-    Anthropic produced on the originating turn.
-    """
+    """Merge streamed reasoning fragments by type and index for lossless replay."""
     if not isinstance(piece, dict):
         return
     idx = piece.get("index")
@@ -112,8 +79,7 @@ def merge_reasoning_detail_stream(
                 if field in piece and field not in existing:
                     existing[field] = piece[field]
             return
-    # No existing match — append a fresh copy so subsequent merges
-    # don't mutate the provider's delta object.
+    # Copy new entries so later merges never mutate the provider-owned delta.
     accumulator.append(dict(piece))
 
 
@@ -125,12 +91,7 @@ def pack_reasoning_fields(
     include_text: bool = False,
     include_details: bool = False,
 ) -> dict[str, Any]:
-    """Assemble captured reasoning fields into one extras dict.
-
-    ``include_*`` means "the provider emitted this field". When set,
-    preserve the field even if its value is empty so stateful reasoning
-    payloads round-trip losslessly.
-    """
+    """Pack reasoning fields while preserving explicitly emitted empty values."""
     packed: dict[str, Any] = {}
     if include_text or text:
         packed["reasoning_content"] = text
@@ -142,23 +103,11 @@ def pack_reasoning_fields(
 
 
 def lift_legacy_reasoning_effort(
-    extra: dict[str, Any],
-    *,
-    base_url: str,
+    extra: dict[str, Any], *, base_url: str
 ) -> tuple[dict[str, Any], str]:
-    """Promote legacy ``extra_body.reasoning.effort`` for OpenAI endpoints.
-
-    Older local configs sometimes stored OpenAI reasoning effort under
-    ``extra_body: {reasoning: {effort: ...}}``. The official OpenAI SDK
-    expects that as a top-level ``reasoning_effort`` parameter for chat
-    completions. Keep OpenAI proper compatible while leaving provider-
-    specific ``reasoning`` bodies intact for OpenAI-compatible services
-    that use their own schema.
-    """
+    """Promote legacy OpenAI reasoning effort to its top-level field."""
     base = (base_url or "").lower()
-    if is_anthropic_endpoint(base_url, None):
-        return extra, ""
-    if any(
+    if is_anthropic_endpoint(base_url, None) or any(
         host in base
         for host in (
             "openrouter.ai",
@@ -167,15 +116,12 @@ def lift_legacy_reasoning_effort(
         )
     ):
         return extra, ""
-
     reasoning = extra.get("reasoning")
     if not isinstance(reasoning, dict) or reasoning.get("enabled") is False:
         return extra, ""
-
     effort = reasoning.get("effort")
     if not isinstance(effort, str) or not effort:
         return extra, ""
-
     remaining = {k: v for k, v in reasoning.items() if k not in {"enabled", "effort"}}
     next_extra = dict(extra)
     if remaining:
@@ -193,14 +139,13 @@ def apply_request_controls(
     reasoning_effort: str = "",
     service_tier: str | None = None,
 ) -> dict[str, Any]:
-    """Apply OpenAI-style reasoning/service controls to a request."""
+    """Apply OpenAI-style reasoning and service controls."""
     merged_extra, promoted_effort = lift_legacy_reasoning_effort(
-        merged_extra,
-        base_url=base_url,
+        merged_extra, base_url=base_url
     )
-    effort = reasoning_effort or promoted_effort
     if service_tier:
         create_kwargs["service_tier"] = service_tier
+    effort = reasoning_effort or promoted_effort
     if effort:
         create_kwargs["reasoning_effort"] = effort
     return merged_extra
@@ -216,16 +161,7 @@ _STATEFUL_ASSISTANT_FIELD_DEFAULTS: dict[str, Any] = {
 def normalize_stateful_assistant_fields(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Keep seen provider-owned assistant state fields present.
-
-    This is evidence-based and provider-agnostic: once a conversation
-    contains a known stateful assistant field, every assistant message
-    in the outgoing request gets that field, defaulting to the empty
-    value for its shape. Providers that never emit these fields are left
-    untouched, while DeepSeek-style thinking/tool-call conversations
-    keep the required field present across synthetic, compacted, or
-    empty-reasoning assistant turns.
-    """
+    """Fill known stateful assistant fields after a conversation begins using them."""
     seen = {
         field
         for msg in messages
@@ -256,7 +192,7 @@ def normalize_stateful_assistant_fields(
 
 
 def tool_call_from_pending(call: dict[str, str]) -> NativeToolCall:
-    """Convert a streaming pending-call accumulator to NativeToolCall."""
+    """Convert a streaming tool-call accumulator to a native call."""
     return NativeToolCall(
         id=call["id"],
         name=call["name"],
@@ -265,7 +201,7 @@ def tool_call_from_pending(call: dict[str, str]) -> NativeToolCall:
 
 
 def tool_calls_from_message(tool_calls: Any) -> list[NativeToolCall]:
-    """Convert SDK message tool calls into KT NativeToolCall objects."""
+    """Convert SDK tool calls into framework-native calls."""
     return [
         NativeToolCall(
             id=tc.id,

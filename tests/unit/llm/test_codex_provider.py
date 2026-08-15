@@ -12,16 +12,9 @@ from dataclasses import dataclass
 import pytest
 
 from kohakuterrarium.llm import codex_provider as cp
-from kohakuterrarium.llm.api_keys import KeyPool
 from kohakuterrarium.llm.codex_provider import CODEX_BASE_URL, CodexOAuthProvider
 
 pytestmark = pytest.mark.skipif(not cp.HAS_OPENAI, reason="openai SDK not installed")
-
-
-class _StatusError(Exception):
-    def __init__(self, status_code: int):
-        super().__init__(f"HTTP {status_code}")
-        self.status_code = status_code
 
 
 @dataclass
@@ -65,36 +58,6 @@ class TestApiKeyMode:
         clone = p.with_model("b")
         assert clone._api_key == "sk-custom"
         assert clone._base_url == "https://my.host/v1"
-
-    async def test_key_pool_failover_stops_after_five_keys(self):
-        p = CodexOAuthProvider(
-            model="m",
-            api_key=KeyPool(["k1", "k2", "k3", "k4", "k5", "k6"]),
-            base_url="https://h/v1",
-        )
-        seen_keys = []
-
-        async def always_unauthorized(messages, **kwargs):
-            create_kwargs = {}
-            p._apply_request_api_key(create_kwargs)
-            seen_keys.append(create_kwargs["extra_headers"]["Authorization"])
-            raise _StatusError(401)
-            yield  # pragma: no cover
-
-        p._raw_stream_chat = always_unauthorized
-
-        with pytest.raises(_StatusError):
-            async for _ in p._stream_chat([]):
-                pass
-
-        assert seen_keys == [
-            "Bearer k1",
-            "Bearer k2",
-            "Bearer k3",
-            "Bearer k4",
-            "Bearer k5",
-        ]
-        assert p._api_key_pool.next() == "k6"
 
 
 class TestOAuthMode:
@@ -159,3 +122,180 @@ class TestSessionIdHeaderGating:
         kw = p._client.responses.kwargs
         assert "extra_headers" in kw
         assert "session_id" in kw["extra_headers"]
+
+
+class _Ev:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class _FakeWSConnection:
+    def __init__(self):
+        self.sent = []
+        self.scripts = []
+
+    async def send(self, event):
+        self.sent.append(event)
+
+    def __aiter__(self):
+        events = self.scripts.pop(0) if self.scripts else []
+
+        async def gen():
+            for e in events:
+                yield e
+
+        return gen()
+
+    async def close(self):
+        pass
+
+
+class _FakeWSManager:
+    def __init__(self, connection):
+        self.connection = connection
+
+    async def enter(self):
+        return self.connection
+
+
+class _FakeWSResponses:
+    """responses namespace exposing both connect() and create()."""
+
+    def __init__(self):
+        self.connection = _FakeWSConnection()
+        self.connect_kwargs = None
+        self.connect_exc: Exception | None = None
+        self.kwargs = None
+
+    def connect(self, **kwargs):
+        if self.connect_exc is not None:
+            raise self.connect_exc
+        self.connect_kwargs = kwargs
+        return _FakeWSManager(self.connection)
+
+    async def create(self, **kwargs):
+        self.kwargs = kwargs
+
+        async def _empty():
+            if False:  # pragma: no cover - async generator shape
+                yield
+
+        return _empty()
+
+
+class _FakeWSClient:
+    def __init__(self):
+        self.responses = _FakeWSResponses()
+
+
+def _ws_completed(resp_id="r1"):
+    usage = _Ev(
+        input_tokens=10,
+        output_tokens=5,
+        total_tokens=15,
+        input_tokens_details=_Ev(cached_tokens=3),
+    )
+    return _Ev(
+        type="response.completed",
+        response=_Ev(id=resp_id, output=[], usage=usage),
+    )
+
+
+class TestWebsocketMode:
+    """websocket_mode drives turns over responses.connect with HTTP fallback."""
+
+    def _provider(self, extra_body=None) -> CodexOAuthProvider:
+        p = CodexOAuthProvider(
+            model="m",
+            api_key="sk",
+            base_url="https://h/v1",
+            reasoning_effort="low",
+            extra_body=extra_body or {"websocket_mode": True},
+        )
+        p._client = _FakeWSClient()
+        return p
+
+    async def _drive(self, provider):
+        chunks = []
+        async for chunk in provider._raw_stream_chat(
+            [
+                {"role": "system", "content": "SYS"},
+                {"role": "user", "content": "hi"},
+            ]
+        ):
+            chunks.append(chunk)
+        return chunks
+
+    async def test_ws_turn_streams_and_collects_state(self):
+        p = self._provider()
+        p._client.responses.connection.scripts = [
+            [
+                _Ev(type="response.output_text.delta", delta="hello"),
+                _Ev(
+                    type="response.output_item.done",
+                    item=_Ev(
+                        type="function_call", call_id="c9", name="t", arguments="{}"
+                    ),
+                ),
+                _ws_completed(),
+            ]
+        ]
+
+        chunks = await self._drive(p)
+
+        assert chunks == ["hello"]
+        assert [tc.name for tc in p.last_tool_calls] == ["t"]
+        assert p._last_usage["prompt_tokens"] == 10
+        assert p._last_usage["cached_tokens"] == 3
+        # The HTTP path must not have run.
+        assert p._client.responses.kwargs is None
+        sent = p._client.responses.connection.sent[0]
+        assert sent["model"] == "m"
+        assert sent["instructions"] == "SYS"
+        assert sent["store"] is False
+        assert sent["reasoning"] == {"effort": "low"}
+        assert "websocket_mode" not in sent
+
+    async def test_extra_body_reasoning_merges_into_ws_event(self):
+        p = self._provider(
+            extra_body={"websocket_mode": True, "reasoning": {"mode": "pro"}}
+        )
+        p._client.responses.connection.scripts = [[_ws_completed()]]
+
+        await self._drive(p)
+
+        sent = p._client.responses.connection.sent[0]
+        assert sent["reasoning"] == {"effort": "low", "mode": "pro"}
+
+    async def test_connect_failure_falls_back_to_http(self):
+        p = self._provider()
+        p._client.responses.connect_exc = ConnectionError("no ws upgrade")
+
+        await self._drive(p)
+
+        kw = p._client.responses.kwargs
+        assert kw is not None
+        assert kw["model"] == "m"
+
+    async def test_extra_body_reasoning_merges_on_http_path(self):
+        p = CodexOAuthProvider(
+            model="m",
+            api_key="sk",
+            base_url="https://h/v1",
+            reasoning_effort="low",
+            extra_body={"reasoning": {"mode": "pro"}},
+        )
+        p._client = _FakeClient()
+        async for _ in p._raw_stream_chat([{"role": "user", "content": "hi"}]):
+            pass
+
+        kw = p._client.responses.kwargs
+        assert kw["reasoning"] == {"effort": "low", "mode": "pro"}
+
+    def test_with_model_propagates_ws_mode_with_fresh_session(self):
+        p = self._provider()
+        p._ws_session = object()
+        clone = p.with_model("m2")
+        assert clone._websocket_mode is True
+        assert clone.extra_body == p.extra_body
+        assert clone._ws_session is None

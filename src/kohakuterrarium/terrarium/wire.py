@@ -26,10 +26,8 @@ take a primitive dict and return the dataclass.  Unpack functions are
 strict — missing keys raise ``KeyError`` and unknown keys are ignored
 (forward-compatible with field additions).
 
-Path-form ``add_creature`` (``str`` or ``Path``) is **not supported**
-in Unit A; ``pack_creature_build_input`` raises
-:class:`RemoteAddCreatureError` for those inputs.  Lifted in Unit C
-(``studio.deploy`` lands the file bundle first; then path-form works).
+Path-form ``add_creature`` accepts only absolute worker-side paths; callers must
+first deploy local files and then pass the resulting remote path.
 """
 
 from dataclasses import is_dataclass
@@ -42,6 +40,24 @@ from kohakuterrarium.core.config_serde import (
     unpack_agent_config,
 )
 from kohakuterrarium.core.config_types import AgentConfig
+from kohakuterrarium.terrarium.drive.errors import (
+    CrossNodeDriveNotSupportedError,
+    DriveBackpressureError,
+    DriveConflictError,
+    DriveDeliveryError,
+    DriveError,
+    DriveIdempotencyConflictError,
+    DriveNotFoundError,
+    DrivePermissionError,
+    DrivePersistenceRequiredError,
+    DriveReconfigurationRequiredError,
+    DriveRegistrationDisabledError,
+    DriveRegistrationIncompatibleError,
+    DriveRegistrationNotFoundError,
+    DriveSettingsConflictError,
+    DriveTransitionError,
+    DriveValidationError,
+)
 from kohakuterrarium.terrarium.events import (
     ConnectionResult,
     DisconnectionResult,
@@ -60,9 +76,9 @@ from kohakuterrarium.terrarium.topology import (
 class RemoteAddCreatureError(ValueError):
     """Raised when ``add_creature`` is called with an unsupported config form.
 
-    In Unit A only in-memory :class:`AgentConfig` is accepted over the
-    wire.  String / ``Path`` configs require the file-deploy pipeline
-    (Unit C, ``studio.deploy``).
+    In-memory :class:`AgentConfig` values can cross the wire directly.
+    String and ``Path`` configs must first use the ``studio.deploy`` pipeline
+    so the worker receives a path on its own filesystem.
     """
 
 
@@ -83,6 +99,7 @@ def pack_creature_info(c: CreatureInfo) -> dict[str, Any]:
         "send_channels": list(c.send_channels),
         "model": c.model,
         "llm_name": c.llm_name,
+        "config_name": c.config_name,
     }
 
 
@@ -96,13 +113,14 @@ def unpack_creature_info(d: dict[str, Any]) -> CreatureInfo:
         parent_creature_id=d.get("parent_creature_id"),
         listen_channels=tuple(d.get("listen_channels", ())),
         send_channels=tuple(d.get("send_channels", ())),
-        # ``model`` is a 2026-05 addition; old workers / wire payloads
-        # may omit it — default to empty string so old peers still
-        # decode cleanly (UI falls through to "no model").
+        # Older workers may omit ``model``; default to an empty string so
+        # those payloads still decode cleanly and the UI shows "no model".
         model=str(d.get("model", "") or ""),
-        # ``llm_name`` is a 2026-05-16 addition (B3/B4 fix); same
-        # forward-compat treatment as ``model``.
+        # Older workers may also omit ``llm_name``; use the same
+        # forward-compatibility treatment as ``model``.
         llm_name=str(d.get("llm_name", "") or ""),
+        # Graph-local name resolution accepts the original config alias too.
+        config_name=str(d.get("config_name", "") or ""),
     )
 
 
@@ -351,8 +369,115 @@ def unpack_content(value: str | list[dict[str, Any]]) -> str | list[dict[str, An
     return value
 
 
+# ---------------------------------------------------------------------------
+# Drive typed-error mapping across the Lab wire
+# ---------------------------------------------------------------------------
+#
+# A worker's Drive op can fail with a *specific* typed error
+# (:class:`DriveConflictError`, :class:`DrivePermissionError`, …). The generic
+# adapter envelope only distinguishes ``not_found`` / ``invalid`` / ``engine``,
+# which would collapse every Drive failure to ``KeyError`` / ``ValueError`` /
+# ``RemoteEngineError`` and lose the subtype. These helpers pack a Drive error
+# into a kind-tagged body on the worker and reconstruct the same subtype on the
+# controller so ``except DriveConflictError`` keeps working across a node hop.
+
+# Most-specific first: the first ``isinstance`` match wins, so a
+# ``DriveIdempotencyConflictError`` is not shadowed by its ``DriveConflictError``
+# sibling / the ``DriveError`` base.
+_DRIVE_ERROR_ORDER: tuple[tuple[type[DriveError], str], ...] = (
+    (DriveIdempotencyConflictError, "drive_idempotency_conflict"),
+    (DriveSettingsConflictError, "drive_settings_conflict"),
+    (DriveConflictError, "drive_conflict"),
+    (DriveTransitionError, "drive_transition"),
+    (DriveRegistrationNotFoundError, "drive_registration_not_found"),
+    (DriveRegistrationDisabledError, "drive_registration_disabled"),
+    (DriveRegistrationIncompatibleError, "drive_registration_incompatible"),
+    (DriveReconfigurationRequiredError, "drive_reconfiguration_required"),
+    (DrivePersistenceRequiredError, "drive_persistence_required"),
+    (DriveBackpressureError, "drive_backpressure"),
+    (DriveDeliveryError, "drive_delivery"),
+    (DriveNotFoundError, "drive_not_found"),
+    (DriveValidationError, "drive_validation"),
+    (DrivePermissionError, "drive_permission"),
+    (CrossNodeDriveNotSupportedError, "cross_node_drive_not_supported"),
+    (DriveError, "drive"),
+)
+
+_DRIVE_ERROR_BY_KIND: dict[str, type[DriveError]] = {
+    kind: cls for cls, kind in _DRIVE_ERROR_ORDER
+}
+
+
+def is_drive_error_kind(kind: object) -> bool:
+    """Whether ``kind`` names a Drive typed error carried over the wire."""
+    return isinstance(kind, str) and kind in _DRIVE_ERROR_BY_KIND
+
+
+def pack_drive_error(exc: DriveError) -> dict[str, Any]:
+    """Serialize a Drive error to a kind-tagged envelope inner body.
+
+    The worker adapter wraps the result as ``{"error": <this>}``; the extra
+    typed attributes (revisions, from/to status, idempotency key) travel under
+    ``details`` so the controller can reconstruct the exact subtype.
+    """
+    kind = "drive"
+    for cls, tag in _DRIVE_ERROR_ORDER:
+        if isinstance(exc, cls):
+            kind = tag
+            break
+    details: dict[str, Any] = {}
+    for attr in (
+        "expected_revision",
+        "actual_revision",
+        "from_status",
+        "to_status",
+        "idempotency_key",
+    ):
+        value = getattr(exc, attr, None)
+        if value is not None:
+            details[attr] = value
+    return {"kind": kind, "message": str(exc), "details": details}
+
+
+def drive_error_from_body(body: object) -> DriveError | None:
+    """Reconstruct a Drive typed error from an ``{"error": {...}}`` envelope.
+
+    Returns ``None`` when ``body`` is not a Drive error envelope, so callers can
+    fall through to the generic ``not_found`` / ``invalid`` mapping.
+    """
+    if not isinstance(body, dict):
+        return None
+    err = body.get("error")
+    if not isinstance(err, dict):
+        return None
+    kind = err.get("kind")
+    cls = _DRIVE_ERROR_BY_KIND.get(kind) if isinstance(kind, str) else None
+    if cls is None:
+        return None
+    message = str(err.get("message", ""))
+    details = err.get("details") if isinstance(err.get("details"), dict) else {}
+    if cls in (DriveConflictError, DriveSettingsConflictError):
+        return cls(
+            message,
+            expected_revision=details.get("expected_revision"),
+            actual_revision=details.get("actual_revision"),
+        )
+    if cls is DriveIdempotencyConflictError:
+        return cls(message, idempotency_key=details.get("idempotency_key"))
+    if cls is DriveTransitionError:
+        return cls(
+            message,
+            from_status=details.get("from_status"),
+            to_status=details.get("to_status"),
+        )
+    return cls(message)
+
+
 __all__ = [
     "RemoteAddCreatureError",
+    "drive_error_from_body",
+    "is_drive_error_kind",
+    "pack_drive_error",
     "pack_agent_config",
     "pack_channel_info",
     "pack_connection_result",

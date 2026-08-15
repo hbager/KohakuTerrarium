@@ -1,10 +1,9 @@
 """Sessions namespace for the :class:`Studio` façade.
 
-Split out of ``studio/studio.py`` (file-size cap).  Every class here is
-a thin delegation layer over ``kohakuterrarium.studio.sessions.*`` —
-the façade wires them up as ``studio.sessions`` / ``studio.sessions.chat``
-etc.  Real signatures (no ``*args/**kwargs`` passthrough) so the
-programmatic surface is discoverable and at parity with the HTTP layer.
+Provides the typed ``studio.sessions`` namespaces while delegating behavior to
+``kohakuterrarium.studio.sessions.*``. Explicit signatures keep the programmatic
+surface discoverable and aligned with the HTTP adapters without duplicating
+session logic.
 """
 
 from __future__ import annotations
@@ -13,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, AsyncIterator
 
 from kohakuterrarium.errors import SessionNotFoundError
+from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.studio._runtime import host_engine_or_none
 from kohakuterrarium.studio.persistence import store as _persistence_store
 from kohakuterrarium.studio.sessions import (
@@ -22,12 +22,14 @@ from kohakuterrarium.studio.sessions import (
     creature_model as _session_model,
     creature_plugins as _session_plugins,
     creature_state as _session_state,
+    drives as _session_drives,
     handles as _session_handles,
     lifecycle as _session_lifecycle,
     memory_search as _session_memory,
     topology as _session_topology,
     wiring as _session_wiring,
 )
+from kohakuterrarium.terrarium.drive.models import ActorRef
 
 if TYPE_CHECKING:
     from kohakuterrarium.studio.studio import Studio
@@ -44,6 +46,7 @@ class _SessionsNS:
         self.plugins = _SessionsPlugins(studio)
         self.model = _SessionsModel(studio)
         self.command = _SessionsCommand(studio)
+        self.drives = _SessionsDrives(studio)
 
     async def start_creature(
         self,
@@ -70,6 +73,7 @@ class _SessionsNS:
         pwd: str | None = None,
         llm: str | None = None,
         name: str | None = None,
+        on_node: str = "_host",
     ) -> _session_handles.Session:
         return await _session_lifecycle.start_terrarium(
             self._studio._service,
@@ -77,6 +81,7 @@ class _SessionsNS:
             pwd=pwd,
             llm=llm,
             name=name,
+            on_node=on_node,
         )
 
     def list(self) -> list[_session_handles.SessionListing]:
@@ -88,6 +93,9 @@ class _SessionsNS:
     async def stop(self, session_id: str) -> None:
         await _session_lifecycle.stop_session(self._studio._service, session_id)
 
+    async def end(self, session_id: str) -> None:
+        await _session_lifecycle.end_session(self._studio._service, session_id)
+
     def find_creature(self, session_id: str, name_or_id: str) -> Any:
         return _session_lifecycle.find_creature(
             self._studio._service, session_id, name_or_id
@@ -98,7 +106,6 @@ class _SessionsNS:
             self._studio._service, creature_id
         )
 
-    # creature CRUD inside a running session (hot-plug)
     async def add_creature(self, session_id: str, config: Any) -> str:
         return await _session_lifecycle.add_creature(
             self._studio._service, session_id, config
@@ -112,7 +119,6 @@ class _SessionsNS:
             self._studio._service, session_id, creature_id
         )
 
-    # topology + wiring
     async def add_channel(
         self,
         session_id: str,
@@ -179,7 +185,6 @@ class _SessionsNS:
             self._studio._service, creature_id, sink_id
         )
 
-    # memory search
     async def search_memory(
         self,
         name: str | Path,
@@ -189,14 +194,12 @@ class _SessionsNS:
         k: int = 10,
         agent: str | None = None,
     ) -> dict[str, Any]:
-        """FTS5 / vector / hybrid search over a saved session.
+        """Search a saved session by name or direct ``.kohakutr`` path.
 
-        ``name`` is either a saved-session name (resolved against the
-        session dir, the same lookup the HTTP routes use) or a direct
-        ``.kohakutr`` path.  The engine is supplied from this Studio
-        instance so a live creature's store is reused when present.
-        Raises :class:`SessionNotFoundError` when the session cannot be
-        resolved — never creates files as a side effect.
+        Resolution matches the HTTP surface, and a local host engine is supplied
+        so an already-open session store can be reused. Failed resolution raises
+        :class:`SessionNotFoundError` without creating a database as a side
+        effect.
         """
         path = Path(name)
         if not path.exists():
@@ -219,10 +222,9 @@ class _SessionsChat:
     def chat(
         self, session_id: str, creature_id: str, content: Any
     ) -> AsyncIterator[str]:
-        # ``_session_chat.chat`` is an async *generator* — calling it
-        # already returns an AsyncIterator. This wrapper must NOT be
-        # ``async def`` (that would make the call return a coroutine,
-        # breaking the documented ``async for chunk in ...chat(...)``).
+        # The delegated callable is an async generator, so this wrapper must
+        # return it directly. Declaring the wrapper async would add a coroutine
+        # layer and break direct ``async for`` consumption.
         return _session_chat.chat(
             self._studio._service, session_id, creature_id, content
         )
@@ -234,13 +236,17 @@ class _SessionsChat:
         *,
         turn_index: int | None = None,
         branch_view: dict[int, int] | None = None,
-    ) -> None:
-        await _session_chat.regenerate(
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> dict[str, Any]:
+        return await _session_chat.regenerate(
             self._studio._service,
             session_id,
             creature_id,
             turn_index=turn_index,
             branch_view=branch_view,
+            request_id=request_id,
+            target=target,
         )
 
     async def edit_message(
@@ -253,7 +259,9 @@ class _SessionsChat:
         turn_index: int | None = None,
         user_position: int | None = None,
         branch_view: dict[int, int] | None = None,
-    ) -> bool | dict[str, object]:
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> dict[str, Any]:
         return await _session_chat.edit_message(
             self._studio._service,
             session_id,
@@ -263,6 +271,8 @@ class _SessionsChat:
             turn_index=turn_index,
             user_position=user_position,
             branch_view=branch_view,
+            request_id=request_id,
+            target=target,
         )
 
     async def rewind(self, session_id: str, creature_id: str, msg_idx: int) -> None:
@@ -270,11 +280,15 @@ class _SessionsChat:
             self._studio._service, session_id, creature_id, msg_idx
         )
 
-    def history(self, session_id: str, creature_id: str) -> dict[str, Any]:
-        return _session_chat.history(self._studio._service, session_id, creature_id)
+    async def history(self, session_id: str, creature_id: str) -> dict[str, Any]:
+        return await _session_chat.history(
+            self._studio._service, session_id, creature_id
+        )
 
-    def branches(self, session_id: str, creature_id: str) -> dict[str, Any]:
-        return _session_chat.branches(self._studio._service, session_id, creature_id)
+    async def branches(self, session_id: str, creature_id: str) -> list[dict[str, Any]]:
+        return await _session_chat.branches(
+            self._studio._service, session_id, creature_id
+        )
 
 
 class _SessionsCtl:
@@ -287,7 +301,6 @@ class _SessionsCtl:
         await _session_ctl.interrupt(self._studio._service, session_id, creature_id)
 
     async def list_jobs(self, session_id: str, creature_id: str) -> list[dict]:
-        # ``_session_ctl.list_jobs`` is ``async def`` — must be awaited.
         return await _session_ctl.list_jobs(
             self._studio._service, session_id, creature_id
         )
@@ -298,7 +311,6 @@ class _SessionsCtl:
         )
 
     async def promote_job(self, session_id: str, creature_id: str, job_id: str) -> bool:
-        # ``_session_ctl.promote_job`` is ``async def`` — must be awaited.
         return await _session_ctl.promote_job(
             self._studio._service, session_id, creature_id, job_id
         )
@@ -391,4 +403,191 @@ class _SessionsCommand:
     ) -> dict:
         return await _session_command.execute_command(
             self._studio._service, session_id, creature_id, command, args
+        )
+
+
+class _SessionsDrives:
+    """Manage graph-scoped Drive records through ``TerrariumService``.
+
+    Session IDs identify graphs at this boundary. Calls default to the trusted
+    ``user:local`` actor and operator privileges so the Python surface can create
+    and assign Drives. Returned payloads are JSON-safe, and list rows omit
+    sensitive specification and evidence details.
+    """
+
+    def __init__(self, studio: Studio) -> None:
+        self._studio = studio
+
+    @staticmethod
+    def _actor(actor: ActorRef | str | None) -> ActorRef:
+        if isinstance(actor, ActorRef):
+            return actor
+        if isinstance(actor, str) and actor:
+            return ActorRef.parse(actor)
+        return ActorRef("user", "local")
+
+    async def list(
+        self,
+        session_id: str,
+        *,
+        actor: ActorRef | str | None = None,
+        is_privileged: bool = True,
+        statuses: Any = None,
+        kinds: Any = None,
+        owner: Any = None,
+        assignee_creature_id: str | None = None,
+        mine: bool = False,
+        include_terminal: bool = True,
+    ) -> list[dict]:
+        return await _session_drives.list_records(
+            self._studio._service,
+            graph_id=session_id,
+            actor=self._actor(actor),
+            is_privileged=is_privileged,
+            statuses=statuses,
+            kinds=kinds,
+            owner=owner,
+            assignee_creature_id=assignee_creature_id,
+            mine=mine,
+            include_terminal=include_terminal,
+        )
+
+    async def get(
+        self,
+        drive_id: str,
+        *,
+        actor: ActorRef | str | None = None,
+        is_privileged: bool = True,
+    ) -> dict | None:
+        return await _session_drives.get_record(
+            self._studio._service,
+            drive_id,
+            actor=self._actor(actor),
+            is_privileged=is_privileged,
+        )
+
+    async def create(
+        self,
+        session_id: str,
+        body: dict,
+        *,
+        actor: ActorRef | str | None = None,
+        is_privileged: bool = True,
+        operator: bool = True,
+    ) -> dict:
+        return await _session_drives.create_record(
+            self._studio._service,
+            graph_id=session_id,
+            actor=self._actor(actor),
+            body=body,
+            is_privileged=is_privileged,
+            operator=operator,
+        )
+
+    async def update(
+        self,
+        drive_id: str,
+        body: dict,
+        *,
+        expected_revision: int,
+        actor: ActorRef | str | None = None,
+        idempotency_key: str | None = None,
+        is_privileged: bool = True,
+    ) -> dict:
+        return await _session_drives.update_record(
+            self._studio._service,
+            drive_id,
+            expected_revision=expected_revision,
+            actor=self._actor(actor),
+            body=body,
+            idempotency_key=idempotency_key,
+            is_privileged=is_privileged,
+        )
+
+    async def assign(
+        self,
+        drive_id: str,
+        assignee_creature_id: str,
+        assignee_graph_id: str,
+        *,
+        expected_revision: int,
+        actor: ActorRef | str | None = None,
+        is_privileged: bool = True,
+        operator: bool = True,
+    ) -> dict:
+        return await _session_drives.assign_record(
+            self._studio._service,
+            drive_id,
+            assignee_creature_id=assignee_creature_id,
+            assignee_graph_id=assignee_graph_id,
+            expected_revision=expected_revision,
+            actor=self._actor(actor),
+            is_privileged=is_privileged,
+            operator=operator,
+        )
+
+    async def transition(
+        self,
+        drive_id: str,
+        target_status: str,
+        *,
+        expected_revision: int,
+        actor: ActorRef | str | None = None,
+        status_reason: str | None = None,
+        is_privileged: bool = True,
+    ) -> dict:
+        return await _session_drives.transition_record(
+            self._studio._service,
+            drive_id,
+            target_status=target_status,
+            expected_revision=expected_revision,
+            actor=self._actor(actor),
+            status_reason=status_reason,
+            is_privileged=is_privileged,
+        )
+
+    async def report_progress(
+        self,
+        drive_id: str,
+        *,
+        summary: str,
+        evidence: dict | None = None,
+        actor: ActorRef | str | None = None,
+        is_privileged: bool = True,
+    ) -> dict:
+        return await _session_drives.report_progress_record(
+            self._studio._service,
+            drive_id,
+            summary=summary,
+            evidence=evidence,
+            actor=self._actor(actor),
+            is_privileged=is_privileged,
+        )
+
+    async def deliveries(
+        self,
+        drive_id: str,
+        *,
+        actor: ActorRef | str | None = None,
+        is_privileged: bool = True,
+    ) -> list[dict]:
+        return await _session_drives.list_deliveries_records(
+            self._studio._service,
+            drive_id,
+            actor=self._actor(actor),
+            is_privileged=is_privileged,
+        )
+
+    async def replay(
+        self,
+        delivery_id: str,
+        *,
+        actor: ActorRef | str | None = None,
+        is_privileged: bool = True,
+    ) -> dict:
+        return await _session_drives.replay_delivery_record(
+            self._studio._service,
+            delivery_id,
+            actor=self._actor(actor),
+            is_privileged=is_privileged,
         )

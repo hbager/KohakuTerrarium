@@ -77,20 +77,15 @@ class TestMutationOps:
         try:
             creature = adapter._engine.get_creature("alice")
             switched = []
-
-            def switch_model(model):
-                switched.append(model)
-                return f"{model}@reasoning=xhigh"
-
             creature.agent = SimpleNamespace(
                 is_running=False,
-                switch_model=switch_model,
+                switch_model=lambda m: switched.append(m),
                 config=SimpleNamespace(model="old"),
             )
             out = await adapter._dispatch(
                 _msg("switch_model", {"creature_id": "alice", "model": "new"})
             )
-            assert out == {"model": "new@reasoning=xhigh"}
+            assert out == {"model": "new"}
             # Setter path is taken — config is NOT mutated directly.
             assert switched == ["new"]
             assert creature.agent.config.model == "old"
@@ -480,9 +475,11 @@ class TestModuleCatalogOps:
 
             captured = {}
 
-            async def _exec(ag, command, args):
+            async def _exec(ag, command, args, **kwargs):
                 captured["command"] = command
                 captured["args"] = args
+                captured["is_operator"] = kwargs.get("is_operator")
+                captured["principal"] = kwargs.get("principal")
                 return {"ran": command}
 
             orig = mod.agent_execute_command
@@ -495,14 +492,21 @@ class TestModuleCatalogOps:
                             "creature_id": "alice",
                             "command": "status",
                             "args": "verbose",
+                            "principal": "user:7",
+                            "is_operator": True,
                         },
+                        # execute_command is host-only (R1-04): a peer origin is
+                        # rejected, so the trusted control message comes from _host.
+                        sender="_host",
                     )
                 )
             finally:
                 mod.agent_execute_command = orig
             assert out == {"ran": "status"}
-            # The string arg survives _normalize_command_args unchanged.
-            assert captured == {"command": "status", "args": "verbose"}
+            # The string arg survives; host-authorized principal/operator thread.
+            assert captured["command"] == "status" and captured["args"] == "verbose"
+            assert captured["is_operator"] is True
+            assert captured["principal"] == "user:7"
         finally:
             await adapter._engine.shutdown()
 
@@ -537,19 +541,6 @@ class TestPrewarmIdentity:
         finally:
             await engine.shutdown()
 
-    async def test_prewarm_skips_provider_for_no_auth_profile(self):
-        engine = await TestTerrariumBuilder().build()
-        cache = _RecordingIdentityCache(
-            profile={"provider": "opencode-zen", "auth_mode": "none"}
-        )
-        adapter = TerrariumRuntimeAdapter(engine, _FakeNode(), identity_cache=cache)
-        try:
-            config = SimpleNamespace(llm_profile="zen-free", provider="", model="")
-            await adapter._prewarm_identity(config)
-            assert cache.providers == []
-        finally:
-            await engine.shutdown()
-
     async def test_prewarm_falls_back_to_model_prefix(self):
         engine = await TestTerrariumBuilder().build()
         cache = _RecordingIdentityCache()
@@ -559,22 +550,6 @@ class TestPrewarmIdentity:
             config = SimpleNamespace(llm_profile="", provider="", model="openai/gpt-4o")
             await adapter._prewarm_identity(config)
             assert cache.providers == ["openai"]
-        finally:
-            await engine.shutdown()
-
-    async def test_prewarm_inline_no_auth_skips_provider(self):
-        engine = await TestTerrariumBuilder().build()
-        cache = _RecordingIdentityCache()
-        adapter = TerrariumRuntimeAdapter(engine, _FakeNode(), identity_cache=cache)
-        try:
-            config = SimpleNamespace(
-                llm_profile="",
-                provider="opencode-zen",
-                model="deepseek-v4-flash-free",
-                auth_mode="none",
-            )
-            await adapter._prewarm_identity(config)
-            assert cache.providers == []
         finally:
             await engine.shutdown()
 

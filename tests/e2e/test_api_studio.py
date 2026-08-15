@@ -225,11 +225,7 @@ class TestApiStudioJourney:
             _catalog_packages_ops.install_package_op(str(biome_src), editable=True)
             resp = client.get("/api/studio/catalog/plugins")
             assert resp.status_code == 200
-            assert {
-                "cost_tracker",
-                "event_logger",
-                "multimodal_guard",
-            } <= {p["name"] for p in resp.json()}
+            assert "checkpoint" in {p["name"] for p in resp.json()}
             resp = client.get("/api/studio/catalog/inputs")
             assert resp.status_code == 200
             assert "discord_input" in {i["name"] for i in resp.json()}
@@ -549,7 +545,16 @@ class TestApiStudioJourney:
         assert resp.status_code == 200
         plugin_names = {p["name"] for p in resp.json()}
         assert "sandbox" in plugin_names
-        assert all(p["enabled"] is False for p in resp.json())
+        # A Drive-enabled Terrarium turns on its always-on Drive plugins on
+        # every creature (the ``goal`` composition + the ``drive_runtime``
+        # prompt contributor); every other builtin (sandbox, budget, permgate,
+        # …) stays off until explicitly toggled.
+        terrarium_defaults = {"goal", "drive_runtime"}
+        assert all(
+            p["enabled"] is False
+            for p in resp.json()
+            if p["name"] not in terrarium_defaults
+        )
         # The HTTP toggle takes an explicit ``enabled`` — turn it on,
         # confirm via the list, then turn it back off.
         resp = client.post(f"{base}/plugins/sandbox/toggle", json={"enabled": True})
@@ -595,14 +600,50 @@ class TestApiStudioJourney:
             "ping again",
         ]
         assert regen_msgs[-1]["role"] == "assistant"
-        # The branches route is reachable and returns a list payload.
+        # Regeneration records the replaced tail as a child branch.
         resp = client.get(f"{base}/branches")
         assert resp.status_code == 200
-        assert resp.json() == []
+        branches = resp.json()
+        assert len(branches) == 2
+        assert [branch["turn_index"] for branch in branches] == [1, 2]
+        assert [branch["selected"] for branch in branches] == [1, 2]
+        assert branches[1]["branches"][1]["parent_branch_paths"] == [[[1, 1]]]
 
         # Stop the session — flushes + closes the .kohakutr file.
         resp = client.delete(f"/api/sessions/active/{session_id}")
         assert resp.status_code == 200
+        assert client.get("/api/sessions/active").json() == []
+
+        # Stop detaches the runtime but keeps the conversation open and dormant.
+        open_rows = client.get("/api/sessions/open").json()
+        assert len(open_rows) == 1
+        assert open_rows[0]["is_live"] is False
+        conversation_id = open_rows[0]["conversation_id"]
+        saved_name = open_rows[0]["saved_name"]
+
+        # Dormant history stays readable without implicitly resuming it.
+        assert client.get("/api/sessions/active").json() == []
+
+        # Opening a dormant surface uses the saved-session resume path. The
+        # frontend covers the click-to-resume handoff; this journey proves the
+        # backend retains the stable conversation identity across that handoff.
+        resp = client.post(f"/api/sessions/{saved_name}/resume")
+        assert resp.status_code == 200
+        resumed_id = resp.json()["instance_id"]
+        assert [
+            row["session_id"] for row in client.get("/api/sessions/active").json()
+        ] == [resumed_id]
+        resumed_rows = client.get("/api/sessions/open").json()
+        assert len(resumed_rows) == 1
+        assert resumed_rows[0]["conversation_id"] == conversation_id
+        assert resumed_rows[0]["runtime_id"] == resumed_id
+        assert resumed_rows[0]["is_live"] is True
+
+        # Explicit End removes the live runtime and Rail row while preserving
+        # the saved History entry.
+        resp = client.post(f"/api/sessions/open/{conversation_id}/end")
+        assert resp.status_code == 200
+        assert client.get("/api/sessions/open").json() == []
         assert client.get("/api/sessions/active").json() == []
 
         # 13. The stopped session is now a saved session on disk — the
@@ -613,7 +654,7 @@ class TestApiStudioJourney:
         assert resp.status_code == 200
         listing = resp.json()
         assert listing["total"] == 1
-        saved_name = listing["sessions"][0]["name"]
+        assert listing["sessions"][0]["name"] == saved_name
         assert listing["sessions"][0]["agents"] == ["scout"]
         # History index lists the agent target; the per-target read
         # returns its saved metadata.

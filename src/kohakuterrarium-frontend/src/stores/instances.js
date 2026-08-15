@@ -1,5 +1,5 @@
-import { agentAPI, sessionAPI, terrariumAPI } from "@/utils/api"
 import { createVisibilityInterval } from "@/composables/useVisibilityInterval"
+import { agentAPI, sessionAPI, terrariumAPI } from "@/utils/api"
 
 /**
  * Instances store — frontend's mirror of the engine's live sessions.
@@ -40,7 +40,8 @@ export const useInstancesStore = defineStore("instances", {
       if (this._inflightFetch) return this._inflightFetch
       this.loading = true
       const seq = ++this._fetchSeq
-      this._inflightFetch = (async () => {
+      let task
+      task = (async () => {
         try {
           const sessions = await sessionAPI.listActive()
           if (seq !== this._fetchSeq) return
@@ -48,18 +49,28 @@ export const useInstancesStore = defineStore("instances", {
         } catch (err) {
           console.error("Failed to fetch instances:", err)
         } finally {
-          this.loading = false
-          this._inflightFetch = null
+          if (this._inflightFetch === task) {
+            this.loading = false
+            this._inflightFetch = null
+          }
         }
       })()
-      return this._inflightFetch
+      this._inflightFetch = task
+      return task
     },
 
     async fetchOne(id) {
       this.loading = true
+      const seq = this._fetchSeq
       try {
         const data = await sessionAPI.getActive(id)
         const loaded = _mapSession(data)
+        if (seq !== this._fetchSeq) {
+          return (
+            this.list.find((item) => item.id === loaded.id) ??
+            (this.current?.id === loaded.id ? this.current : null)
+          )
+        }
         this.current = loaded
         const idx = this.list.findIndex((item) => item.id === loaded.id)
         if (idx >= 0) {
@@ -69,11 +80,12 @@ export const useInstancesStore = defineStore("instances", {
         }
         return loaded
       } catch (err) {
-        if (err?.response?.status === 404) {
+        if (err?.response?.status === 404 && seq === this._fetchSeq) {
           this.list = this.list.filter((i) => i.id !== id)
           if (this.current?.id === id) this.current = null
           return null
         }
+        if (err?.response?.status === 404) return null
         console.error("Failed to fetch instance:", err)
         throw err
       } finally {
@@ -88,15 +100,13 @@ export const useInstancesStore = defineStore("instances", {
      * Both produce the same Session shape and end up in the same list.
      */
     async create(mode, configPath, pwd, name = null, opts = {}) {
-      const { onNode = "_host", llm = "" } = opts
-      const createOpts = { onNode }
-      if (llm) createOpts.llm = llm
+      const { onNode = "_host" } = opts
       if (mode === "terrarium") {
-        const { terrarium_id } = await terrariumAPI.create(configPath, pwd, name, createOpts)
+        const { terrarium_id } = await terrariumAPI.create(configPath, pwd, name, { onNode })
         await this.fetchAll()
         return terrarium_id
       }
-      const { agent_id, session_id } = await agentAPI.create(configPath, pwd, name, createOpts)
+      const { agent_id, session_id } = await agentAPI.create(configPath, pwd, name, { onNode })
       await this.fetchAll()
       // Prefer the canonical session_id when the backend surfaces it
       // (newer paths do), otherwise fall back to the historical
@@ -105,15 +115,12 @@ export const useInstancesStore = defineStore("instances", {
       return session_id || agent_id
     },
 
-    async stop(id) {
-      try {
-        await sessionAPI.stopActive(id)
-        this.list = this.list.filter((i) => i.id !== id)
-        if (this.current?.id === id) this.current = null
-      } catch (err) {
-        console.error("Failed to stop instance:", err)
-        throw err
-      }
+    markRuntimeStopped(id) {
+      ++this._fetchSeq
+      this._inflightFetch = null
+      this.loading = false
+      this.list = this.list.filter((i) => i.id !== id)
+      if (this.current?.id === id) this.current = null
     },
 
     startPolling() {
@@ -166,8 +173,7 @@ function _mapSession(data) {
     compact_threshold: c.compact_threshold || 0,
     listen_channels: c.listen_channels || [],
     send_channels: c.send_channels || [],
-    is_privileged: !!c.is_privileged,
-    is_root: !!data.has_root && !!(c.is_root || c.is_privileged),
+    is_root: !!c.is_root,
     // Per-creature lab cluster site; fall back to session-level home.
     home_node: c.home_node || sessionHome,
   }))

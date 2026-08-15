@@ -7,37 +7,9 @@
 import { onBeforeUnmount, ref, shallowRef, watch } from "vue"
 import MarkdownIt from "markdown-it"
 import markdownItKatex from "@vscode/markdown-it-katex"
-import hljs from "highlight.js/lib/core"
-import bash from "highlight.js/lib/languages/bash"
-import css from "highlight.js/lib/languages/css"
-import javascript from "highlight.js/lib/languages/javascript"
-import json from "highlight.js/lib/languages/json"
-import markdown from "highlight.js/lib/languages/markdown"
-import python from "highlight.js/lib/languages/python"
-import typescript from "highlight.js/lib/languages/typescript"
-import xml from "highlight.js/lib/languages/xml"
+import hljs from "highlight.js"
 
-hljs.registerLanguage("bash", bash)
-hljs.registerLanguage("css", css)
-hljs.registerLanguage("javascript", javascript)
-hljs.registerLanguage("json", json)
-hljs.registerLanguage("markdown", markdown)
-hljs.registerLanguage("python", python)
-hljs.registerLanguage("typescript", typescript)
-hljs.registerLanguage("xml", xml)
-
-const HIGHLIGHT_ALIASES = {
-  html: "xml",
-  js: "javascript",
-  jsx: "javascript",
-  md: "markdown",
-  sh: "bash",
-  shell: "bash",
-  ts: "typescript",
-  tsx: "typescript",
-  vue: "xml",
-  zsh: "bash",
-}
+import { IncrementalMarkdownRenderer } from "@/utils/markdownIncremental"
 
 const props = defineProps({
   content: { type: String, default: "" },
@@ -57,12 +29,11 @@ const md = new MarkdownIt({
   breaks: props.breaks,
   highlight(str, lang) {
     const displayLang = lang || "text"
-    const language = HIGHLIGHT_ALIASES[lang] || lang
-    const langClass = language && hljs.getLanguage(language) ? language : ""
+    const langClass = lang && hljs.getLanguage(lang) ? lang : ""
     let highlighted
     if (langClass) {
       try {
-        highlighted = hljs.highlight(str, { language: langClass }).value
+        highlighted = hljs.highlight(str, { language: lang }).value
       } catch {
         highlighted = md.utils.escapeHtml(str)
       }
@@ -186,6 +157,10 @@ function renderMarkdown(content) {
   }
 }
 
+// Reuse rendered HTML for the unchanged block prefix of streamed content;
+// only the changed tail block re-renders each throttle window.
+const incremental = new IncrementalMarkdownRenderer(renderMarkdown)
+
 /*
  * Throttled rendering.
  *
@@ -213,9 +188,10 @@ let pendingContent = null
 function doRender(content) {
   if (!content) {
     rendered.value = ""
+    incremental.reset()
     return
   }
-  rendered.value = renderMarkdown(preprocessLatex(content))
+  rendered.value = incremental.render(preprocessLatex(content))
   lastRenderAt = performance.now()
 }
 

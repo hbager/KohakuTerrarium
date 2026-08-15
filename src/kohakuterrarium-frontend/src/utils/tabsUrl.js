@@ -13,15 +13,7 @@
  * source of truth even when a registered plugin has unloaded).
  */
 
-const SINGLETONS = new Set([
-  "dashboard",
-  "catalog",
-  "extensions",
-  "settings",
-  "saved-sessions",
-  "stats",
-  "graph-editor",
-])
+const SINGLETONS = new Set(["dashboard", "catalog", "settings", "saved-sessions", "stats"])
 
 /** Encode the tab list and active id into a query-string fragment. */
 export function encodeTabsToQuery(tabs, activeId) {

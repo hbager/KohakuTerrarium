@@ -152,13 +152,14 @@
 
 <script setup>
 import { ElMessage, ElMessageBox } from "element-plus"
+import { openSavedSessionHistory, prepareWorkspaceResume } from "@/utils/workdirPrompt"
 
 import BuildEmbeddingsModal from "@/components/sessions/modals/BuildEmbeddingsModal.vue"
 import GemBadge from "@/components/common/GemBadge.vue"
 import { useInstancesStore } from "@/stores/instances"
 import { GEM } from "@/utils/colors"
 import { useI18n } from "@/utils/i18n"
-import { sessionAPI } from "@/utils/api"
+import { sessionAPI, terrariumAPI } from "@/utils/api"
 import { extractTextPreview } from "@/utils/multimodal"
 
 function previewText(session, limit = 200) {
@@ -252,7 +253,20 @@ function viewSession(session) {
 async function resumeSession(session) {
   resuming.value = session.name
   try {
-    const result = await sessionAPI.resume(session.name)
+    const onNode = session.on_node || session.home_node || session.node_id
+    const prepared = await prepareWorkspaceResume(session.name, { onNode })
+    if (prepared.action !== "resume") {
+      if (prepared.action === "history") openSavedSessionHistory(session.name)
+      return
+    }
+    const result = await sessionAPI.resume(session.name, {
+      onNode,
+      members: prepared.members,
+      workspaceOverrides: prepared.workspaceOverrides,
+      memberWorkspaceOverrides: prepared.memberWorkspaceOverrides,
+      memberPwdOverrides: prepared.memberPwdOverrides,
+      pwd: prepared.pwd,
+    })
     await instances.fetchAll()
     ElMessage.success(t("sessions.resumed", { name: session.name }))
     if (typeof props.onResume === "function") {

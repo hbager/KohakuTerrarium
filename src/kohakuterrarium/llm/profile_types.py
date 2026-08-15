@@ -12,21 +12,7 @@ _LEGACY_BACKEND_TYPES = {
 
 @dataclass
 class LLMBackend:
-    """Reusable concrete provider profile.
-
-    ``provider_name`` is the compatibility key that provider-native tools
-    match against (``BaseTool.provider_support``). Built-in backends
-    default to their own name (``codex``, ``openai``, …); custom
-    backends default to the backend's own ``name`` unless the user
-    explicitly sets something else (e.g. ``codex`` to masquerade as
-    Codex for tool-compat purposes on a ChatGPT-Enterprise endpoint).
-
-    ``provider_native_tools`` is the set of builtin tool names the user
-    has opted into for this backend. Runtime auto-injects these tools
-    when the active LLM profile resolves through this backend; tools
-    not listed here are never injected, even if the active provider
-    class (e.g. ``CodexOAuthProvider``) advertises them globally.
-    """
+    """Provider transport and native-tool compatibility configuration."""
 
     name: str
     backend_type: str
@@ -34,7 +20,6 @@ class LLMBackend:
     api_key_env: str = ""
     provider_name: str = ""
     provider_native_tools: list[str] = field(default_factory=list)
-    auth_mode: str = "api_key"
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {"backend_type": self.backend_type}
@@ -42,8 +27,6 @@ class LLMBackend:
             data["base_url"] = self.base_url
         if self.api_key_env:
             data["api_key_env"] = self.api_key_env
-        if self.auth_mode != "api_key":
-            data["auth_mode"] = self.auth_mode
         if self.provider_name:
             data["provider_name"] = self.provider_name
         if self.provider_native_tools:
@@ -60,7 +43,6 @@ class LLMBackend:
             backend_type=data.get("backend_type") or data.get("provider", "openai"),
             base_url=data.get("base_url", ""),
             api_key_env=data.get("api_key_env", ""),
-            auth_mode=data.get("auth_mode", "api_key") or "api_key",
             provider_name=data.get("provider_name", ""),
             provider_native_tools=[str(tool) for tool in native_tools if tool],
         )
@@ -124,15 +106,7 @@ class LLMPreset:
 
 @dataclass
 class LLMProfile:
-    """Resolved runtime LLM configuration.
-
-    ``backend_provider_name`` and ``backend_native_tools`` are carried
-    through from :class:`LLMBackend` so ``bootstrap/llm.py`` can stamp
-    them onto the constructed LLM provider instance (see
-    :meth:`LLMBackend.provider_name` and
-    :meth:`LLMBackend.provider_native_tools`). These control which
-    provider-native tools auto-inject into the agent's tool registry.
-    """
+    """Resolved model, transport, variation, and native-tool runtime settings."""
 
     name: str
     model: str
@@ -150,7 +124,6 @@ class LLMProfile:
     selected_variations: dict[str, str] = field(default_factory=dict)
     backend_provider_name: str = ""
     backend_native_tools: list[str] = field(default_factory=list)
-    auth_mode: str = "api_key"
 
     @classmethod
     def from_dict(cls, name: str, data: dict[str, Any]) -> "LLMProfile":
@@ -171,7 +144,6 @@ class LLMProfile:
             max_output=data.get("max_output", 65536),
             base_url=data.get("base_url", ""),
             api_key_env=data.get("api_key_env", ""),
-            auth_mode=data.get("auth_mode", "api_key") or "api_key",
             temperature=data.get("temperature"),
             reasoning_effort=data.get("reasoning_effort", ""),
             service_tier=data.get("service_tier", ""),
@@ -196,8 +168,6 @@ class LLMProfile:
             data["base_url"] = self.base_url
         if self.api_key_env:
             data["api_key_env"] = self.api_key_env
-        if self.auth_mode != "api_key":
-            data["auth_mode"] = self.auth_mode
         if self.temperature is not None:
             data["temperature"] = self.temperature
         if self.reasoning_effort:

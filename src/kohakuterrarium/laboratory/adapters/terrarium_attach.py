@@ -1,36 +1,10 @@
-"""APP extension adapter for ``terrarium.attach`` — WS-frame proxy.
-
-Subclass of :class:`WSProxyAdapter` (the unified ws-forwarder in
-``laboratory/ws_proxy.py``).  Mirrors the host-side
-``studio.attach.io.attach_io`` behaviour over the Lab transport: the
-controller's frontend WebSocket gets the FULL event stream from a
-remote creature — tokens, tool calls, sub-agent events, channel
-messages, processing markers, interactive UI events.
-
-Lifecycle for a single attach session (``stream_id``):
-
-1. Controller opens the lab stream via ``terrarium.attach.start``
-   with body ``{creature_id, session_id}``.  This adapter resolves
-   the creature, attaches a :class:`StreamOutput` to its
-   ``output_router``, subscribes siblings in the same graph, and
-   registers shared-channel callbacks.  All four sinks pump frames
-   into the same ``WSFrameSink``.  Returns the initial
-   ``session_info`` frame under the ``setup`` key so the controller
-   forwards it BEFORE the first streamed frame.
-2. Controller forwards every WS frame to
-   ``terrarium.attach.input``; a consumer task on this side awaits
-   ``sink.receive_json()`` and dispatches by ``frame.type``:
-   ``input`` → fire-and-forget ``agent.inject_input``, ``ui_reply`` →
-   ``output_router.submit_reply_with_status`` + echo ``ui_reply_ack``,
-   ``ui_dismiss`` → noop.
-3. ``terrarium.attach.cancel`` (or RemoteStream.aclose) tears down
-   every sink, removes channel callbacks, and stops the consumer.
-"""
+"""Bridge remote creature attach sessions to WebSocket frame streams."""
 
 import asyncio
 import time
 from typing import Any
 
+from kohakuterrarium.core.pending_input import new_pending_id
 from kohakuterrarium.laboratory.protocols import LabRegistrar
 from kohakuterrarium.laboratory.ws_proxy import WSFrameSink, WSProxyAdapter
 from kohakuterrarium.llm.message import (
@@ -124,7 +98,7 @@ class TerrariumAttachAdapter(WSProxyAdapter):
         primary = StreamOutput(creature.name, queue_shim, log, agent=agent)  # type: ignore[arg-type]
         agent.output_router.add_secondary(primary)
 
-        # Sibling subscribe — mirrors the host attach for terrarium graphs.
+        # A graph attach includes sibling output so the remote view matches a local attach.
         sibling_modules: list[tuple[Any, Any]] = []
         if creature.graph_id and creature.graph_id in self._engine._topology.graphs:
             graph = self._engine._topology.graphs[creature.graph_id]
@@ -141,7 +115,7 @@ class TerrariumAttachAdapter(WSProxyAdapter):
                 sibling.agent.output_router.add_secondary(sib_module)
                 sibling_modules.append((sibling.agent, sib_module))
 
-        # Channel callbacks + history replay.
+        # Replay precedes live delivery so an attach starts with a coherent channel view.
         channel_cbs = self._register_channel_callbacks(creature.graph_id, sink)
         self._replay_channel_history(creature.graph_id, sink)
 
@@ -170,10 +144,6 @@ class TerrariumAttachAdapter(WSProxyAdapter):
         if session is not None:
             session.teardown()
 
-    # ------------------------------------------------------------------
-    # Consumer — pulls inbound frames from the sink and dispatches.
-    # ------------------------------------------------------------------
-
     async def _consume_input(
         self,
         sink: WSFrameSink,
@@ -185,14 +155,11 @@ class TerrariumAttachAdapter(WSProxyAdapter):
                 frame = await sink.receive_json()
                 frame_type = frame.get("type")
                 if frame_type == "ui_reply":
-                    self._handle_ui_reply(sink, agent, creature.name, frame)
+                    self._handle_ui_reply(sink, creature, frame)
                     continue
                 if frame_type == "ui_dismiss":
                     continue
-                if frame_type != "input":
-                    continue
-                content = _normalize_input_content(frame)
-                if not content:
+                if frame_type not in {"input", "input_edit", "input_cancel"}:
                     continue
                 target_name = (frame.get("target") or "").strip()
                 target_agent = agent
@@ -214,23 +181,39 @@ class TerrariumAttachAdapter(WSProxyAdapter):
                         continue
                     target_agent = sibling.agent
                     target_name_eff = sibling.name
+                if frame_type in {"input_edit", "input_cancel"}:
+                    self._handle_pending_op(
+                        sink,
+                        target_agent,
+                        frame,
+                        frame_type,
+                        target_name_eff,
+                    )
+                    continue
+                content = _normalize_input_content(frame)
+                if not content:
+                    continue
+                pending_id = (frame.get("event_id") or "").strip() or new_pending_id()
                 sink.send_json_nowait(
                     {
                         "type": "user_input",
                         "source": target_name_eff,
                         "content": content,
+                        "event_id": pending_id,
                         "ts": time.time(),
                     }
                 )
                 asyncio.create_task(
-                    self._process_input(sink, target_agent, content, target_name_eff)
+                    self._process_input(
+                        sink,
+                        target_agent,
+                        content,
+                        target_name_eff,
+                        pending_id,
+                    )
                 )
         except asyncio.CancelledError:
             raise
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
 
     def _register_channel_callbacks(
         self, graph_id: str, sink: WSFrameSink
@@ -310,13 +293,21 @@ class TerrariumAttachAdapter(WSProxyAdapter):
     def _handle_ui_reply(
         self,
         sink: WSFrameSink,
-        agent: Any,
-        creature_name: str,
+        creature: Any,
         frame: dict,
     ) -> None:
         event_id = frame.get("event_id")
         if not isinstance(event_id, str) or not event_id:
             return
+        # Replies must reach the creature that raised the prompt; otherwise its
+        # pending interaction remains unresolved. Unknown targets fall back to
+        # the attached creature for compatibility with untargeted clients.
+        target = creature
+        target_name = (frame.get("target") or "").strip()
+        if target_name and target_name != creature.name:
+            sibling = self._find_sibling_by_name(creature, target_name)
+            if sibling is not None:
+                target = sibling
         reply = UIReply(
             event_id=event_id,
             action_id=frame.get("action_id", ""),
@@ -329,7 +320,7 @@ class TerrariumAttachAdapter(WSProxyAdapter):
             ),
         )
         try:
-            _ok, ack_status = agent.output_router.submit_reply_with_status(reply)
+            _ok, ack_status = target.agent.output_router.submit_reply_with_status(reply)
         except Exception:
             logger.warning("submit_reply failed", exc_info=True)
             ack_status = "unknown"
@@ -338,8 +329,38 @@ class TerrariumAttachAdapter(WSProxyAdapter):
                 "type": "ui_reply_ack",
                 "event_id": event_id,
                 "status": ack_status,
-                "source": creature_name,
+                "source": target.name,
                 "ts": time.time(),
+            }
+        )
+
+    @staticmethod
+    def _handle_pending_op(
+        sink: WSFrameSink,
+        agent: Any,
+        frame: dict[str, Any],
+        frame_type: str,
+        source_name: str,
+    ) -> None:
+        event_id = (frame.get("event_id") or "").strip()
+        committed = False
+        if event_id:
+            if frame_type == "input_edit":
+                committed = agent.edit_pending(
+                    event_id, _normalize_input_content(frame)
+                )
+            else:
+                committed = agent.cancel_pending(event_id)
+        sink.send_json_nowait(
+            {
+                "type": f"{frame_type}_ack",
+                "source": source_name,
+                "event_id": event_id,
+                "status": (
+                    "edited"
+                    if committed and frame_type == "input_edit"
+                    else "cancelled" if committed else "already_sent"
+                ),
             }
         )
 
@@ -349,9 +370,14 @@ class TerrariumAttachAdapter(WSProxyAdapter):
         agent: Any,
         content: Any,
         source_name: str,
+        pending_id: str,
     ) -> None:
         try:
-            await agent.inject_input(content, source="web")
+            dispatched = await agent.inject_input(
+                content,
+                source="web",
+                pending_id=pending_id,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -360,6 +386,16 @@ class TerrariumAttachAdapter(WSProxyAdapter):
                     "type": "error",
                     "source": source_name,
                     "content": str(e),
+                    "ts": time.time(),
+                }
+            )
+            return
+        if dispatched is False:
+            sink.send_json_nowait(
+                {
+                    "type": "input_queued",
+                    "source": source_name,
+                    "event_id": pending_id,
                     "ts": time.time(),
                 }
             )

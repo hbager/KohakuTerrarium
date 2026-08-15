@@ -1,20 +1,14 @@
 """Reusable variation-group blocks for built-in LLM presets.
 
-Split out of :mod:`presets` to keep that module under the file-size
-guard (same treatment as :mod:`preset_aliases`). Each block declares the
-canonical knob shape once — presets inline them via ``**`` splat or
-direct reference — which avoids copy-paste drift across entries.
+Define reusable provider-specific option groups for model presets.
 
-Values were researched against the relevant provider docs (effective
-2026-07-10); per-block provenance notes inline.
+Each group centralizes a wire-format knob so presets cannot drift through
+copy-pasted option dictionaries.
 """
 
 from typing import Any
 
-# Codex OAuth (ChatGPT-subscription): top-level ``reasoning_effort`` field.
-# Per the 2026-07 Codex models docs the effort scale is
-# ``low | medium | high | xhigh`` (``medium`` is the default; ``none`` is
-# no longer listed on the Codex side — it remains a direct-API value).
+# Codex OAuth accepts a top-level effort value; unlike the direct API, it omits none.
 _CODEX_REASONING_GROUP: dict[str, dict[str, Any]] = {
     "low": {"reasoning_effort": "low"},
     "medium": {"reasoning_effort": "medium"},
@@ -22,43 +16,41 @@ _CODEX_REASONING_GROUP: dict[str, dict[str, Any]] = {
     "xhigh": {"reasoning_effort": "xhigh"},
 }
 
-# GPT-5.6 adds ``max`` and, on Sol/Terra only, ``ultra`` ("maximum
-# reasoning with automatic task delegation"). Verified against the Codex
-# CLI model catalog (codex-rs/models-manager/models.json, 2026-07-10):
-#   Sol / Terra: low | medium | high | xhigh | max | ultra
-#   Luna:        low | medium | high | xhigh | max   (no ultra)
-#
-# ``ultra`` is NOT a wire value — the API 400s on the literal string
-# (``Invalid value: 'ultra'``). The Codex CLI rewrites Ultra → Max before
-# sending (core/src/client.rs ``reasoning_effort_for_request``) and uses
-# the ultra *setting* only to flip its client-side multi-agent mode to
-# "proactive" (core/src/session/multi_agents.rs). We mirror that: the
-# ``ultra`` option sends ``max``; the delegation half lives in the Codex
-# harness and cannot be requested via the API.
+# GPT-5.6 adds max. Ultra is a Codex CLI orchestration mode, not a wire value,
+# so API-facing groups stop at max and Luna shares the same accepted values.
 _GPT56_REASONING_GROUP: dict[str, dict[str, Any]] = {
     "low": {"reasoning_effort": "low"},
     "medium": {"reasoning_effort": "medium"},
     "high": {"reasoning_effort": "high"},
     "xhigh": {"reasoning_effort": "xhigh"},
     "max": {"reasoning_effort": "max"},
-    "ultra": {"reasoning_effort": "max"},
 }
 
 _GPT56_LUNA_REASONING_GROUP: dict[str, dict[str, Any]] = {
     key: patch for key, patch in _GPT56_REASONING_GROUP.items() if key != "ultra"
 }
 
-# Codex "fast mode" on GPT-5.4 / GPT-5.5 / GPT-5.6.
-#
-# The API accepts ``service_tier="priority"`` (Priority processing — the only
-# valid non-default tier values are ``priority`` and ``default``). The Codex
-# CLI's own ``config.toml`` uses a separate ``[features].fast_mode = true``
-# flag + ``service_tier = "fast"`` literal that the CLI translates into the
-# API-level priority header — the literal ``"fast"`` value is NOT accepted
-# by the OpenAI API itself (observed: 400 ``Unsupported service_tier: fast``).
+# Codex fast mode maps to the API's priority tier; the literal fast tier is invalid.
 _CODEX_SPEED_GROUP: dict[str, dict[str, Any]] = {
     "normal": {},
     "fast": {"service_tier": "priority"},
+}
+
+# GPT-5.6 execution mode: ``reasoning.mode = standard | pro`` on the Responses
+# API, independent of ``reasoning.effort``. Exposed on every 5.6 route; note
+# the Codex OAuth backend currently rejects ``pro`` ("`reasoning.mode` is not
+# supported with this model", probed 2026-07), which surfaces as a request
+# error until OpenAI enables it there.
+_GPT56_MODE_GROUP: dict[str, dict[str, Any]] = {
+    "standard": {},
+    "pro": {"extra_body.reasoning.mode": "pro"},
+}
+
+# OpenAI direct fast mode: same priority tier the codex speed group maps to.
+# GPT-5.4/5.5/5.6 support it; the mini/nano tiers do not expose it.
+_OPENAI_SPEED_GROUP: dict[str, dict[str, Any]] = {
+    "normal": {},
+    "fast": {"extra_body.service_tier": "priority"},
 }
 
 # OpenAI direct API reasoning: extra_body.reasoning.effort. Full scale per
@@ -93,7 +85,7 @@ _OR_REASONING_GROUP: dict[str, dict[str, Any]] = {
     "high": {"extra_body.reasoning.effort": "high"},
 }
 
-# Same as above plus xhigh, for the models that actually honor it.
+# Keep xhigh separate because many OpenRouter models silently clamp it to high.
 _OR_REASONING_GROUP_WITH_XHIGH: dict[str, dict[str, Any]] = {
     **_OR_REASONING_GROUP,
     "xhigh": {"extra_body.reasoning.effort": "xhigh"},
@@ -157,7 +149,7 @@ _GEMINI_THINKING_GROUP_WITH_MINIMAL: dict[str, dict[str, Any]] = {
     **_GEMINI_THINKING_GROUP,
 }
 
-# Flash-Lite does not accept HIGH.
+# Flash-Lite omits HIGH from its accepted thinking levels.
 _GEMINI_THINKING_LITE_GROUP: dict[str, dict[str, Any]] = {
     "minimal": {"extra_body.google.thinking_config.thinking_level": "MINIMAL"},
     "low": {"extra_body.google.thinking_config.thinking_level": "LOW"},

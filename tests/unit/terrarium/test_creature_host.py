@@ -7,6 +7,7 @@ import pytest
 from kohakuterrarium.builtins.inputs.none import NoneInput
 from kohakuterrarium.builtins.outputs.none import NoneOutput
 from kohakuterrarium.builtins.outputs.stdout import StdoutOutput
+from kohakuterrarium.modules.trigger.base import BaseTrigger
 from kohakuterrarium.terrarium.creature_host import Creature, build_creature
 from kohakuterrarium.testing.llm import ScriptedLLM
 from kohakuterrarium.testing.terrarium import _FakeAgent
@@ -36,6 +37,53 @@ class TestBuildCreatureLLMInjection:
         scripted = ScriptedLLM(["hi"])
         creature = build_creature(str(tmp_path), llm=scripted, io="none")
         assert creature.agent.llm is scripted
+        assert creature.agent.plugins.is_enabled("goal")
+        assert (
+            sum(
+                plugin["name"] == "goal"
+                for plugin in creature.agent.plugins.list_plugins()
+            )
+            == 1
+        )
+
+
+# ── warm pause + kill markers (UXI-11) ─────────────────────────
+
+
+class TestCreatureLifecycleMarkers:
+    def test_pause_resume_delegate_to_agent(self):
+        agent = _FakeAgent(name="w")
+        agent._paused = False
+        agent.pause = lambda: setattr(agent, "_paused", True)
+        agent.resume = lambda: setattr(agent, "_paused", False)
+        c = _creature(name="w", agent=agent)
+        assert c.paused is False
+        c.pause()
+        assert c.paused is True
+        c.resume()
+        assert c.paused is False
+
+    async def test_killed_marker_reset_on_start(self):
+        agent = _FakeAgent(name="w")
+        c = _creature(name="w", agent=agent)
+        assert c.killed is False
+        c._killed = True
+        assert c.killed is True
+        # A fresh start clears the killed marker.
+        await c.start()
+        try:
+            assert c.killed is False
+        finally:
+            await c.stop()
+
+    def test_get_status_reports_paused_and_killed(self):
+        agent = _FakeAgent(name="w")
+        agent._paused = True
+        c = _creature(name="w", agent=agent)
+        c._killed = True
+        status = c.get_status()
+        assert status["paused"] is True
+        assert status["killed"] is True
 
 
 # ── typed turn drivers on Creature (E3) ────────────────────────
@@ -140,12 +188,62 @@ class TestStartStop:
         await c.start()
         await c.stop()
         assert c._running is False
+        assert c.stop_requested
+
+    async def test_only_explicit_start_clears_stop_intent(self):
+        c = _creature()
+        await c.start()
+        await c.stop()
+        assert c.stop_requested
+
+        await c.start(requested=False)
+        assert c.stop_requested
+        await c.stop(requested=False)
+        assert c.stop_requested
+
+        await c.start()
+        assert not c.stop_requested
+        await c.stop()
+
+    async def test_natural_idle_requires_no_turn_or_background_work(self):
+        c = _creature()
+        await c.start()
+        c._running = False
+        c.agent._running = False
+        assert c.is_naturally_idle()
+
+        c.agent._active_handles = {"direct": object()}
+        assert not c.is_naturally_idle()
+        c.agent._active_handles.clear()
+
+        c.agent._event_inbox = asyncio.Queue()
+        c.agent._event_inbox.put_nowait(object())
+        assert not c.is_naturally_idle()
+        c.agent._event_inbox.get_nowait()
+
+        c.agent._processing_task = asyncio.create_task(asyncio.sleep(1))
+        assert not c.is_naturally_idle()
+        c.agent._processing_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await c.agent._processing_task
 
     async def test_is_running_property(self):
         c = _creature()
-        assert c.is_running is False
+        assert c.is_running is False  # not_started
         await c.start()
-        # _FakeAgent.is_running is also True after start.
+        # is_running is a shortcut over status: idle/busy → True.
+        assert c.is_running is True
+
+    async def test_input_loop_exit_keeps_creature_message_eligible(self):
+        # The creature-host _running flag flips when its _drive_input task
+        # idles out, but the agent stays alive. is_running derives from status
+        # (agent liveness), so the creature stays "idle" and message-eligible
+        # rather than falsely reporting "not running" to group_send.
+        c = _creature()
+        await c.start()
+        assert c.is_running is True
+        c._running = False  # _drive_input idled out; agent still alive
+        assert c.status == "idle"
         assert c.is_running is True
 
     async def test_drive_input_skipped_when_absent(self):
@@ -153,6 +251,45 @@ class TestStartStop:
         c = _creature()
         await c.start()
         assert c._input_task is None
+
+    async def test_failed_agent_start_rolls_back_partial_resources(self, tmp_path):
+        class FailingTrigger(BaseTrigger):
+            def __init__(self):
+                super().__init__()
+                self.stop_calls = 0
+
+            async def _on_start(self):
+                raise RuntimeError("startup failed")
+
+            async def _on_stop(self):
+                self.stop_calls += 1
+
+            async def wait_for_trigger(self):
+                await asyncio.Event().wait()
+
+        (tmp_path / "config.yaml").write_text(
+            "name: failing\ninput:\n  type: none\noutput:\n  type: none\n",
+            encoding="utf-8",
+        )
+        creature = build_creature(
+            str(tmp_path), llm=ScriptedLLM(["unused"]), io="headless"
+        )
+        trigger = FailingTrigger()
+        await creature.agent.trigger_manager.add(
+            trigger, trigger_id="failing", autostart=False
+        )
+
+        with pytest.raises(RuntimeError, match="startup failed"):
+            await creature.start()
+
+        assert trigger.is_running is False
+        assert trigger.stop_calls == 1
+        assert creature.agent.is_running is False
+        assert creature.is_running is False
+        assert creature.restoration_state == "added"
+
+        await creature.stop()
+        assert trigger.stop_calls == 1
 
 
 # ── inject_input ──────────────────────────────────────────────
@@ -429,6 +566,117 @@ class TestReapInputTask:
         await c._reap_input_task()
         # Reaped.
         assert c._input_task is None
+
+
+# ── restoration barrier (design §6.5, Phase E) ────────────────
+
+
+class _BarrierAgent(_FakeAgent):
+    """Fake agent that exposes the ``_startup_settled`` observable."""
+
+    def __init__(self, name="barrier"):
+        super().__init__(name=name)
+        self._startup_settled = asyncio.Event()
+
+
+class TestRestorationBarrier:
+    async def test_starts_at_added(self):
+        c = _creature()
+        assert c.restoration_state == "added"
+        assert c.restoration_ready is False
+
+    async def test_fresh_creature_reaches_ready_when_no_startup(self):
+        # A fake agent with no startup-settle observable is treated as
+        # settled at once — a session-less fresh creature is promptly ready.
+        c = _creature()
+        await c.start()
+        await c.wait_restoration_ready()
+        assert c.restoration_state == "restoration_ready"
+        assert c.restoration_ready is True
+        await c.stop()
+
+    async def test_barrier_waits_for_startup_settlement(self):
+        agent = _BarrierAgent()
+        c = _creature(agent=agent)
+        await c.start()
+        await asyncio.sleep(0)  # let the barrier task reach the wait
+        # Startup has not settled — the barrier is not crossed yet.
+        assert c.restoration_state == "started"
+        assert c.restoration_ready is False
+        agent._startup_settled.set()
+        await c.wait_restoration_ready()
+        assert c.restoration_ready is True
+        await c.stop()
+
+    async def test_stop_resets_barrier(self):
+        c = _creature()
+        await c.start()
+        await c.wait_restoration_ready()
+        await c.stop()
+        # Stop tears the barrier down — a restart must re-arm it.
+        assert c.restoration_ready is False
+        assert c.restoration_state == "added"
+
+    async def test_restart_rearms_barrier(self):
+        agent = _BarrierAgent()
+        c = _creature(agent=agent)
+        await c.start()
+        agent._startup_settled.set()
+        await c.wait_restoration_ready()
+        await c.stop()
+        # Fresh cycle: the observable is re-cleared by agent.start(), so a
+        # new barrier gates the second run.
+        agent._startup_settled.clear()
+        await c.start()
+        await asyncio.sleep(0)
+        assert c.restoration_ready is False
+        agent._startup_settled.set()
+        await c.wait_restoration_ready()
+        assert c.restoration_ready is True
+        await c.stop()
+
+
+# ── inject_event (public creature ingress) ────────────────────
+
+
+class TestInjectEvent:
+    def _cfg(self, tmp_path):
+        (tmp_path / "config.yaml").write_text(
+            "name: injc\ninput:\n  type: none\noutput:\n  type: none\n",
+            encoding="utf-8",
+        )
+        return str(tmp_path)
+
+    async def test_runs_event_and_echoes_correlation(self, tmp_path):
+        from kohakuterrarium.core.events import TriggerEvent
+
+        c = build_creature(
+            self._cfg(tmp_path), llm=ScriptedLLM(["drive done"]), io="headless"
+        )
+        await c.start()
+        try:
+            event = TriggerEvent(
+                type="drive_ready", content="pursue", context={}, stackable=False
+            )
+            result = await c.inject_event(event, correlation_id="d-7")
+            assert result.status == "ok"
+            assert "drive done" in result.text
+            assert result.correlation_id == "d-7"
+        finally:
+            await c.stop()
+
+    async def test_rejects_when_stopped_not_silently(self, tmp_path):
+        from kohakuterrarium.core.events import TriggerEvent
+
+        c = build_creature(
+            self._cfg(tmp_path), llm=ScriptedLLM(["never"]), io="headless"
+        )
+        # Never started — the event must not run.
+        event = TriggerEvent(type="drive_ready", content="x", stackable=False)
+        result = await c.inject_event(event, correlation_id="d-1")
+        assert result.status == "rejected"
+        assert result.correlation_id == "d-1"
+        assert result.text == ""
 
 
 class TestApplyCreatureName:

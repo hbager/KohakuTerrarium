@@ -26,7 +26,6 @@ from kohakuterrarium.builtins.inputs.none import NoneInput
 from kohakuterrarium.builtins.tui.input import TUIInput
 from kohakuterrarium.builtins.tui.output import TUIOutput
 from kohakuterrarium.builtins.tui.session import TUISession
-from kohakuterrarium.builtins.tui.widgets import ChatInput
 from kohakuterrarium.core.session import get_session
 from kohakuterrarium.builtins.user_commands import (
     get_builtin_user_command,
@@ -34,13 +33,17 @@ from kohakuterrarium.builtins.user_commands import (
 )
 from kohakuterrarium.core.channel import BaseChannel, ChannelMessage
 from kohakuterrarium.modules.input.base import InputModule
-from kohakuterrarium.modules.user_command.base import (
-    UserCommandContext,
-    parse_slash_command,
-)
+from kohakuterrarium.modules.user_command.base import parse_slash_command
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.engine import Terrarium
+from kohakuterrarium.terrarium.engine_cli_commands import (
+    _build_command_aliases,
+    _dispatch_active_engine_command,
+    _engine_command_context,
+)
 from kohakuterrarium.terrarium.events import EventFilter, EventKind
+from kohakuterrarium.terrarium.service import LocalTerrariumService
+from kohakuterrarium.utils.async_utils import cancel_tasks
 from kohakuterrarium.utils.logging import get_logger, restore_logging, suppress_logging
 
 logger = get_logger(__name__)
@@ -52,13 +55,9 @@ async def _handle_tui_slash(text: str, tui: "TUISession", focus: Any) -> bool:
     Returns True if the slash was handled (caller should ``continue``);
     False to fall through to the standard agent slash dispatch.
 
-    Mirrors ``cli_rich/app.py:RichCLIApp._handle_slash`` for TUI mode.
-    The old design routed this via ``TUIInput.try_user_command`` →
-    ``_intercept_module`` / ``_intercept_model``, which required the
-    agent's input to BE TUIInput. With the input swap to NoneInput
-    (stdin-contention fix), that path is gone — so the dispatch moves
-    here, the runner-level loop where the engine already has the
-    TUISession + focus agent in scope.
+    This runner owns the dispatch because replacing stdin-consuming inputs
+    with ``NoneInput`` bypasses ``TUIInput``'s interception hooks. It already
+    has both the TUI session and focus agent needed by modal commands.
 
     Modal-backed commands act on the ACTIVE tab's creature (resolved
     via ``tui.agent_for_tab``), so ``/model`` on bob's tab picks a
@@ -69,8 +68,23 @@ async def _handle_tui_slash(text: str, tui: "TUISession", focus: Any) -> bool:
     resolver = getattr(tui, "agent_for_tab", None)
     target_agent = (resolver() if callable(resolver) else None) or focus
 
+    # The engine runner owns Textual's input loop. Its creatures use
+    # ``NoneInput``, so forwarding ExitCommand would only set that module's
+    # private flag -- a flag this loop never reads. Stop the TUISession here;
+    # ``stop()`` wakes ``get_input()`` with an empty value so the runner can
+    # leave the loop and perform its normal cleanup.
+    if name in ("exit", "quit", "q"):
+        tui.stop()
+        return True
+
     if name == "model" and not stripped_args:
         await tui.show_model_picker_modal(target_agent)
+        return True
+
+    # Intercept ONLY the bare command — subcommands (`/drives list|show|…`)
+    # fall through to the agent's command registry for scriptable text output.
+    if name in ("drives", "drive") and not stripped_args:
+        await tui.show_drive_panel()
         return True
 
     if name in ("module", "modules", "mod"):
@@ -197,6 +211,10 @@ async def run_engine_with_tui(
     tui_tabs.extend(f"#{ch_info.name}" for ch_info in graph.channels.values())
 
     tui = TUISession(agent_name=graph_id)
+    # Inject a ready service (record panel) + engine (settings live-apply); the
+    # TUI consumes these duck-typed handles instead of importing terrarium.service.
+    tui.engine = engine
+    tui.drive_service = LocalTerrariumService(engine)
     tui.set_terrarium_tabs(tui_tabs)
 
     focus_output = TUIOutput(session_key=focus_creature_id)
@@ -261,7 +279,7 @@ async def run_engine_with_tui(
     # begins routing user input to ``focus.inject_input``.
     for creature in engine.list_creatures():
         if creature.graph_id == graph_id and not creature.is_running:
-            await creature.start()
+            await engine.start(creature)
 
     await tui.start()
     # Wire ESC → interrupt AFTER tui.start() creates the AgentTUI.
@@ -284,7 +302,6 @@ async def run_engine_with_tui(
         _refresh_tui_on_topology_change(
             engine,
             tui,
-            graph_id,
             focus_creature_id,
             wired_channels,
             routed_creatures,
@@ -293,9 +310,11 @@ async def run_engine_with_tui(
 
     commands = {n: get_builtin_user_command(n) for n in list_builtin_user_commands()}
     aliases = _build_command_aliases(commands)
-    cmd_context = UserCommandContext(agent=focus, session=focus.session)
-    cmd_context.extra["command_registry"] = commands
-    _set_command_hints(tui, commands)
+    cmd_context = _engine_command_context(focus, engine, focus_creature_id, commands)
+    tui.command_hint_fallback = commands
+    for creature in graph_creatures:
+        tui.watch_command_agent(creature.creature_id, creature.agent)
+    tui.refresh_command_hints_for_tab(focus_creature_id)
 
     # Track in-flight inject_input tasks so we can drain them on exit
     # but DON'T await them inline. Awaiting inline blocks the input
@@ -307,13 +326,21 @@ async def run_engine_with_tui(
     # first turn holds the lock. Firing as a task hands the second
     # call into the agent immediately; ``_process_event`` detects the
     # lock is held and buffers it for the current turn's drain.
-    inflight_inputs: list[asyncio.Task] = []
+    inflight_inputs: set[asyncio.Task[Any]] = set()
 
     def _spawn_inject(coro) -> None:
         task = asyncio.create_task(coro)
-        inflight_inputs.append(task)
-        # Reap finished tasks so the list doesn't grow forever.
-        inflight_inputs[:] = [t for t in inflight_inputs if not t.done()]
+        inflight_inputs.add(task)
+
+        def _reap(completed: asyncio.Task[Any]) -> None:
+            inflight_inputs.discard(completed)
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                logger.error("TUI input injection failed", error=str(error))
+
+        task.add_done_callback(_reap)
 
     try:
         while True:
@@ -334,6 +361,17 @@ async def run_engine_with_tui(
             # text (the modal IS the response to this input).
             if text.startswith("/"):
                 if await _handle_tui_slash(text, tui, focus):
+                    continue
+                # Engine-aware subcommands (`/drives list`, `/goal …`) run
+                # against the trusted local-console context so they reach the
+                # live Drive service instead of the engine-agnostic agent
+                # pipeline that returns "unavailable". The registry and context
+                # are resolved from the active tab per dispatch so plugin commands
+                # are seen and both the service target and rendered notice follow
+                # that tab.
+                if await _dispatch_active_engine_command(
+                    text, tui, engine, focus, focus_creature_id, graph_id, commands
+                ):
                     continue
             active_tab = tui.get_active_tab()
             if not active_tab or active_tab == focus_creature_id:
@@ -359,6 +397,7 @@ async def run_engine_with_tui(
     except (KeyboardInterrupt, asyncio.CancelledError):
         pass
     finally:
+        await cancel_tasks(inflight_inputs)
         restore_logging()
         refresh_task.cancel()
         try:
@@ -448,26 +487,6 @@ def _update_terrarium_panel(
     tui.update_terrarium(creature_info, env.shared_channels.get_channel_info())
 
 
-def _build_command_aliases(commands: dict) -> dict[str, str]:
-    aliases: dict[str, str] = {}
-    for name, cmd in commands.items():
-        for alias in getattr(cmd, "aliases", []):
-            aliases[alias] = name
-    return aliases
-
-
-def _set_command_hints(tui: TUISession, commands: dict) -> None:
-    if not tui._app:
-        return
-    try:
-        inp = tui._app.query_one("#input-box", ChatInput)
-        inp.command_names = list(commands.keys())
-    except Exception as e:
-        logger.warning(
-            "Failed to set command hints on TUI input", error=str(e), exc_info=True
-        )
-
-
 def _wire_new_channels(env, tui: "TUISession", wired: set[str]) -> None:
     """Install on_send callbacks on every channel not already wired.
 
@@ -486,7 +505,6 @@ def _wire_new_channels(env, tui: "TUISession", wired: set[str]) -> None:
 async def _refresh_tui_on_topology_change(
     engine: Terrarium,
     tui: "TUISession",
-    graph_id: str,
     focus_creature_id: str,
     wired_channels: set[str],
     routed_creatures: set[str],
@@ -511,6 +529,9 @@ async def _refresh_tui_on_topology_change(
     )
     try:
         async for _ev in engine.subscribe(filt):
+            graph_id = engine._topology.creature_to_graph.get(focus_creature_id)
+            if graph_id is None:
+                continue
             graph = engine._topology.graphs.get(graph_id)
             if graph is None:
                 continue
@@ -545,6 +566,7 @@ async def _refresh_tui_on_topology_change(
                 creature_out._default_target = creature.creature_id
                 creature.agent.output_router.default_output = creature_out
                 routed_creatures.add(creature.creature_id)
+                tui.watch_command_agent(creature.creature_id, creature.agent)
                 # New tab → seed its model line so the panel is right
                 # the first time the user switches to it.
                 _seed_tab_models(tui, [creature])

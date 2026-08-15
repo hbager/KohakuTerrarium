@@ -1,19 +1,20 @@
-"""Per-creature chat routes — HTTP fallback chat / regen / edit /
-rewind / history / branches.
+"""Expose per-creature chat, editing, history, and branch operations.
 
-Service-driven: ``Depends(get_service)`` so multi-node lab-host
-deployments route by ``_home`` automatically.  ``service.chat`` and
-``service.chat_history`` already cross the lab transport for remote
-creatures.
+Service routing sends remote creature operations to their home workers.
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 
 from kohakuterrarium.api.deps import get_service
 from kohakuterrarium.api.routes.sessions_v2._helpers import resolve_creature_id
-from kohakuterrarium.api.schemas import AgentChat, MessageEdit, RegenerateRequest
-from kohakuterrarium.studio._runtime import host_engine_or_none
-from kohakuterrarium.studio.sessions.creature_chat import channel_history
+from kohakuterrarium.api.schemas import (
+    AgentChat,
+    BranchMutationResponse,
+    MessageEdit,
+    RegenerateRequest,
+)
+from kohakuterrarium.errors import ConflictError, NotFoundError
+from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.terrarium.service import TerrariumService
 
 router = APIRouter()
@@ -38,36 +39,51 @@ async def chat_creature(
         raise HTTPException(404, f"creature {creature_id!r} not found")
 
 
-@router.post("/{session_id}/creatures/{creature_id}/regenerate")
+@router.post(
+    "/{session_id}/creatures/{creature_id}/regenerate",
+    response_model=BranchMutationResponse,
+)
 async def regenerate_creature(
     session_id: str,
     creature_id: str,
     req: RegenerateRequest | None = None,
+    request_id: str | None = Header(default=None, alias="X-Request-ID"),
     service: TerrariumService = Depends(get_service),
 ):
     cid = await resolve_creature_id(service, creature_id, session_id)
     turn_index = req.turn_index if req is not None else None
     branch_view = req.branch_view if req is not None else None
+    request_id = request_id or (req.request_id if req is not None else None)
+    target = (
+        UserMessageSelector(**req.target.model_dump())
+        if req is not None and req.target is not None
+        else None
+    )
     try:
-        result = await service.regenerate(
-            cid, turn_index=turn_index, branch_view=branch_view
-        )
-    except KeyError:
-        raise HTTPException(404, f"creature {creature_id!r} not found")
-    # Pass through ``turn_index`` / ``branch_id`` from the service so
-    # the frontend can promote the <N/M> navigator the instant the API
-    # call returns, instead of waiting for the post-turn resync.
-    if isinstance(result, dict):
-        return result
-    return {"status": "regenerating", "turn_index": turn_index}
+        kwargs = {
+            "turn_index": turn_index,
+            "branch_view": branch_view,
+            "request_id": request_id,
+        }
+        if target is not None:
+            kwargs["target"] = target
+        return await service.regenerate(cid, **kwargs)
+    except (NotFoundError, KeyError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ConflictError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
-@router.post("/{session_id}/creatures/{creature_id}/messages/{msg_idx}/edit")
+@router.post(
+    "/{session_id}/creatures/{creature_id}/messages/{msg_idx}/edit",
+    response_model=BranchMutationResponse,
+)
 async def edit_creature_message(
     session_id: str,
     creature_id: str,
     msg_idx: int,
     req: MessageEdit,
+    request_id: str | None = Header(default=None, alias="X-Request-ID"),
     service: TerrariumService = Depends(get_service),
 ):
     if isinstance(req.content, list):
@@ -78,53 +94,23 @@ async def edit_creature_message(
     else:
         content = req.content
     cid = await resolve_creature_id(service, creature_id, session_id)
+    request_id = request_id or req.request_id
     try:
-        edited = await service.edit_message(
-            cid,
-            msg_idx,
-            content,
-            turn_index=req.turn_index,
-            user_position=req.user_position,
-            branch_view=req.branch_view,
-        )
-    except KeyError:
-        raise HTTPException(404, f"creature {creature_id!r} not found")
-    if isinstance(edited, dict) and "edited" in edited:
-        edit_succeeded = bool(edited["edited"])
-    else:
-        edit_succeeded = bool(edited)
-    if not edit_succeeded:
-        raise HTTPException(400, "Invalid edit target; expected a user message")
-    # Newer service implementations return a dict carrying the just-
-    # opened branch_id / turn_index so the frontend's navigator can
-    # promote immediately. Older ones still return ``True`` — infer
-    # branch metadata from history when available.
-    result = {
-        "status": "edited",
-        "turn_index": (
-            edited.get("turn_index", req.turn_index)
-            if isinstance(edited, dict)
-            else req.turn_index
-        ),
-        "user_position": req.user_position,
-    }
-    branch_id = edited.get("branch_id") if isinstance(edited, dict) else None
-    if branch_id is None and result["turn_index"] is not None:
-        try:
-            history = await service.chat_history(cid)
-        except Exception:
-            history = {}
-        branch_ids = [
-            event.get("branch_id")
-            for event in history.get("events", [])
-            if event.get("turn_index") == result["turn_index"]
-            and isinstance(event.get("branch_id"), int)
-        ]
-        if branch_ids:
-            branch_id = max(branch_ids)
-    if branch_id is not None:
-        result["branch_id"] = branch_id
-    return result
+        target = UserMessageSelector(**req.target.model_dump()) if req.target else None
+        kwargs = {
+            "turn_index": req.turn_index,
+            "user_position": req.user_position,
+            "branch_view": req.branch_view,
+            "request_id": request_id,
+        }
+        if target is not None:
+            kwargs["target"] = target
+        edited = await service.edit_message(cid, msg_idx, content, **kwargs)
+        return edited
+    except (NotFoundError, KeyError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ConflictError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.post("/{session_id}/creatures/{creature_id}/messages/{msg_idx}/rewind")
@@ -138,8 +124,10 @@ async def rewind_creature(
     try:
         await service.rewind(cid, msg_idx)
         return {"status": "rewound"}
-    except KeyError:
-        raise HTTPException(404, f"creature {creature_id!r} not found")
+    except (NotFoundError, KeyError) as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (ConflictError, ValueError) as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @router.get("/{session_id}/creatures/{creature_id}/history")
@@ -148,41 +136,23 @@ async def creature_history(
     creature_id: str,
     service: TerrariumService = Depends(get_service),
 ):
-    # The frontend uses the same endpoint for per-creature chat tabs and
-    # per-channel tabs (``ch:<name>``).  In lab-host mode the host engine
-    # has no attached session store, but the service's cluster-aware
-    # ``channel_history`` already unions messages across every cluster
-    # member's worker store (CF-4). CF-9: delegate to it so the channel
-    # tab is non-empty even when ``channel_history``'s studio-attached
-    # store walk finds nothing.
+    # Channel tabs share this endpoint through the ``ch:`` prefix.
     if creature_id.startswith("ch:"):
         channel_name = creature_id[3:]
-        engine = host_engine_or_none(service)
-        if engine is not None:
-            payload = channel_history(engine, session_id, channel_name)
-            if payload.get("events"):
-                return payload
-        # Fall back to (or default to in lab-host) the service-routed
-        # cluster fan-out. Shape the returned list of channel-message
-        # dicts as ``channel_message`` events so the frontend's chat
-        # replay can render them in the channel tab.
         try:
             messages = await service.channel_history(session_id, channel_name)
-        except (KeyError, AttributeError):
+        except KeyError:
             messages = []
-        except Exception:
-            messages = []
-        events: list[dict] = []
-        for m in messages or []:
-            events.append(
-                {
-                    "type": "channel_message",
-                    "channel": channel_name,
-                    "sender": m.get("sender", ""),
-                    "content": m.get("content", ""),
-                    "ts": m.get("ts", 0) or m.get("timestamp", 0),
-                }
-            )
+        events = [
+            {
+                "type": "channel_message",
+                "channel": channel_name,
+                "sender": message.get("sender", ""),
+                "content": message.get("content", ""),
+                "ts": message.get("timestamp", message.get("ts", 0)),
+            }
+            for message in messages
+        ]
         return {
             "creature_id": creature_id,
             "session_id": session_id,

@@ -661,6 +661,49 @@ class TestApiSettingsJourney:
         resp = client.delete("/api/settings/backends/acme")
         assert resp.status_code == 404
 
+        # ── 6. Drive runtime settings ─────────────────────────────────
+        # The Settings config-file editor persists drive-settings.yaml with
+        # SCHEMA validation (raw save = validated-persist only, design §8.4):
+        # an invalid runtime block is a 400, never a silent enable.
+        from kohakuterrarium.api.deps import get_service_legacy
+        from kohakuterrarium.studio.identity import drive_settings as ds
+
+        current_drive_file = client.get(
+            "/api/settings/config-files/drive-settings/content"
+        ).json()
+        bad = client.put(
+            "/api/settings/config-files/drive-settings/content",
+            json={
+                "content": "runtime:\n  enabled: not-a-bool\n",
+                "sha256_expected": current_drive_file["sha256"],
+            },
+        )
+        assert bad.status_code == 400
+        assert "drive-settings schema error" in bad.json()["detail"]
+
+        good = client.put(
+            "/api/settings/config-files/drive-settings/content",
+            json={
+                "content": (
+                    "schema_version: 1\n"
+                    "runtime:\n  enabled: true\n"
+                    "registrations:\n  generic:\n    enabled: true\n"
+                ),
+                "sha256_expected": current_drive_file["sha256"],
+            },
+        )
+        assert good.status_code == 200, good.text
+        read = client.get("/api/settings/config-files/drive-settings/content").json()
+        assert "enabled: true" in read["content"]
+
+        # Resolve + apply against the default-on running engine. Removing the
+        # default goal kind requires a restart (design §8.6).
+        engine = get_service_legacy().engine
+        result = ds.apply_runtime(engine)
+        assert result["result"] == ds.RESTART_REQUIRED
+        assert result["desired_revision"] == ds.current_revision()
+        assert result["warnings"]
+
         # Stop the live session — it leaves the active list.
         resp = client.delete(f"/api/sessions/active/{session_id}")
         assert resp.status_code == 200

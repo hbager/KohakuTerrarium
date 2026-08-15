@@ -54,6 +54,44 @@ terrarium:
 
 Field reference: [reference/configuration](../reference/configuration.md).
 
+## Recipes stay graph-only
+
+A recipe describes **structure**: which creatures exist, which channels
+exist, which edges are wired. It never carries runtime resource
+configuration. In particular, a recipe carries **no [Drive](../concepts/multi-agent/drive.md)
+fields** — no runtime toggle, no registration selection, no seed Drive
+records. All existing recipes remain valid with zero Drive awareness.
+
+Drive runtime configuration is an explicit `Terrarium(...)` constructor
+argument, applied *around* recipe application, not inside it:
+
+```python
+from kohakuterrarium import Terrarium
+from kohakuterrarium.terrarium.drive.config import (
+    DriveRuntimeConfig,
+    default_registrations,
+)
+
+# The engine is configured with its runtime capabilities; the recipe only
+# adds creatures/channels/wiring. The already-configured engine injects its
+# Drive capabilities into every creature the recipe creates.
+async with Terrarium(
+    session_dir="runs/",
+    drive_config=DriveRuntimeConfig(enabled=True),
+    drive_registrations=default_registrations(),
+) as engine:
+    await engine.apply_recipe("@kt-biome/terrariums/swe_team")
+    # ... create Drive records explicitly here via the service ...
+```
+
+`from_recipe`, `resume`, and `with_creature` forward the same explicit
+Drive arguments to the constructor; the recipe object is untouched.
+Applying one recipe to two differently-configured engines can therefore
+produce different Drive capabilities. Managed products (web, TUI, `kt`)
+resolve these arguments from [`drive-settings.yaml`](../reference/configuration.md#drive-settings-drive-settingsyaml)
+through Studio; the low-level engine never reads that file. See
+[Programmatic Drive](programmatic-drive.md).
+
 ## Auto-created channels
 
 The runtime always creates:
@@ -145,6 +183,8 @@ async with Terrarium() as engine:
 ```
 
 Cross-graph `connect()` merges the two graphs: environments union, attached session stores merge into one (with `parent_session_ids` recording lineage), the new listener gets a `ChannelTrigger` injected. `disconnect()` may split a graph back apart and copy the parent session into each side. See [`examples/code/terrarium_hotplug.py`](../../examples/code/terrarium_hotplug.py).
+
+Routing operations such as channel wiring, group messaging, and output wiring resolve targets inside the caller's current logical graph. Prefer an exact runtime creature ID. A display or config name is accepted only when it is unique in that graph; ambiguous, stale, and foreign-graph targets are rejected. These operations never merge disconnected graphs implicitly: call `connect()` first with exact endpoints.
 
 The same mutations are available to a privileged node inside the graph through the group tools: `group_add_node`, `group_remove_node`, `group_start_node`, `group_stop_node`, `group_channel`, `group_wire`. Together they form the in-graph "graph editor" an LLM-driven privileged node uses to evolve the team mid-run.
 

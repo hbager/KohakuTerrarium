@@ -1,16 +1,4 @@
-"""
-SessionStore - persistent session storage backed by KohakuVault.
-
-Single .kohakutr file (SQLite) containing:
-  - meta:       Session metadata, config snapshots
-  - state:      Per-agent scratchpad, counters, token usage
-  - events:     Append-only ordered event log (everything)
-  - channels:   Channel message history
-  - subagents:  Sub-agent conversation snapshots
-  - jobs:       Tool/sub-agent job execution records
-  - conversation: Per-agent conversation snapshots (for fast resume)
-  - fts:        Full-text search index (TextVault)
-"""
+"""Persist session metadata, events, state, and indexes in KohakuVault."""
 
 import json
 import platform
@@ -27,6 +15,7 @@ from kohakuterrarium.session.history import (
     dedupe_adjacent_duplicate_events,
     normalize_resumable_events,
 )
+from kohakuterrarium.session.identity import legacy_conversation_id, new_conversation_id
 from kohakuterrarium.session.rollup import (
     get_turn_rollup,
     list_turn_rollups,
@@ -52,14 +41,7 @@ from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# KVault's ``keys()`` defaults to ``limit=10000``; once a session crosses
-# that threshold (~10 long turns of streaming chunks) every read path
-# silently truncates and the latest events become invisible. We pass a
-# very large explicit cap so the read covers any realistic session
-# while staying well below the 64-bit overflow line. Use the helper
-# :func:`iter_kv_keys` from this module instead of calling ``keys()``
-# directly — every site in ``session/`` and ``studio/persistence/``
-# routes through it.
+# KVault defaults to 10,000 keys, which can silently truncate long sessions.
 _KV_KEYS_LIMIT: int = 2**31 - 1
 
 
@@ -71,9 +53,8 @@ def iter_kv_keys(
 ) -> Iterable[Any]:
     """Iterate every key of a KVault table, bypassing its 10k default.
 
-    Returns an iterator over the table's keys (filtered by ``prefix`` if
-    given). The default ``limit`` is large enough to cover any session
-    we expect to see in practice; pass an explicit ``limit`` to opt out.
+    ``prefix`` filters the result, and an explicit ``limit`` can override the
+    large session-safe default.
     """
     if prefix is None:
         return table.keys(limit=limit)
@@ -83,23 +64,12 @@ def iter_kv_keys(
 class SessionStore:
     """Persistent session storage backed by KohakuVault.
 
-    Tables (msgpack auto-pack):
-      - meta: session_id, config_type, config_path, …
-      - state: ``{agent}:scratchpad``, ``{agent}:turn_count``, …
-      - events: ``{agent}:e{seq:06d}`` (append-only event log)
-      - channels: ``{channel}:m{seq:06d}``
-      - subagents: ``{parent}:{name}:{run}:meta`` + ``:conversation``
-      - jobs: ``{job_id}``
-      - conversation: ``{agent}`` (snapshot cache — see history.replay)
-      - turn_rollup: ``{agent}:turn:{turn_index:06d}`` (Wave B §3.3)
-      - fts: TextVault-backed FTS5 index
+    One ``.kohakutr`` file contains metadata, per-agent state, append-only
+    events, channel history, child-run records, conversation caches, turn
+    rollups, job records, and full-text search data.
     """
 
-    # Default durability gates for the events cache. ``append_event``
-    # flushes whenever EITHER threshold is met since the last flush —
-    # whichever fires first wins. The KVault's own ``flush_interval``
-    # remains a passive fallback in case neither gate trips (idle session
-    # with one straggling event in the buffer).
+    # Flush on either explicit threshold; KVault's interval remains a fallback.
     DEFAULT_FLUSH_EVERY_N_EVENTS = 4
     DEFAULT_FLUSH_EVERY_N_SECONDS = 1.0
 
@@ -113,14 +83,12 @@ class SessionStore:
     ) -> None:
         self._path = str(Path(path).expanduser())
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
-        # Read-only opens never mutate meta on close (E8) — set via
-        # :meth:`open_readonly`.
+        # Read-only consumers must not alter status or recency on close.
         self._readonly = False
 
-        # Cross-process writer lock (see ``store_lock``); released in close.
+        # The optional cross-process writer lock is released during close.
         self._writer_lock = acquire_writer_lock(self._path) if writer_lock else None
 
-        # Durability gates for the events cache.
         self._flush_every_n_events: int = (
             flush_every_n_events
             if flush_every_n_events is not None
@@ -134,20 +102,19 @@ class SessionStore:
         self._unflushed_event_count: int = 0
         self._last_flush_at: float = time.monotonic()
 
-        # Sequence counters + Wave B global monotonic event id.
+        # Per-namespace sequences coexist with one session-wide event identifier.
         self._event_seq: dict[str, int] = {}
         self._channel_seq: dict[str, int] = {}
         self._subagent_runs: dict[str, int] = {}
         self._global_event_id: int = 0
-        # Artifacts directory — created lazily.
+        # Artifact storage is created only on first use.
         self._artifacts_dir: Path | None = None
-        # Append-event subscribers — each callback gets ``(key, data)``
-        # after the row is written + FTS-indexed (see ``append_event``).
+        # Companion resources close in LIFO order before the store lock is released.
+        self._companion_closers: list[Callable[[], None]] = []
+        # Subscribers observe events only after persistence and FTS indexing.
         self._event_subscribers: list[Callable[[str, dict], None]] = []
 
-        # Opening the tables can fail on a corrupt / unreadable file;
-        # release the writer lock if construction aborts so an in-process
-        # retry isn't wedged by a leaked lock.
+        # Construction failures must not strand the cross-process writer lock.
         try:
             self._open_tables()
             self._restore_counters()
@@ -166,8 +133,7 @@ class SessionStore:
         self.state.enable_auto_pack()
         self.events = KVault(self._path, table="events")
         self.events.enable_auto_pack()
-        # KVault's passive flush_interval acts as a backstop — our
-        # explicit gates in ``append_event`` are the primary path.
+        # The passive interval backs up the explicit append-time flush gates.
         self.events.enable_cache(flush_interval=2.0)
         self.channels = KVault(self._path, table="channels")
         self.channels.enable_auto_pack()
@@ -177,11 +143,9 @@ class SessionStore:
         self.jobs.enable_auto_pack()
         self.conversation = KVault(self._path, table="conversation")
         self.conversation.enable_auto_pack()
-        # Per-turn rollup table (Wave B §3.3) — denormalised per-turn
-        # counters, cheap for viewers without reducing the event log.
+        # Denormalized turn rows accelerate viewers without replacing source events.
         self.turn_rollup = KVault(self._path, table="turn_rollup")
         self.turn_rollup.enable_auto_pack()
-        # FTS for search.
         self.fts = TextVault(self._path, table="fts")
         self.fts.enable_auto_pack()
 
@@ -204,6 +168,11 @@ class SessionStore:
         """Write raw bytes to ``artifacts_dir/<filename>``. Traversal-safe."""
         return write_artifact_bytes(self.artifacts_dir, filename, data)
 
+    def register_companion_closer(self, closer: Callable[[], None]) -> None:
+        # Registration is idempotent; companion resources close in reverse order.
+        if closer not in self._companion_closers:
+            self._companion_closers.append(closer)
+
     def _restore_counters(self) -> None:
         """Scan existing keys to restore sequence counters after restart."""
         self._global_event_id = restore_event_counters(self.events, self._event_seq)
@@ -216,8 +185,6 @@ class SessionStore:
                 event_agents=list(self._event_seq.keys()),
                 channel_count=len(self._channel_seq),
             )
-
-    # ─── Event Log ──────────────────────────────────────────────────
 
     def _next_event_seq(self, agent: str) -> int:
         """Get and increment the event sequence counter for an agent."""
@@ -246,23 +213,17 @@ class SessionStore:
         Every event carries a per-session monotonic ``event_id`` plus
         optional ``turn_index`` / ``spawned_in_turn`` / ``branch_id``.
 
-        ``turn_index`` identifies the user-input turn the event belongs
-        to (stable across regenerate / edit+rerun). ``branch_id`` is
-        which branch of that turn (1 = original, 2 = first regen, …).
-        Events of the same ``turn_index`` but different ``branch_id``
-        are siblings — replay default picks the latest branch; the
-        ``<1/N>`` navigator surfaces the others.
+        ``turn_index`` identifies a logical user turn across reruns. Sibling
+        ``branch_id`` values represent alternate responses; replay selects the
+        latest branch unless a caller requests another.
         """
         seq = self._next_event_seq(agent)
         key = f"{agent}:e{seq:06d}"
-        # Preserve a caller-supplied ``event_id`` (e.g. the mirror writer
-        # forwards the worker's id verbatim so cross-node ``since=event_id``
-        # filters line up).  Only mint a fresh id when none was provided.
+        # Mirrors preserve source event identifiers for consistent cross-node cursors.
         preset_eid = data.get("event_id")
         if isinstance(preset_eid, int) and preset_eid > 0:
             event_id = preset_eid
-            # Keep the local monotonic counter ahead of any externally
-            # supplied id so subsequent local appends don't collide.
+            # Future local identifiers must remain above imported identifiers.
             if event_id > self._global_event_id:
                 self._global_event_id = event_id
         else:
@@ -277,16 +238,13 @@ class SessionStore:
             data["spawned_in_turn"] = turn_index
         if branch_id is not None:
             data["branch_id"] = branch_id
-        # Stamp parent_branch_path so nested-branch filtering can run
-        # without scanning event history at replay time. Stored as a
-        # JSON-friendly list-of-pairs.
+        # Persist lineage in JSON-safe form to avoid replay-time history scans.
         if parent_branch_path is not None:
             data["parent_branch_path"] = [list(p) for p in parent_branch_path]
         if "ts" not in data:
             data["ts"] = time.time()
         self.events[key] = data
 
-        # Index searchable text in FTS
         text = data.get("content") or data.get("output") or data.get("text") or ""
         if isinstance(text, str) and len(text) > 10:
             try:
@@ -302,17 +260,14 @@ class SessionStore:
             except Exception as e:
                 logger.warning("FTS indexing failed", error=str(e), exc_info=True)
 
-        # Fan out to live subscribers. Each callback is isolated — a
-        # slow or failing listener must not block the appending agent.
+        # Subscriber failures cannot invalidate a successfully appended event.
         for cb in tuple(self._event_subscribers):
             try:
                 cb(key, data)
             except Exception as e:
                 logger.warning("Event subscriber failed", error=str(e), exc_info=True)
 
-        # Durability gate — flush when either threshold is exceeded.
-        # See ``DEFAULT_FLUSH_EVERY_N_EVENTS`` /
-        # ``DEFAULT_FLUSH_EVERY_N_SECONDS`` for the policy.
+        # Either durability threshold may trigger a cache flush.
         self._unflushed_event_count += 1
         self._maybe_flush_events()
 
@@ -338,14 +293,10 @@ class SessionStore:
         self._unflushed_event_count = 0
         self._last_flush_at = time.monotonic()
 
-    # ─── Live event subscription (V1 viewer) ────────────────────────
-
     def subscribe(self, callback: Callable[[str, dict], None]) -> None:
         """Register a callback fired after each ``append_event``.
 
-        Idempotent: re-subscribing the same callable is a no-op so the
-        WebSocket handler does not need an explicit "already attached"
-        check on reconnect retries.
+        Re-registering the same callable is a no-op, allowing safe reconnects.
         """
         if callback not in self._event_subscribers:
             self._event_subscribers.append(callback)
@@ -416,8 +367,6 @@ class SessionStore:
         all_events.sort(key=lambda x: x[1].get("ts", 0))
         return all_events
 
-    # ─── Conversation Snapshots ─────────────────────────────────────
-
     def save_conversation(self, agent: str, messages: list[dict] | str) -> None:
         """Save a conversation snapshot (overwritten each time).
 
@@ -433,10 +382,9 @@ class SessionStore:
         """
         try:
             val = self.conversation[agent]
-            # msgpack auto-decode returns list directly
             if isinstance(val, list):
                 return val
-            # Legacy: JSON string from older sessions
+            # Older sessions may contain JSON rather than auto-packed lists.
             if isinstance(val, (str, bytes)):
                 s = (
                     val.decode("utf-8", errors="replace")
@@ -451,8 +399,6 @@ class SessionStore:
             return None
         except KeyError:
             return None
-
-    # ─── Per-Agent State ────────────────────────────────────────────
 
     def save_state(
         self,
@@ -507,8 +453,6 @@ class SessionStore:
         except KeyError:
             return []
 
-    # ─── Per-Turn Rollup (Wave B §3.3) ──────────────────────────────
-
     def save_turn_rollup(
         self, agent: str, turn_index: int, data: dict[str, Any]
     ) -> None:
@@ -523,8 +467,6 @@ class SessionStore:
         """List rollup rows for an agent, ordered by ``turn_index``."""
         return list_turn_rollups(self.turn_rollup, agent)
 
-    # ─── Channel Messages ───────────────────────────────────────────
-
     def _next_channel_seq(self, channel: str) -> int:
         seq = self._channel_seq.get(channel, 0)
         self._channel_seq[channel] = seq + 1
@@ -538,7 +480,6 @@ class SessionStore:
             data["ts"] = time.time()
         self.channels[key] = data
 
-        # FTS index
         content = data.get("content", "")
         if isinstance(content, str) and len(content) > 10:
             try:
@@ -570,8 +511,6 @@ class SessionStore:
                     "Failed to read channel message", error=str(e), exc_info=True
                 )
         return result
-
-    # ─── Sub-Agent Conversations ────────────────────────────────────
 
     def next_subagent_run(self, parent: str, name: str) -> int:
         """Get the next run index for a sub-agent."""
@@ -613,8 +552,6 @@ class SessionStore:
         except KeyError:
             return None
 
-    # ─── Job Records ────────────────────────────────────────────────
-
     def save_job(self, job_id: str, data: dict) -> None:
         """Save a job execution record."""
         if "ts" not in data:
@@ -627,8 +564,6 @@ class SessionStore:
             return self.jobs[job_id]
         except KeyError:
             return None
-
-    # ─── Meta ───────────────────────────────────────────────────────
 
     def init_meta(
         self,
@@ -644,9 +579,7 @@ class SessionStore:
     ) -> None:
         """Initialize session metadata. Called once when session is created.
 
-        Raises ``ValueError`` when ``config_type`` is not a resumable
-        literal — resume dispatches on this exact string; a free-form
-        value used to silently produce an UNRESUMABLE session file.
+        ``config_type`` must be a supported resume discriminator.
         """
         if config_type not in ("agent", "terrarium"):
             raise ValueError(
@@ -665,6 +598,9 @@ class SessionStore:
         self.meta["created_at"] = now
         self.meta["last_active"] = now
         self.meta["status"] = "running"
+        self.meta["conversation_open"] = True
+        if not self.meta.get("conversation_id"):
+            self.meta["conversation_id"] = new_conversation_id()
         self.meta["agents"] = agents
         self.meta["hostname"] = platform.node()
         self.meta["python_version"] = platform.python_version()
@@ -682,19 +618,33 @@ class SessionStore:
         self.meta["status"] = status
         self.meta["last_active"] = datetime.now(timezone.utc).isoformat()
 
+    def set_conversation_open(self, is_open: bool) -> None:
+        """Persist whether the user still considers this conversation open."""
+
+        self.meta["conversation_open"] = bool(is_open)
+        if is_open:
+            self.ensure_conversation_id()
+
+    def ensure_conversation_id(self) -> str | None:
+        """Return the immutable persisted identity for a marked conversation.
+
+        Legacy files are backfilled only when they carry the explicit open
+        marker. Their path-derived UUID is deterministic across retries.
+        """
+        existing = self.meta.get("conversation_id")
+        if isinstance(existing, str) and existing:
+            return existing
+        if not self.meta.get("conversation_open"):
+            return None
+        conversation_id = legacy_conversation_id(self._path)
+        self.meta["conversation_id"] = conversation_id
+        return conversation_id
+
     def set_viewer_default_agent(self, namespace: str) -> None:
         """Record ``namespace`` as the session viewer's default agent.
 
-        Writes ``meta["viewer_default_agent"]``. Used by
-        ``attach_agent_to_session`` so the Wave F attach namespace
-        (``<host>:attached:<role>:<seq>``) becomes the default the viewer
-        dispatches under; without this the host namespace (which only
-        carries lineage events) would win and the conversation tab would
-        render empty. Last-attach wins; earlier attaches stay reachable
-        via ``discover_attached_agents`` and explicit ``?agent=`` query.
-
-        Kept off ``meta["agents"]`` so resume / hot-plug / token-loop
-        enumeration keep treating that list as main creatures only.
+        The most recent attachment wins. The value remains separate from
+        ``meta["agents"]`` so main-creature discovery and resume are unaffected.
         """
 
         if not isinstance(namespace, str) or not namespace:
@@ -709,10 +659,8 @@ class SessionStore:
     def load_meta(self) -> dict[str, Any]:
         """Load all metadata as a dict.
 
-        Wave B: ``meta["agents"]`` is augmented with any agent names
-        discovered by scanning event-key prefixes. Hot-plugged creatures
-        (whose writes land directly via ``append_event`` without going
-        through ``add_creature``) become visible to resume.
+        Event namespaces augment ``meta["agents"]`` so hot-plugged creatures are
+        visible to resume even when metadata was not updated explicitly.
         """
         result = {}
         for key_bytes in iter_kv_keys(self.meta):
@@ -736,17 +684,10 @@ class SessionStore:
     def discover_agents_from_events(self) -> list[str]:
         """Scan event keys, returning agent names in first-seen order.
 
-        Excludes framework-scope names like ``terrarium`` and Wave F
-        attached-agent namespaces (``<host>:attached:<role>:<seq>``) —
-        the latter are exposed separately via
-        :meth:`discover_attached_agents` so ``resume_terrarium`` does
-        not try to rebuild them as standalone creatures.
+        Framework namespaces and attached-agent namespaces are excluded so
+        resume does not rebuild them as standalone creatures.
         """
-        # Flush the events cache before scanning keys — buffered events
-        # (a hot-plugged creature still under the durability gate) are
-        # otherwise invisible to the raw key scan, so the creature
-        # silently never appears in load_meta()'s agent list. Mirrors
-        # what get_events / get_all_events already do.
+        # Buffered event keys must be flushed before namespace discovery.
         self.events.flush_cache()
         seen: list[str] = []
         excluded = {"terrarium"}
@@ -760,7 +701,7 @@ class SessionStore:
             if len(parts) != 2:
                 continue
             agent = parts[0]
-            # Wave F: skip attached namespaces here.
+            # Attached namespaces are reported by the dedicated discovery API.
             if ":attached:" in agent:
                 continue
             if agent not in excluded and agent not in seen:
@@ -768,13 +709,8 @@ class SessionStore:
         return seen
 
     def discover_attached_agents(self) -> list[dict[str, Any]]:
-        """Return Wave F attached-agent namespaces discovered in ``events``.
-
-        Each entry is ``{"host": ..., "role": ..., "attach_seq": ...,
-        "namespace": "<host>:attached:<role>:<seq>"}``. Ordering is
-        first-seen (matches :meth:`discover_agents_from_events`).
-        """
-        # Flush buffered events first — see discover_agents_from_events.
+        """Return attached-agent namespaces from events in first-seen order."""
+        # Buffered event keys must be visible before discovery.
         self.events.flush_cache()
         seen: dict[str, dict[str, Any]] = {}
         for key_bytes in iter_kv_keys(self.events):
@@ -787,7 +723,7 @@ class SessionStore:
             if len(parts) != 2:
                 continue
             ns = parts[0]
-            # Expected shape: ``<host>:attached:<role>:<attach_seq>``.
+            # Roles may contain colons, so split the sequence from the right.
             segments = ns.split(":attached:", 1)
             if len(segments) != 2:
                 continue
@@ -811,8 +747,6 @@ class SessionStore:
             }
         return list(seen.values())
 
-    # ─── Search ─────────────────────────────────────────────────────
-
     def search(self, query: str, k: int = 10) -> list[dict]:
         """Search session content via FTS5 (BM25 keyword search).
 
@@ -825,8 +759,6 @@ class SessionStore:
         except Exception as e:
             logger.warning("FTS search failed", error=str(e))
         return results
-
-    # ─── Lifecycle ──────────────────────────────────────────────────
 
     @property
     def path(self) -> str:
@@ -842,14 +774,8 @@ class SessionStore:
     def checkpoint(self) -> None:
         """Flush every table cache and checkpoint the WAL — without closing.
 
-        A raw byte read of the ``.kohakutr`` file only sees data that
-        has reached the main SQLite database file: rows still sitting
-        in a write cache or the ``-wal`` sidecar are invisible. The
-        resume route copies a *live* mirror store's bytes to push a
-        session to a worker — without this checkpoint that copy is
-        missing the session meta (``config_type`` / ``config_path``)
-        and the worker rejects it as "Session is a None". Call this
-        before any out-of-band byte copy of an open store.
+        Raw file copies omit cached and WAL-only rows. Call this before copying
+        bytes from an open store so metadata and recent events are complete.
         """
         for table in (
             self.events,
@@ -863,28 +789,30 @@ class SessionStore:
         ):
             try:
                 table.flush_cache()
-            except Exception:  # pragma: no cover - defensive
+            except Exception:  # pragma: no cover - checkpoint continues per table
                 logger.warning("checkpoint: flush_cache failed", exc_info=True)
             try:
                 table.checkpoint()
-            except Exception:  # pragma: no cover - defensive
+            except Exception:  # pragma: no cover - checkpoint continues per table
                 logger.warning("checkpoint: WAL checkpoint failed", exc_info=True)
         self._unflushed_event_count = 0
         self._last_flush_at = time.monotonic()
 
     @classmethod
     def open_readonly(cls, path: "str | Path") -> "SessionStore":
-        """Open for READING — close() never mutates meta.  Use for every
-        listing / preview / viewer consumer: a plain open+close bumps
-        ``last_active``, corrupting the recency ordering (E8)."""
+        """Open a store whose close operation never mutates session metadata.
+
+        Listing and viewer consumers must use this mode to preserve recency.
+        """
         store = cls(path)
         store._readonly = True
         return store
 
     def close(self, update_status: bool = True) -> None:
-        """Flush and close all tables.  Idempotent (a second close is a
-        no-op).  ``update_status=True`` marks the session paused +
-        bumps last_active; ignored for :meth:`open_readonly` stores.
+        """Idempotently flush and close the store and companion resources.
+
+        Writable stores optionally transition to paused; read-only stores never
+        mutate metadata.
         """
         if getattr(self, "_closed", False):
             return
@@ -910,13 +838,10 @@ class SessionStore:
             self.conversation,
             self.turn_rollup,
         )
-        # Closes tables + drops native handles, then releases the writer
-        # lock in ``finally`` (a table-close error can't strand the lock).
-        close_tables(tables, self.fts, self._writer_lock)
+        # Close helpers release the writer lock even if a companion closer fails.
+        close_tables(tables, self.fts, self._writer_lock, self._companion_closers)
         self._writer_lock = None
         logger.debug("SessionStore closed", path=self._path)
-
-    # ─── Fork / Branch (Wave E) ─────────────────────────────────────
 
     def fork(
         self,
@@ -927,7 +852,7 @@ class SessionStore:
         name: str | None = None,
         pending_job_ids: set[str] | None = None,
     ) -> "SessionStore":
-        """Copy-on-fork delegating to :mod:`session.store_fork`."""
+        """Create an independent child session through ``at_event_id``."""
         return perform_fork(
             self,
             target_path,
@@ -936,8 +861,6 @@ class SessionStore:
             name=name,
             pending_job_ids=pending_job_ids,
         )
-
-    # ─── Token-usage read API (Wave G) ──────────────────────────────
 
     def token_usage(
         self,
@@ -949,25 +872,9 @@ class SessionStore:
     ) -> dict[str, Any]:
         """Return token counters for ``agent``.
 
-        ``agent`` — controller-loop namespace to read. ``None`` raises
-        (no silent "main" pick).
-
-        ``include_subagents`` — when ``True``, adds a ``"subagents"``
-        sub-dict keyed by ``<agent>:subagent:<name>:<run>``. Sub-agent
-        tokens are recovered from the parent's ``subagent_result``
-        events (matched against the authoritative ``subagents`` KVault
-        table).
-
-        ``include_attached`` — when ``True``, adds an ``"attached"``
-        sub-dict keyed by ``<host>:attached:<role>:<attach_seq>``
-        (discovered via :meth:`discover_attached_agents`). Missing keys
-        become empty dicts, never absent.
-
-        ``by_turn`` — when ``True``, adds a ``"by_turn"`` list of
-        ``{turn_index, prompt, completion, cached}`` rows. Reads the
-        ``turn_rollup`` table first; falls back to walking
-        ``token_usage`` events grouped by ``turn_index`` when the
-        rollup emitter has not fired for this agent yet.
+        The agent namespace is required. Optional mappings expose sub-agent and
+        attached-agent counters, while ``by_turn`` uses rollups with event-based
+        fallback.
         """
         return _token_usage_impl(
             self,
@@ -980,14 +887,8 @@ class SessionStore:
     def token_usage_all_loops(self) -> list[tuple[str, dict[str, int]]]:
         """Flat enumeration of every controller loop in the session.
 
-        Returns ``[(agent_path, usage_dict)]`` where ``agent_path`` is:
-
-        * ``<host>`` for each main agent,
-        * ``<host>:subagent:<name>:<run>`` for a tracked sub-agent,
-        * ``<host>:attached:<role>:<attach_seq>`` for an attached agent.
-
-        Each ``usage_dict`` is that loop's own counters only (no
-        aggregation). Consumers display / sum as they see fit.
+        Paths identify main, sub-agent, and attached-agent loops. Each usage
+        dictionary contains only that loop's counters, without aggregation.
         """
         return _token_usage_all_loops_impl(self)
 

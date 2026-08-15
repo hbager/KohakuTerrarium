@@ -209,6 +209,70 @@ async def test_subprocess_harness_boots_host_and_worker(tmp_path, monkeypatch):
         )
 
 
+async def test_node_targeted_drive_settings_over_real_ws(tmp_path, monkeypatch):
+    """Node-targeted Drive settings resolve to the WORKER's own config home.
+
+    A subprocess worker boots Drive-enabled from its OWN ``drive-settings.yaml``
+    (via ``cli/lab_client.py`` resolving it at boot). The host's node-targeted
+    settings API then reaches that worker's ``studio.settings`` adapter over real
+    WS, while the host's own settings stay untouched — the per-node scope
+    isolation (design §8.4/§8.5) that in-process harnesses cannot show because
+    they share ``KT_CONFIG_DIR``.
+    """
+    monkeypatch.setenv("KT_SESSION_DIR", str(tmp_path / "host-sessions"))
+    install_scripted_llm(monkeypatch)
+
+    async with RealLabHost(tmp_path) as host:
+        async with RealLabSubprocessWorker(
+            "drv-worker", host.lab_ws_url, tmp_path / "drv-worker", drive_enabled=True
+        ) as worker:
+            await worker.wait_for_join(host, timeout=OP_TIMEOUT * 4)
+
+            # Node-targeted status routes to the worker's config home over WS.
+            r = await host.http.get(
+                "/api/settings/drives", params={"node": "drv-worker"}
+            )
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert body["node"] == "drv-worker"
+            assert body["runtime"]["enabled"] is True  # worker booted Drive-enabled
+
+            # The worker's LIVE Drive runtime is up (proves boot-time resolution).
+            r = await host.http.get(
+                "/api/settings/drives/runtime-status", params={"node": "drv-worker"}
+            )
+            assert r.status_code == 200 and r.json()["enabled"] is True
+
+            # The host's OWN settings are a DIFFERENT config home. Both nodes
+            # default to the drive-enabled ``default_settings()``; isolation is
+            # proven below by the worker-scoped save leaving the host untouched.
+            r_host = await host.http.get("/api/settings/drives")
+            assert r_host.status_code == 200
+            assert r_host.json()["runtime"]["enabled"] is True
+            host_rev_before = r_host.json()["settings_revision"]
+
+            # A node-targeted save is worker-scoped and round-trips. The save API
+            # demands an optimistic precondition (design §8.4): pass the worker's
+            # current on-disk revision, exactly as every real UI adapter does.
+            good = {
+                "schema_version": 1,
+                "runtime": {"enabled": True},
+                "registrations": {"generic": {"enabled": True, "options": {}}},
+            }
+            r = await host.http.put(
+                "/api/settings/drives",
+                params={"node": "drv-worker"},
+                json={"settings": good, "expected_revision": body["settings_revision"]},
+            )
+            assert r.status_code == 200, r.text
+            assert r.json()["revision"]
+
+            # The worker-scoped save did not touch the host's own config home.
+            r_host2 = await host.http.get("/api/settings/drives")
+            assert r_host2.status_code == 200
+            assert r_host2.json()["settings_revision"] == host_rev_before
+
+
 async def test_cross_node_user_named_channel_wires_both_sides(tmp_path, monkeypatch):
     """User-named channel must survive the cross-node wire path.
 
@@ -285,42 +349,20 @@ async def test_cross_node_user_named_channel_wires_both_sides(tmp_path, monkeypa
                 graph_a != graph_b
             ), "creatures on different workers must start in different graphs"
 
-            # --- declare 'my_channel' in A's graph ---------------------
-            ch_resp = await asyncio.wait_for(
+            # Explicit endpoint identities establish the cross-node link and
+            # declare the user-named channel on both worker-local graphs.
+            connected = await asyncio.wait_for(
                 host.http.post(
-                    f"/api/sessions/topology/{graph_a}/channels",
-                    json={"name": "my_channel", "description": "user-named"},
+                    f"/api/sessions/topology/{graph_a}/connect",
+                    json={
+                        "sender": a_id,
+                        "receiver": b_id,
+                        "channel": "my_channel",
+                    },
                 ),
                 timeout=OP_TIMEOUT,
             )
-            assert (
-                ch_resp.status_code == 200
-            ), f"add_channel failed on graph_a: {ch_resp.text}"
-
-            # --- wire A → my_channel (same graph — should work) --------
-            wire_a = await asyncio.wait_for(
-                host.http.post(
-                    f"/api/sessions/topology/{graph_a}/creatures/{a_id}/wire",
-                    json={"channel": "my_channel", "direction": "send"},
-                ),
-                timeout=OP_TIMEOUT,
-            )
-            assert (
-                wire_a.status_code == 200
-            ), f"same-graph wire failed (sanity check): {wire_a.text}"
-
-            # --- wire my_channel → B (cross-graph — THE BUG) -----------
-            wire_b = await asyncio.wait_for(
-                host.http.post(
-                    f"/api/sessions/topology/{graph_b}/creatures/{b_id}/wire",
-                    json={"channel": "my_channel", "direction": "listen"},
-                ),
-                timeout=OP_TIMEOUT,
-            )
-            assert wire_b.status_code == 200, (
-                f"cross-graph wire of user-named channel failed (THE BUG): "
-                f"{wire_b.text}\nw2 stderr: {w2.dump_stderr()[:1500]}"
-            )
+            assert connected.status_code == 200, connected.text
 
             # --- both graphs must surface my_channel -------------------
             list_a = await asyncio.wait_for(
@@ -443,28 +485,13 @@ async def test_wire_new_channel_after_cross_node_setup(tmp_path, monkeypatch):
                     timeout=OP_TIMEOUT * 2,
                 )
             ).json()
-            graph_b = sb["session_id"]
             b_id = sb["creatures"][0]["creature_id"]
 
-            # Step 2: a→ch1→b cross-node.
-            await asyncio.wait_for(
-                host.http.post(
-                    f"/api/sessions/topology/{graph_a}/channels",
-                    json={"name": "ch1"},
-                ),
-                timeout=OP_TIMEOUT,
-            )
-            await asyncio.wait_for(
-                host.http.post(
-                    f"/api/sessions/topology/{graph_a}/creatures/{a_id}/wire",
-                    json={"channel": "ch1", "direction": "send"},
-                ),
-                timeout=OP_TIMEOUT,
-            )
+            # Step 2: explicitly connect a→ch1→b cross-node.
             r = await asyncio.wait_for(
                 host.http.post(
-                    f"/api/sessions/topology/{graph_b}/creatures/{b_id}/wire",
-                    json={"channel": "ch1", "direction": "listen"},
+                    f"/api/sessions/topology/{graph_a}/connect",
+                    json={"sender": a_id, "receiver": b_id, "channel": "ch1"},
                 ),
                 timeout=OP_TIMEOUT,
             )
@@ -556,32 +583,16 @@ async def test_cross_node_direct_output_wire(tmp_path, monkeypatch):
             graph_b = sb["session_id"]
             b_id = sb["creatures"][0]["creature_id"]
 
-            # Pre-state matching user's report: first do a→1→b
-            # (channel cross-node wire) before the direct output-wire.
-            ch_resp = await asyncio.wait_for(
+            # Pre-state matching user's report: first explicitly connect
+            # a→1→b before the direct output-wire.
+            connected = await asyncio.wait_for(
                 host.http.post(
-                    f"/api/sessions/topology/{graph_a}/channels",
-                    json={"name": "ch1"},
+                    f"/api/sessions/topology/{graph_a}/connect",
+                    json={"sender": a_id, "receiver": b_id, "channel": "ch1"},
                 ),
                 timeout=OP_TIMEOUT,
             )
-            assert ch_resp.status_code == 200, ch_resp.text
-            wire_a = await asyncio.wait_for(
-                host.http.post(
-                    f"/api/sessions/topology/{graph_a}/creatures/{a_id}/wire",
-                    json={"channel": "ch1", "direction": "send"},
-                ),
-                timeout=OP_TIMEOUT,
-            )
-            assert wire_a.status_code == 200, wire_a.text
-            wire_b = await asyncio.wait_for(
-                host.http.post(
-                    f"/api/sessions/topology/{graph_b}/creatures/{b_id}/wire",
-                    json={"channel": "ch1", "direction": "listen"},
-                ),
-                timeout=OP_TIMEOUT,
-            )
-            assert wire_b.status_code == 200, wire_b.text
+            assert connected.status_code == 200, connected.text
 
             # Now the user-reported step: direct b → a output wire
             # across workers (after a→1→b is set up).
@@ -668,29 +679,19 @@ async def test_cross_node_wire_renders_as_single_cluster_graph(tmp_path, monkeyp
             }
             assert {graph_a, graph_b} <= graph_ids_before
 
-            # User-named channel + cross-node wire.
-            await asyncio.wait_for(
+            # User-named channel + explicit cross-node connection.
+            connected = await asyncio.wait_for(
                 host.http.post(
-                    f"/api/sessions/topology/{graph_a}/channels",
-                    json={"name": "cluster_channel"},
+                    f"/api/sessions/topology/{graph_a}/connect",
+                    json={
+                        "sender": a_id,
+                        "receiver": b_id,
+                        "channel": "cluster_channel",
+                    },
                 ),
                 timeout=OP_TIMEOUT,
             )
-            await asyncio.wait_for(
-                host.http.post(
-                    f"/api/sessions/topology/{graph_a}/creatures/{a_id}/wire",
-                    json={"channel": "cluster_channel", "direction": "send"},
-                ),
-                timeout=OP_TIMEOUT,
-            )
-            wire_b = await asyncio.wait_for(
-                host.http.post(
-                    f"/api/sessions/topology/{graph_b}/creatures/{b_id}/wire",
-                    json={"channel": "cluster_channel", "direction": "listen"},
-                ),
-                timeout=OP_TIMEOUT,
-            )
-            assert wire_b.status_code == 200, wire_b.text
+            assert connected.status_code == 200, connected.text
 
             # Post-condition: the snapshot folds both engine graphs
             # into ONE cluster graph.

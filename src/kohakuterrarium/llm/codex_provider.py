@@ -1,9 +1,5 @@
 """
-Codex OAuth LLM provider - uses ChatGPT subscription for model access.
-
-Uses the OpenAI Python SDK with the Codex backend endpoint. Authenticates
-via OAuth PKCE (browser or device code flow). Billing goes to the user's
-ChatGPT Plus/Pro subscription, not API credits.
+Provide Responses API access through Codex OAuth or an explicit API key.
 """
 
 import asyncio
@@ -21,12 +17,12 @@ except ImportError:
     AsyncOpenAI = None  # type: ignore[assignment,misc]
     HAS_OPENAI = False
 
-from kohakuterrarium.llm.api_keys import KeyPool
 from kohakuterrarium.llm.base import (
     BaseLLMProvider,
     ChatResponse,
     LLMConfig,
     NativeToolCall,
+    OverflowRecoveryState,
     ToolSchema,
 )
 from kohakuterrarium.llm.codex_auth import CodexTokens, oauth_login, refresh_tokens
@@ -45,15 +41,14 @@ from kohakuterrarium.llm.codex_rate_limits import (
     UsageSnapshot,
     set_cached,
 )
-from kohakuterrarium.llm.openai import ROOCODE_USER_AGENT
 from kohakuterrarium.llm.openai_sanitize import strip_surrogates
 from kohakuterrarium.llm.recovery import (
     ErrorClass,
     RetryPolicy,
     backoff_delay,
     classify_openai_error,
-    drop_last_tool_round,
 )
+from kohakuterrarium.llm.responses_ws import ResponsesWSError, ResponsesWSSession
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -62,17 +57,11 @@ CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 
 
 async def _capture_rate_limit_headers(response: Any) -> None:
-    """httpx response hook — capture Codex rate-limit headers.
-
-    The Codex backend delivers ``x-codex-*`` rate-limit / credits /
-    promo headers on every response. This hook parses them and stores
-    the latest snapshot in the process-level cache for ``/codex-usage``
-    to read. Failure is silent — the hook must never break the request.
-    """
+    """Cache rate-limit headers without allowing telemetry failures to break requests."""
     try:
         snap = capture_from_headers(response.headers)
         set_cached(snap)
-    except Exception as exc:  # pragma: no cover - defensive
+    except Exception as exc:  # pragma: no cover - response hooks must be isolated
         logger.warning(
             "Codex rate-limit header capture failed",
             error=str(exc),
@@ -81,25 +70,11 @@ async def _capture_rate_limit_headers(response: Any) -> None:
 
 
 class CodexOAuthProvider(BaseLLMProvider):
-    """LLM provider using ChatGPT subscription via Codex OAuth.
+    """Stream Codex Responses API output with tools, retries, and token refresh."""
 
-    Uses the AsyncOpenAI SDK's Responses API routed through the Codex backend.
-    Supports streaming, tool calls, and auto token refresh.
-
-    Usage:
-        provider = CodexOAuthProvider(model="gpt-5.4")
-        await provider.ensure_authenticated()
-
-        async for chunk in provider.chat(messages, stream=True):
-            print(chunk, end="")
-    """
-
-    # Provider-native tool compatibility key — matches the
-    # ``provider_support`` declaration on ImageGenTool etc.
+    # Native tools use this key to declare provider compatibility.
     provider_name = "codex"
-    # Provider-native tools auto-injected into every creature that
-    # runs on this provider (opt-out via creature config's
-    # ``disable_provider_tools`` list).
+    # Image generation is available by default unless the creature opts out.
     provider_native_tools = frozenset({"image_gen"})
 
     def __init__(
@@ -111,24 +86,26 @@ class CodexOAuthProvider(BaseLLMProvider):
         timeout: float = 300.0,
         max_retries: int = 2,
         retry_policy: RetryPolicy | dict[str, Any] | None = None,
-        api_key: str | KeyPool | None = None,
+        api_key: str | None = None,
         base_url: str | None = None,
+        extra_body: dict[str, Any] | None = None,
+        websocket_mode: bool | None = None,
     ):
         super().__init__(LLMConfig(model=model, retry_policy=retry_policy))
         self.model = model
-        self.reasoning_effort = reasoning_effort  # none/minimal/low/medium/high/xhigh
-        self.service_tier = service_tier  # None/priority/flex
+        self.reasoning_effort = reasoning_effort  # Codex effort wire value.
+        self.service_tier = service_tier  # Optional Responses API service tier.
         self.timeout = timeout
         self.max_retries = max_retries
         self._retry_policy = RetryPolicy.from_value(retry_policy)
-        # API-key mode: when ``api_key`` is set, this provider speaks the
-        # OpenAI Responses API against ``base_url`` (default: the Codex
-        # ChatGPT backend) using API-key auth and SKIPS the Codex OAuth
-        # login entirely. When ``api_key`` is None it falls back to the
-        # ChatGPT-subscription OAuth flow (the historical behaviour).
-        self._api_key_pool = api_key if isinstance(api_key, KeyPool) else None
-        self._api_key = api_key.first if isinstance(api_key, KeyPool) else api_key
+        # An explicit key bypasses OAuth and targets the configured Responses endpoint.
+        self._api_key = api_key
         self._base_url = base_url
+        self.extra_body = dict(extra_body or {})
+        if websocket_mode is None:
+            websocket_mode = bool(self.extra_body.get("websocket_mode"))
+        self._websocket_mode = bool(websocket_mode)
+        self._ws_session: ResponsesWSSession | None = None
         self._tokens: CodexTokens | None = None
         self._client: Any = None  # AsyncOpenAI
         self._last_tool_calls: list[NativeToolCall] = []
@@ -136,21 +113,8 @@ class CodexOAuthProvider(BaseLLMProvider):
         self._last_assistant_parts: list[Any] = []
         self.prompt_cache_key: str | None = None
 
-    def _apply_request_api_key(self, create_kwargs: dict[str, Any]) -> None:
-        """Attach the next pooled API key to one Responses request."""
-        if not self._api_key_pool:
-            return
-        headers = dict(create_kwargs.get("extra_headers") or {})
-        headers["Authorization"] = f"Bearer {self._api_key_pool.next()}"
-        create_kwargs["extra_headers"] = headers
-
     async def ensure_authenticated(self) -> None:
-        """Ensure the client is ready.
-
-        API-key mode builds the client straight away (no OAuth). OAuth
-        mode loads/refreshes Codex tokens, opening the browser/device-code
-        login if none exist.
-        """
+        """Build the client from an API key or a valid OAuth token set."""
         if self._api_key:
             self._rebuild_client()
             return
@@ -170,24 +134,15 @@ class CodexOAuthProvider(BaseLLMProvider):
         self._rebuild_client()
 
     def _rebuild_client(self) -> None:
-        """Create or recreate the AsyncOpenAI client with current token.
-
-        Installs an httpx response event hook that captures rate-limit
-        headers from every Codex response into the process-level cache
-        (see ``codex_rate_limits.set_cached``). This replaces the dead
-        ``/backend-api/codex/usage`` endpoint — rate limits now ride on
-        every real API call's response.
-        """
+        """Recreate the SDK client and attach passive rate-limit capture."""
         if not HAS_OPENAI:
             raise ImportError("openai not installed. Install with: pip install openai")
-        # Resolve auth: explicit API key wins; otherwise the OAuth token.
+        # Explicit credentials must take precedence over cached OAuth state.
         key = self._api_key or (self._tokens.access_token if self._tokens else None)
         if not key:
             return
 
-        # Custom httpx client with a response hook so we can observe
-        # rate-limit headers on every response without changing the
-        # streaming / non-streaming code paths.
+        # A response hook keeps rate-limit capture identical across request modes.
         http_client = httpx.AsyncClient(
             event_hooks={"response": [_capture_rate_limit_headers]},
             timeout=self.timeout,
@@ -197,7 +152,6 @@ class CodexOAuthProvider(BaseLLMProvider):
             base_url=self._base_url or CODEX_BASE_URL,
             timeout=self.timeout,
             max_retries=self.max_retries,
-            default_headers={"User-Agent": ROOCODE_USER_AGENT},
             http_client=http_client,
         )
 
@@ -220,23 +174,11 @@ class CodexOAuthProvider(BaseLLMProvider):
 
     @property
     def last_assistant_content_parts(self) -> list[Any] | None:
-        """Structured assistant parts from the most recent turn.
-
-        The Codex provider captures images emitted via the
-        ``image_generation`` built-in tool (and may later add other
-        structured outputs here). Returns ``None`` when the turn was
-        plain text so the controller keeps the zero-overhead fast path.
-        """
+        """Return generated images and other structured parts from the last turn."""
         return self._last_assistant_parts or None
 
     def translate_provider_native_tool(self, tool: Any) -> dict | None:
-        """Map a KT provider-native tool onto a Codex Responses tool spec.
-
-        Currently supports ``image_gen`` (see
-        :mod:`kohakuterrarium.llm.codex_image_gen`). Future Codex
-        built-ins plug in here — dispatch by tool name, return
-        ``None`` for anything this provider doesn't handle.
-        """
+        """Translate supported native tools into Codex Responses schemas."""
         return translate_image_gen_tool(tool)
 
     def with_model(self, name: str) -> "CodexOAuthProvider":
@@ -250,8 +192,10 @@ class CodexOAuthProvider(BaseLLMProvider):
             timeout=self.timeout,
             max_retries=self.max_retries,
             retry_policy=self._retry_policy,
-            api_key=self._api_key_pool or self._api_key,
+            api_key=self._api_key,
             base_url=self._base_url,
+            extra_body=dict(self.extra_body),
+            websocket_mode=self._websocket_mode,
         )
         clone._tokens = self._tokens
         clone._client = self._client
@@ -261,16 +205,8 @@ class CodexOAuthProvider(BaseLLMProvider):
         clone._profile_max_context = getattr(self, "_profile_max_context", None)
         return clone
 
-    # ------------------------------------------------------------------
-    # Chat Completions -> Responses API message conversion
-    # ------------------------------------------------------------------
-
     _to_responses_input = staticmethod(to_responses_input)
     _fix_tool_call_pairing = staticmethod(fix_tool_call_pairing)
-
-    # ------------------------------------------------------------------
-    # Streaming (called by BaseLLMProvider.chat)
-    # ------------------------------------------------------------------
 
     async def _stream_chat(
         self,
@@ -280,19 +216,10 @@ class CodexOAuthProvider(BaseLLMProvider):
         provider_native_tools: list[Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        """Stream response from Codex backend with KT-side retry.
-
-        Mirrors the OpenAI / Anthropic provider retry pattern so a
-        transient mid-stream failure (httpx ``RemoteProtocolError``,
-        connection reset, 5xx, 429) is retried per the configured
-        ``RetryPolicy`` instead of bubbling up to the agent loop.
-        Only explicit user-error classes (4xx / unknown-status that
-        the classifier rules out) escape without retry.
-        """
+        """Stream with classified retries and two-stage overflow recovery."""
         current = messages
         attempt = 0
-        api_key_failures = 0
-        overflow_recovered = False
+        overflow_state = OverflowRecoveryState()
         while True:
             try:
                 async for chunk in self._raw_stream_chat(
@@ -305,25 +232,13 @@ class CodexOAuthProvider(BaseLLMProvider):
                 return
             except Exception as exc:
                 cls = classify_openai_error(exc)
-                if cls is ErrorClass.OVERFLOW and not overflow_recovered:
-                    dropped, recovered = drop_last_tool_round(current)
-                    if dropped:
-                        overflow_recovered = True
-                        current = recovered
-                        self._notify_emergency_drop(recovered)
-                        logger.warning(
-                            "provider_emergency_drop",
-                            dropped=dropped,
-                            recovered_messages=len(recovered),
-                        )
+                if cls is ErrorClass.OVERFLOW:
+                    replacement = await self._recover_from_overflow(
+                        current, overflow_state
+                    )
+                    if replacement is not None:
+                        current = replacement
                         continue
-                if cls is not ErrorClass.OVERFLOW and self._api_key_pool:
-                    api_key_failures += 1
-                    if self._should_failover_api_key(cls, api_key_failures - 1):
-                        self._log_api_key_failover(cls, api_key_failures, exc)
-                        continue
-                    if self._api_key_failover_limit() > 1:
-                        raise
                 if (
                     cls in self._retry_policy.retry_classes
                     and attempt < self._retry_policy.max_retries
@@ -349,7 +264,7 @@ class CodexOAuthProvider(BaseLLMProvider):
         provider_native_tools: list[Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        """Single-shot stream attempt — wrapped by ``_stream_chat`` for retries."""
+        """Perform one streaming request without retry orchestration."""
         self._last_tool_calls = []
         self._last_usage = {}
         self._last_assistant_parts = []
@@ -358,7 +273,7 @@ class CodexOAuthProvider(BaseLLMProvider):
         if not self._client:
             self._rebuild_client()
 
-        # Extract system message as instructions
+        # Responses API carries system content separately as instructions.
         instructions = ""
         input_messages = []
         for msg in messages:
@@ -367,11 +282,9 @@ class CodexOAuthProvider(BaseLLMProvider):
             else:
                 input_messages.append(msg)
 
-        # Convert Chat Completions format to Responses API flat array
         api_input = to_responses_input(input_messages)
 
-        # Build tools in Responses API format — normal function tools
-        # first, provider-native translations appended after.
+        # Function tools precede provider-native tools in the outbound list.
         api_tools: list[dict[str, Any]] | None = None
         if tools:
             api_tools = [
@@ -384,9 +297,7 @@ class CodexOAuthProvider(BaseLLMProvider):
                 for t in tools
             ]
 
-        # Track the output format we requested for each provider-native
-        # image tool so we can reconstruct a valid data URL extension
-        # when image_generation_call lands in the stream.
+        # The requested format determines the data URL media extension on output.
         self._image_gen_output_format: str = "png"
         if provider_native_tools:
             for native in provider_native_tools:
@@ -397,10 +308,6 @@ class CodexOAuthProvider(BaseLLMProvider):
                 if spec.get("type") == "image_generation":
                     self._image_gen_output_format = spec.get("output_format", "png")
 
-        # Validate: function_call must be immediately followed by function_call_output
-        # with matching call_id. Reorder, add placeholders, remove orphans.
-        api_input = fix_tool_call_pairing(api_input)
-
         logger.debug(
             "Codex API request",
             model=self.model,
@@ -408,34 +315,69 @@ class CodexOAuthProvider(BaseLLMProvider):
             input_preview=_json.dumps(api_input, ensure_ascii=False)[:500],
         )
 
-        # Build optional params
         extra_params: dict[str, Any] = {}
-        if self.reasoning_effort and self.reasoning_effort != "none":
-            extra_params["reasoning"] = {"effort": self.reasoning_effort}
+        reasoning = self._merged_reasoning()
+        if reasoning:
+            extra_params["reasoning"] = reasoning
         if self.service_tier:
             extra_params["service_tier"] = self.service_tier
+        wire_extra = self._wire_extra_body()
 
         instr_text = instructions or "You are a helpful assistant."
-        # Prompt cache key: routes requests to the same backend server,
-        # dramatically improving cache hit rates. Falls back to system
-        # prompt hash if no session-level key is set.
+        # Stable routing improves prompt-cache reuse; the prompt hash is the fallback.
         cache_key = (
             self.prompt_cache_key
             or hashlib.sha256(instr_text.encode()).hexdigest()[:32]
         )
-        # ``session_id`` is a ChatGPT/Codex-internal routing header; a
-        # third-party OpenAI-compatible Responses endpoint may reject it,
-        # so only send it in OAuth mode. ``prompt_cache_key`` is a standard
-        # OpenAI Responses param and stays in both modes.
-        if not self._api_key:
-            extra_params["extra_headers"] = {"session_id": cache_key}
-        self._apply_request_api_key(extra_params)
+        # Third-party Responses endpoints may reject Codex's internal session header.
+        session_headers = {} if self._api_key else {"session_id": cache_key}
+
+        collected_tool_calls: list[NativeToolCall] = []
+
+        if self._websocket_mode:
+            session = self._ws_session_for_turn(session_headers)
+            if session is not None:
+                base_event: dict[str, Any] = {
+                    "model": self.model,
+                    "instructions": instr_text,
+                    "store": False,
+                    "prompt_cache_key": cache_key,
+                    **extra_params,
+                    **wire_extra,
+                }
+                if api_tools:
+                    base_event["tools"] = api_tools
+                try:
+                    async for event in session.stream_turn(
+                        base_event, api_input, fix_tool_call_pairing
+                    ):
+                        piece = self._process_stream_event(event, collected_tool_calls)
+                        if piece is not None:
+                            yield piece
+                    self._last_tool_calls = collected_tool_calls
+                    return
+                except ResponsesWSError as exc:
+                    if exc.mid_stream:
+                        raise
+                    logger.warning(
+                        "Codex WebSocket turn unavailable, using HTTP",
+                        error=str(exc),
+                    )
+        # An HTTP turn advances the conversation past the WS-side cache.
+        if self._ws_session is not None:
+            self._ws_session.invalidate()
+
+        if session_headers:
+            extra_params["extra_headers"] = session_headers
+        if wire_extra:
+            extra_params["extra_body"] = wire_extra
 
         try:
             stream = await self._client.responses.create(
                 model=self.model,
                 instructions=instr_text,
-                input=api_input,
+                # Codex requires each function call adjacent to its matching output.
+                input=fix_tool_call_pairing(api_input),
                 tools=api_tools,
                 store=False,
                 stream=True,
@@ -446,68 +388,17 @@ class CodexOAuthProvider(BaseLLMProvider):
             logger.error("Codex API request failed", error=str(e))
             raise
 
-        # Process async stream events directly
-        collected_tool_calls: list[NativeToolCall] = []
-
         async for event in stream:
-            # Capture inline rate-limit SSE events if the backend emits them.
-            # These carry the same data as response headers but arrive
-            # during the stream, which can be fresher for long completions.
-            # We don't branch on a specific codex event name here because
-            # the SDK doesn't know about ``codex.rate_limits``; the
-            # payload (if present) rides under a generic event type.
-            maybe_capture_stream_rate_limit(
-                event, parse_rate_limit_event, UsageSnapshot, set_cached
-            )
-
-            match event.type:
-                case "response.output_text.delta":
-                    yield strip_surrogates(event.delta)
-                case "response.output_item.done":
-                    item = event.item
-                    itype = getattr(item, "type", "")
-                    if itype == "function_call":
-                        collected_tool_calls.append(
-                            NativeToolCall(
-                                id=getattr(item, "call_id", ""),
-                                name=getattr(item, "name", "") or "",
-                                arguments=getattr(item, "arguments", ""),
-                            )
-                        )
-                    elif itype == "image_generation_call":
-                        # Built-in image_generation tool output. Status
-                        # at this event is typically "generating" — the
-                        # image bytes are already in `result`; don't
-                        # gate on status == "completed".
-                        self._handle_image_generation_call(item)
-                case "response.completed":
-                    # Extract usage from completed response
-                    resp = getattr(event, "response", None)
-                    if resp:
-                        u = getattr(resp, "usage", None)
-                        if u:
-                            cached = 0
-                            # Responses API: input_tokens_details
-                            details = getattr(u, "input_tokens_details", None)
-                            if details:
-                                cached = getattr(details, "cached_tokens", 0) or 0
-                            self._last_usage = {
-                                "prompt_tokens": getattr(u, "input_tokens", 0),
-                                "completion_tokens": getattr(u, "output_tokens", 0),
-                                "total_tokens": getattr(u, "total_tokens", 0),
-                                "cached_tokens": cached,
-                            }
+            piece = self._process_stream_event(event, collected_tool_calls)
+            if piece is not None:
+                yield piece
 
         self._last_tool_calls = collected_tool_calls
-
-    # ------------------------------------------------------------------
-    # Non-streaming
-    # ------------------------------------------------------------------
 
     async def _complete_chat(
         self, messages: list[dict[str, Any]], **kwargs: Any
     ) -> ChatResponse:
-        """Non-streaming completion (collects streaming output)."""
+        """Collect the streaming implementation into one complete response."""
         parts: list[str] = []
         async for chunk in self._stream_chat(messages, **kwargs):
             parts.append(chunk)
@@ -518,6 +409,85 @@ class CodexOAuthProvider(BaseLLMProvider):
             model=self.model,
         )
 
+    def _merged_reasoning(self) -> dict[str, Any]:
+        """Combine the effort field with reasoning overrides from extra_body."""
+        reasoning: dict[str, Any] = {}
+        if self.reasoning_effort and self.reasoning_effort != "none":
+            reasoning["effort"] = self.reasoning_effort
+        override = self.extra_body.get("reasoning")
+        if isinstance(override, dict):
+            reasoning.update(override)
+        return reasoning
+
+    def _wire_extra_body(self) -> dict[str, Any]:
+        """Return extra_body wire fields (framework knobs and reasoning removed)."""
+        return {
+            k: v
+            for k, v in self.extra_body.items()
+            if k not in ("reasoning", "websocket_mode", "disable_prompt_caching")
+        }
+
+    def _ws_session_for_turn(
+        self, session_headers: dict[str, str]
+    ) -> ResponsesWSSession | None:
+        """Return the WS session, or ``None`` when a turn is already in flight."""
+        self._ws_headers = dict(session_headers)
+        if self._ws_session is None:
+
+            def _factory() -> Any:
+                # Late-bound so credential reloads and header updates apply.
+                return self._client.responses.connect(
+                    max_retries=0, extra_headers=dict(self._ws_headers)
+                )
+
+            self._ws_session = ResponsesWSSession(_factory)
+        if self._ws_session.busy:
+            return None
+        return self._ws_session
+
+    def _process_stream_event(
+        self, event: Any, collected_tool_calls: list[NativeToolCall]
+    ) -> str | None:
+        """Fold one Responses stream event into provider state; return text."""
+        # Generic SDK events may carry fresher inline rate-limit payloads.
+        maybe_capture_stream_rate_limit(
+            event, parse_rate_limit_event, UsageSnapshot, set_cached
+        )
+
+        match getattr(event, "type", ""):
+            case "response.output_text.delta":
+                return strip_surrogates(event.delta)
+            case "response.output_item.done":
+                item = event.item
+                itype = getattr(item, "type", "")
+                if itype == "function_call":
+                    collected_tool_calls.append(
+                        NativeToolCall(
+                            id=getattr(item, "call_id", ""),
+                            name=getattr(item, "name", "") or "",
+                            arguments=getattr(item, "arguments", ""),
+                        )
+                    )
+                elif itype == "image_generation_call":
+                    # Image bytes are available before the item status completes.
+                    self._handle_image_generation_call(item)
+            case "response.completed":
+                resp = getattr(event, "response", None)
+                if resp:
+                    u = getattr(resp, "usage", None)
+                    if u:
+                        cached = 0
+                        details = getattr(u, "input_tokens_details", None)
+                        if details:
+                            cached = getattr(details, "cached_tokens", 0) or 0
+                        self._last_usage = {
+                            "prompt_tokens": getattr(u, "input_tokens", 0),
+                            "completion_tokens": getattr(u, "output_tokens", 0),
+                            "total_tokens": getattr(u, "total_tokens", 0),
+                            "cached_tokens": cached,
+                        }
+        return None
+
     def _handle_image_generation_call(self, item: Any) -> None:
         """Append an ImagePart for an ``image_generation_call`` item."""
         part = build_image_part(item, self._image_gen_output_format)
@@ -525,7 +495,10 @@ class CodexOAuthProvider(BaseLLMProvider):
             self._last_assistant_parts.append(part)
 
     async def close(self) -> None:
-        """Cleanup."""
+        """Close the WebSocket session and the underlying SDK client."""
+        if self._ws_session is not None:
+            await self._ws_session.close()
+            self._ws_session = None
         if self._client:
             await self._client.close()
         self._client = None

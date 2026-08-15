@@ -25,6 +25,9 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from kohakuterrarium.studio.identity.mcp_servers import load_servers, save_servers
+from kohakuterrarium.builtins.cli_rich.dialogs.settings_drives import (
+    DriveSettingsSection,
+)
 from kohakuterrarium.builtins.cli_rich.dialogs.settings_model import TABS
 from kohakuterrarium.builtins.cli_rich.dialogs.settings_render import render_overlay
 from kohakuterrarium.llm.api_keys import PROVIDER_KEY_MAP, get_api_key, save_api_key
@@ -66,22 +69,18 @@ class FormField:
     label: str
     key: str
     value: str = ""
-    # When non-empty, the field is an enum; left/right cycles options.
     options: list[str] | None = None
-    # When True, the field accepts free text (password-style mask in render).
     secret: bool = False
-    # Optional help text shown dim below the field label.
     hint: str = ""
 
 
 @dataclass
 class FormState:
     title: str
-    action: str  # one of: set_key, add_provider, edit_provider, add_mcp, edit_mcp
+    action: str  # set_key, add_provider, edit_provider, add_mcp, or edit_mcp
     fields: list[FormField]
     cursor: int = 0
-    message: str = ""  # transient error/warning shown while the form is open
-    # Context passed back to the action handler (e.g. provider name for set_key).
+    message: str = ""
     context: dict[str, Any] = field(default_factory=dict)
 
 
@@ -95,17 +94,16 @@ class ConfirmState:
 class SettingsOverlay:
     """Tabbed settings editor with list/form/confirm modes."""
 
-    def __init__(self) -> None:
+    def __init__(self, get_engine: Any = None) -> None:
         self.visible = False
-        self.mode = "list"  # list | form | confirm
+        self.mode = "list"  # list, form, or confirm
         self.tab = TABS[0]
         self._cursor: dict[str, int] = {t: 0 for t in TABS}
         self._entries: dict[str, list[dict[str, Any]]] = {t: [] for t in TABS}
         self._form: FormState | None = None
         self._confirm: ConfirmState | None = None
-        self._flash: str = ""  # transient status line under the tab row
-
-    # ── Lifecycle ───────────────────────────────────────────────
+        self._flash: str = ""
+        self.drive_section = DriveSettingsSection(get_engine=get_engine)
 
     def open(self) -> None:
         self.mode = "list"
@@ -126,8 +124,6 @@ class SettingsOverlay:
         """True when printable characters should flow into a form field."""
         return self.visible and self.mode == "form" and self._form is not None
 
-    # ── Data refresh ────────────────────────────────────────────
-
     def _refresh_all(self) -> None:
         for tab in TABS:
             self._refresh_tab(tab)
@@ -142,10 +138,11 @@ class SettingsOverlay:
                 self._entries[tab] = self._load_models()
             elif tab == "MCP":
                 self._entries[tab] = self._load_mcp()
+            elif tab == "Drives":
+                self.drive_section.reload()
         except Exception as e:
             logger.warning("settings: refresh failed", tab=tab, error=str(e))
             self._entries[tab] = []
-        # Clamp cursor to new list size.
         total = len(self._entries[tab])
         if total == 0:
             self._cursor[tab] = 0
@@ -156,21 +153,8 @@ class SettingsOverlay:
         backends = load_backends()
         rows: list[dict[str, Any]] = []
         for name, backend in sorted(backends.items()):
-            if backend.auth_mode == "none":
-                rows.append(
-                    {
-                        "provider": name,
-                        "masked": "(no authentication)",
-                        "has_key": False,
-                        "env": "",
-                        "readonly": True,
-                    }
-                )
-                continue
             if backend.backend_type == "codex":
-                # Codex uses OAuth, not an API key — surface that fact but
-                # don't treat it as editable here (``kt login codex`` owns
-                # the OAuth flow).
+                # OAuth credentials are managed by the login flow, not this form.
                 rows.append(
                     {
                         "provider": name,
@@ -181,14 +165,25 @@ class SettingsOverlay:
                     }
                 )
                 continue
-            key_pool = get_api_key(name)
-            masked = _mask_key(key_pool.first) if key_pool else ""
+            key = get_api_key(name)
+            masked = _mask_key(key) if key else ""
             rows.append(
                 {
                     "provider": name,
                     "masked": masked or "(not set)",
-                    "has_key": bool(key_pool),
+                    "has_key": bool(key),
                     "env": backend.api_key_env or PROVIDER_KEY_MAP.get(name, ""),
+                    "readonly": False,
+                }
+            )
+        for name in sorted(set(PROVIDER_KEY_MAP) - set(backends)):
+            key = get_api_key(name)
+            rows.append(
+                {
+                    "provider": name,
+                    "masked": _mask_key(key) if key else "(not set)",
+                    "has_key": bool(key),
+                    "env": PROVIDER_KEY_MAP[name],
                     "readonly": False,
                 }
             )
@@ -203,7 +198,6 @@ class SettingsOverlay:
                     "backend_type": backend.backend_type,
                     "base_url": backend.base_url or "",
                     "api_key_env": backend.api_key_env or "",
-                    "auth_mode": backend.auth_mode,
                     "built_in": name in _BUILTIN_PROVIDERS,
                 }
             )
@@ -214,7 +208,7 @@ class SettingsOverlay:
         entries = list_all_presets()
         user_keys = set(load_presets().keys())
         default = get_default_model()
-        # default may be ``provider/name`` or a bare legacy name.
+        # Legacy defaults may omit the provider prefix.
         default_provider, default_bare = (
             default.split("/", 1) if "/" in default else ("", default)
         )
@@ -258,22 +252,39 @@ class SettingsOverlay:
         rows.append({"name": "+ Add new MCP server…", "is_add_row": True})
         return rows
 
-    # ── Keyboard ────────────────────────────────────────────────
-
     def handle_key(self, key: str) -> bool:
         """Route named keys (up/down/enter/escape/tab/backspace/…)."""
         if not self.visible:
             return False
+        if self.tab == "Drives" and self.mode == "list":
+            return self._drives_key(key)
         if self.mode == "confirm":
             return self._confirm_key(key)
         if self.mode == "form":
             return self._form_key(key)
         return self._list_key(key)
 
+    def _drives_key(self, key: str) -> bool:
+        """Named-key routing for the Drives tab (tab switch + section)."""
+        section = self.drive_section
+        if not section.editing:
+            if key == "escape":
+                self.close()
+                return True
+            if key == "tab":
+                self._cycle_tab(1)
+                return True
+            if key in ("s-tab", "backtab"):
+                self._cycle_tab(-1)
+                return True
+        return section.handle_key(key)
+
     def handle_text(self, char: str) -> bool:
         """Route a printable char (single-character ``event.data``)."""
         if not self.visible or not char:
             return False
+        if self.tab == "Drives" and self.mode == "list":
+            return self.drive_section.handle_text(char)
         if self.mode == "confirm":
             if char in ("y", "Y"):
                 self._confirm_apply(True)
@@ -281,13 +292,12 @@ class SettingsOverlay:
             if char in ("n", "N"):
                 self._confirm_apply(False)
                 return True
-            return True  # swallow stray chars in confirm mode
+            return True  # Confirm mode owns all printable input.
         if self.mode == "form":
             field_ = self._form_current_field()
             if field_ is None:
                 return True
-            # Enum fields: type letter jumps to first option starting with it
-            # (bash-readline style). Keeps UX consistent with left/right.
+            # Typing selects the first matching enum option.
             if field_.options:
                 for opt in field_.options:
                     if opt.lower().startswith(char.lower()):
@@ -296,10 +306,7 @@ class SettingsOverlay:
                 return True
             field_.value += char
             return True
-        # list mode — actions on letter keys
         return self._list_letter(char)
-
-    # ── List mode ───────────────────────────────────────────────
 
     def _list_key(self, key: str) -> bool:
         if key in ("escape",):
@@ -332,9 +339,7 @@ class SettingsOverlay:
         if char == "d":
             self._list_delete()
             return True
-        # Consume other printable chars silently so they don't leak into
-        # the composer's textarea. This matters because the overlay is
-        # modal — anything the user types with it open should stay here.
+        # Modal input must not leak into the composer behind the overlay.
         return True
 
     def _current_row(self) -> dict[str, Any] | None:
@@ -358,6 +363,8 @@ class SettingsOverlay:
         idx = (idx + delta) % len(TABS)
         self.tab = TABS[idx]
         self._flash = ""
+        if self.tab == "Drives" and not self.drive_section.editing:
+            self.drive_section.reload()
 
     def _list_activate(self) -> None:
         row = self._current_row()
@@ -367,19 +374,16 @@ class SettingsOverlay:
             if row.get("readonly"):
                 self._flash = f"{row['provider']}: OAuth — run /login codex"
                 return
-            env_hint = f"env fallback: {row['env']}" if row["env"] else ""
-            pool_hint = "Multiple keys: separate with comma for round-robin"
-            hint = f"{env_hint}  |  {pool_hint}" if env_hint else pool_hint
             self._form = FormState(
                 title=f"Set API key · {row['provider']}",
                 action="set_key",
                 fields=[
                     FormField(
-                        label="API Key(s)",
+                        label="API Key",
                         key="key",
                         value="",
                         secret=True,
-                        hint=hint,
+                        hint=(f"env fallback: {row['env']}" if row["env"] else ""),
                     ),
                 ],
                 context={"provider": row["provider"]},
@@ -463,8 +467,6 @@ class SettingsOverlay:
             self.mode = "confirm"
             return
 
-    # ── Form mode ───────────────────────────────────────────────
-
     def _build_provider_form(self, row: dict[str, Any] | None) -> FormState:
         editing = row is not None
         return FormState(
@@ -489,13 +491,6 @@ class SettingsOverlay:
                     key="base_url",
                     value=(row.get("base_url", "") if row else ""),
                     hint="e.g. https://api.example.com/v1",
-                ),
-                FormField(
-                    label="Authentication",
-                    key="auth_mode",
-                    value=(row.get("auth_mode", "api_key") if row else "api_key"),
-                    options=["api_key", "none"],
-                    hint="none: send an empty Authorization header",
                 ),
                 FormField(
                     label="API key env",
@@ -590,13 +585,12 @@ class SettingsOverlay:
                 field_.value = field_.value[:-1]
             return True
         if key == "enter":
-            # Last field → submit; otherwise advance.
             if self._form.cursor < len(self._form.fields) - 1:
                 self._form.cursor += 1
                 return True
             self._form_submit()
             return True
-        return True  # swallow — the form is modal while open
+        return True  # The modal form owns all named keys.
 
     def _cycle_field_option(self, field_: FormField, delta: int) -> None:
         opts = field_.options or []
@@ -617,15 +611,10 @@ class SettingsOverlay:
         try:
             if action == "set_key":
                 provider = ctx["provider"]
-                raw = values.get("key", "")
-                if not raw:
+                if not values.get("key"):
                     self._form.message = "Key cannot be empty"
                     return
-                keys = [key.strip() for key in raw.split(",") if key.strip()]
-                if not keys:
-                    self._form.message = "Key cannot be empty"
-                    return
-                save_api_key(provider, keys if len(keys) > 1 else keys[0])
+                save_api_key(provider, values["key"])
                 self._flash = f"API key saved for {provider}"
                 self._refresh_tab("Keys")
             elif action in ("add_provider", "edit_provider"):
@@ -636,8 +625,7 @@ class SettingsOverlay:
                 if action == "add_provider" and name in load_backends():
                     self._form.message = f"Provider {name} already exists"
                     return
-                # Rename not supported inline — delete + readd would lose
-                # presets pinned to the old name. Block it explicitly.
+                # Renaming would orphan presets pinned to the original provider.
                 if (
                     action == "edit_provider"
                     and ctx.get("original_name")
@@ -650,7 +638,6 @@ class SettingsOverlay:
                     backend_type=values.get("backend_type", "openai"),
                     base_url=values.get("base_url", ""),
                     api_key_env=values.get("api_key_env", ""),
-                    auth_mode=values.get("auth_mode", "api_key"),
                 )
                 save_backend(backend)
                 self._flash = f"Provider saved: {name}"
@@ -662,7 +649,6 @@ class SettingsOverlay:
                     self._form.message = "Name is required"
                     return
                 servers = load_servers()
-                # Rename allowed on edit (filter by original, replace).
                 original = ctx.get("original_name", "")
                 servers = [s for s in servers if s.get("name") not in {name, original}]
                 servers.append(
@@ -689,8 +675,6 @@ class SettingsOverlay:
         self._form = None
         self.mode = "list"
 
-    # ── Confirm mode ────────────────────────────────────────────
-
     def _confirm_key(self, key: str) -> bool:
         if key == "escape":
             self._confirm = None
@@ -699,7 +683,7 @@ class SettingsOverlay:
         if key == "enter":
             self._confirm_apply(True)
             return True
-        return True  # modal — swallow other named keys
+        return True  # The modal confirmation owns all named keys.
 
     def _confirm_apply(self, yes: bool) -> None:
         state = self._confirm
@@ -732,8 +716,6 @@ class SettingsOverlay:
                 self._refresh_tab("MCP")
         except Exception as e:
             self._flash = f"Error: {e}"
-
-    # ── Rendering ───────────────────────────────────────────────
 
     def render(self, width: int) -> str:
         return render_overlay(self, width)

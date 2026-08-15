@@ -1,24 +1,20 @@
 """Resolve local session-artifact image URLs to inline ``data:`` URLs.
 
-Tool images are materialized by the controller to
-``/api/sessions/{sid}/artifacts/{path}`` — a relative URL that points at
-our own FastAPI server (keeps the stored conversation small). External
-providers can't fetch a relative local path, so before sending we resolve
-it back to a base64 ``data:`` URL read from disk.
+Inline local session artifacts at the provider boundary.
 
-This was originally bespoke to the Codex provider; it now lives here so
-every provider (OpenAI, Anthropic, Codex) shares one implementation. The
-provider boundary is the right place: the stored conversation / session
-file keep the small ``/api/sessions/...`` URL, and only the outgoing
-request carries the inlined bytes.
+Stored conversations keep compact relative URLs, while outgoing requests use
+base64 data URLs that external providers can consume.
 """
 
 import base64
 import re
-from pathlib import Path
 from typing import Any
 
-from kohakuterrarium.session.artifacts import resolve_artifact_relpath
+from kohakuterrarium.studio.persistence.artifacts import (
+    resolve_artifact_file,
+    resolve_artifacts_dir,
+)
+from kohakuterrarium.studio.persistence.store import _session_dir
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -41,29 +37,18 @@ _ARTIFACT_MIME_BY_EXT = {
 }
 
 
-def resolve_artifact_url(url: str, artifact_store: Any = None) -> str:
-    """Resolve a current-session artifact URL to a data URL.
-
-    ``artifact_store`` is the trusted current-session boundary. URLs for any
-    other session, or calls without a bound store, are returned untouched.
-    """
+def resolve_artifact_url(url: str) -> str:
+    """Inline a local artifact URL, preserving the original URL on failure."""
     if not isinstance(url, str) or not url.startswith("/api/sessions/"):
         return url
     match = _ARTIFACT_URL_RE.match(url)
     if not match:
         return url
     sid = match.group("sid")
-    if artifact_store is None or sid != str(
-        getattr(artifact_store, "session_id", "") or ""
-    ):
-        return url
     rel = match.group("path")
     try:
-        artifacts = Path(artifact_store.artifacts_dir).resolve()
-        path = (artifacts / resolve_artifact_relpath(rel)).resolve()
-        path.relative_to(artifacts)
-        if not path.is_file():
-            return url
+        artifacts = resolve_artifacts_dir(sid, _session_dir())
+        path = resolve_artifact_file(artifacts, rel)
         data = path.read_bytes()
     except Exception as exc:
         logger.warning(
@@ -80,16 +65,9 @@ def resolve_artifact_url(url: str, artifact_store: Any = None) -> str:
 
 
 def resolve_message_image_urls(
-    messages: list[dict[str, Any]], artifact_store: Any = None
+    messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Resolve local artifact URLs inside every ``image_url`` content part.
-
-    Walks Chat-Completions-shaped messages and rewrites the ``url`` of any
-    ``image_url`` part that points at a local session artifact into a
-    ``data:`` URL. Identity-preserving: returns the original list (and
-    original message/part dicts) when nothing needed resolving, so the
-    common "no images / already-data-URL" path stays a no-op.
-    """
+    """Inline local image parts while preserving object identity when unchanged."""
     any_changed = False
     out: list[dict[str, Any]] = []
     for msg in messages:
@@ -107,11 +85,7 @@ def resolve_message_image_urls(
             ):
                 iu = part["image_url"]
                 url = iu.get("url")
-                resolved = (
-                    resolve_artifact_url(url, artifact_store)
-                    if isinstance(url, str)
-                    else url
-                )
+                resolved = resolve_artifact_url(url) if isinstance(url, str) else url
                 if resolved is not url and resolved != url:
                     new_content.append({**part, "image_url": {**iu, "url": resolved}})
                     msg_changed = True

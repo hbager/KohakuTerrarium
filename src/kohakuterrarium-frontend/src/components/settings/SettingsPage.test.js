@@ -1,5 +1,6 @@
 import { describe, expect, it, vi, beforeEach } from "vitest"
 import { mount, flushPromises } from "@vue/test-utils"
+import { createPinia, setActivePinia } from "pinia"
 import { nextTick, defineComponent } from "vue"
 
 vi.mock("element-plus", () => ({
@@ -75,6 +76,7 @@ vi.mock("@/components/settings/modals/MCPServerEditModal.vue", () => ({
 vi.mock("@/components/settings/SitesPane.vue", () => ({ default: { template: "<div />" } }))
 vi.mock("@/components/settings/UpdatesPanel.vue", () => ({ default: { template: "<div />" } }))
 vi.mock("@/components/cluster/SitePicker.vue", () => ({ default: { template: "<div />" } }))
+vi.mock("@/components/settings/DriveSettingsPanel.vue", () => ({ default: { template: "<div />" } }))
 vi.mock("@/components/settings/PresetEditor.vue", () => ({
   default: defineComponent({
     props: ["preset", "backends", "mode"],
@@ -121,6 +123,7 @@ function mountSettingsPage() {
 describe("SettingsPage default model selection", () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    setActivePinia(createPinia())
     settingsAPI.getKeys.mockResolvedValue({ providers: [] })
     settingsAPI.getBackends.mockResolvedValue({
       backends: [{ name: "openrouter", built_in: true }],
@@ -144,7 +147,7 @@ describe("SettingsPage default model selection", () => {
     })
   })
 
-  it("sets the default model with provider/name instead of the ambiguous bare preset name", async () => {
+  it("sets the default model using the provider-qualified selector", async () => {
     const wrapper = mountSettingsPage()
     await flushPromises()
     await nextTick()
@@ -155,11 +158,6 @@ describe("SettingsPage default model selection", () => {
     expect(presetRow).toBeTruthy()
     await presetRow.trigger("click")
     await nextTick()
-
-    const catalogEvents = []
-    window.addEventListener("model:catalog-changed", (event) => catalogEvents.push(event), {
-      once: true,
-    })
 
     const setDefaultButton = wrapper
       .findAll("button")
@@ -172,6 +170,5 @@ describe("SettingsPage default model selection", () => {
     expect(settingsAPI.setDefaultModel).toHaveBeenCalledWith(
       "openrouter/gpt-5.5-custom@reasoning=xhigh,speed=fast",
     )
-    expect(catalogEvents).toHaveLength(1)
   })
 })

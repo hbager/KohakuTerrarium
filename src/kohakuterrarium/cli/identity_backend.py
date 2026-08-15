@@ -14,6 +14,7 @@ from kohakuterrarium.studio.identity.llm_backends import (
 
 
 def list_cli() -> int:
+    """List configured LLM provider backends."""
     backends = list_backends()
     if not backends:
         print("No providers.")
@@ -34,6 +35,7 @@ def list_cli() -> int:
 
 
 def add_or_update_cli(name: str | None = None) -> int:
+    """Interactively add or update an LLM provider backend."""
     existing = get_backend(name) if name else None
     backend_name = name or _prompt("Provider name")
     if not backend_name:
@@ -43,11 +45,6 @@ def add_or_update_cli(name: str | None = None) -> int:
         "Backend type",
         ["openai", "openai_responses", "codex", "anthropic"],
         existing.backend_type if existing else "openai",
-    )
-    auth_mode = _prompt_choice(
-        "Authentication",
-        ["api_key", "none"],
-        existing.auth_mode if existing else "api_key",
     )
     provider_name = _prompt(
         "Provider identity (for native-tool compatibility)",
@@ -64,7 +61,6 @@ def add_or_update_cli(name: str | None = None) -> int:
             api_key_env=_prompt(
                 "API key env", existing.api_key_env if existing else ""
             ),
-            auth_mode=auth_mode,
             provider_name=provider_name.strip(),
             provider_native_tools=native_tools,
         )
@@ -76,6 +72,7 @@ def add_or_update_cli(name: str | None = None) -> int:
 
 
 def delete_cli(name: str) -> int:
+    """Delete a configured LLM provider backend."""
     try:
         deleted = remove_backend(name)
     except ValueError as e:

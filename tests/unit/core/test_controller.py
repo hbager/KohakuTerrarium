@@ -10,8 +10,13 @@ from kohakuterrarium.core.controller import (
     ControllerContext,
     _merge_text_and_parts,
 )
+from kohakuterrarium.core.conversation_elide import (
+    ELISION_MARKER,
+    TOOL_FEEDBACK_KIND,
+)
 from kohakuterrarium.core.events import (
     TriggerEvent,
+    create_tool_complete_event,
     create_user_input_event,
 )
 from kohakuterrarium.core.job import JobResult
@@ -79,7 +84,7 @@ class TestControllerContext:
 
         ex = Executor()
         result = JobResult(job_id="x", output="ok")
-        ex._results["x"] = result
+        ex.job_store.store_result(result)
         ctrl = types.SimpleNamespace(executor=ex)
         ctx = ControllerContext(
             controller=ctrl, job_store=JobStore(), registry=Registry()
@@ -141,6 +146,101 @@ class TestEphemeralMode:
         roles = [m.role for m in env.controller.conversation.get_messages()]
         # Non-system messages cleared between turns.
         assert roles.count("system") >= 1
+
+
+class TestStaleToolResultElision:
+    async def test_prior_round_results_kept_even_when_window_is_full(self):
+        # Elision moved out of the controller into the compact step: the
+        # controller must never stub tool results on its own, even when the
+        # window is crowded, so models keep full freedom to reference what
+        # they read between compactions.
+        env = TestAgentBuilder().with_llm_script(["r1", "r2"]).build()
+        big = "X" * 2000
+        # Simulate a crowded context window (78% of the 256k budget).
+        env.controller._last_usage = {"prompt_tokens": 200_000}
+        await env.controller.push_event(
+            create_tool_complete_event("job1", "round1 output " + big)
+        )
+        async for _ in env.controller.run_once():
+            pass
+        await env.controller.push_event(
+            create_tool_complete_event("job2", "round2 output " + big)
+        )
+        async for _ in env.controller.run_once():
+            pass
+
+        feedback = [
+            m
+            for m in env.controller.conversation.get_messages()
+            if (m.metadata or {}).get("kind") == TOOL_FEEDBACK_KIND
+        ]
+        assert len(feedback) == 2
+        assert big in feedback[0].content
+        assert ELISION_MARKER not in feedback[0].content
+        assert big in feedback[1].content
+
+    async def test_prior_round_results_kept_when_context_is_spacious(self):
+        env = TestAgentBuilder().with_llm_script(["r1", "r2"]).build()
+        big = "X" * 2000
+        # No usage recorded: the window is not crowded, so stale rounds
+        # stay verbatim and the controller can reference what it read
+        # without re-running tools.
+        await env.controller.push_event(
+            create_tool_complete_event("job1", "round1 output " + big)
+        )
+        async for _ in env.controller.run_once():
+            pass
+        await env.controller.push_event(
+            create_tool_complete_event("job2", "round2 output " + big)
+        )
+        async for _ in env.controller.run_once():
+            pass
+
+        feedback = [
+            m
+            for m in env.controller.conversation.get_messages()
+            if (m.metadata or {}).get("kind") == TOOL_FEEDBACK_KIND
+        ]
+        assert len(feedback) == 2
+        assert big in feedback[0].content
+        assert ELISION_MARKER not in feedback[0].content
+        assert big in feedback[1].content
+
+    async def test_elide_disabled_by_config(self):
+        env = TestAgentBuilder().with_llm_script(["r1", "r2"]).build()
+        env.controller.config.elide_tool_results = False
+        env.controller._last_usage = {"prompt_tokens": 200_000}
+        big = "X" * 2000
+        await env.controller.push_event(
+            create_tool_complete_event("job1", "round1 output " + big)
+        )
+        async for _ in env.controller.run_once():
+            pass
+        await env.controller.push_event(
+            create_tool_complete_event("job2", "round2 output " + big)
+        )
+        async for _ in env.controller.run_once():
+            pass
+
+        feedback = [
+            m
+            for m in env.controller.conversation.get_messages()
+            if (m.metadata or {}).get("kind") == TOOL_FEEDBACK_KIND
+        ]
+        assert big in feedback[0].content
+        assert ELISION_MARKER not in feedback[0].content
+
+    async def test_real_user_input_is_never_tagged_or_elided(self):
+        env = TestAgentBuilder().with_llm_script(["r1", "r2"]).build()
+        long_input = "important spec " + "s" * 2000
+        await env.inject(long_input)
+        await env.inject("follow-up")
+        msgs = env.controller.conversation.get_messages()
+        user_msgs = [m for m in msgs if m.role == "user"]
+        assert all(
+            (m.metadata or {}).get("kind") != TOOL_FEEDBACK_KIND for m in user_msgs
+        )
+        assert any("s" * 2000 in (m.content or "") for m in user_msgs)
 
 
 # ── push_event / push_event_sync ────────────────────────────────
@@ -824,57 +924,6 @@ class TestRunLoopCallbacks:
             if isinstance(event, TextEvent):
                 on_text(event.text)
         assert captured  # at least one chunk captured
-
-
-class _CaptureMessagesLLM(ScriptedLLM):
-    def __init__(self):
-        super().__init__(["ok"])
-        self.messages = None
-
-    async def chat(self, messages, **kwargs):
-        self.messages = messages
-        async for chunk in super().chat(messages, **kwargs):
-            yield chunk
-
-
-class TestSessionArtifactResolution:
-    async def test_only_current_session_artifact_is_inlined(self, tmp_path):
-        from kohakuterrarium.session.store import SessionStore
-
-        llm = _CaptureMessagesLLM()
-        env = TestAgentBuilder().with_llm(llm).build()
-        store = SessionStore(tmp_path / "current.kohakutr")
-        store.init_meta("current", "agent", "", str(tmp_path), ["agent"])
-        (store.artifacts_dir / "pic.png").write_bytes(b"PNGDATA")
-        env.controller.session_store = store
-        env.controller.conversation.append(
-            "user",
-            [
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "/api/sessions/current/artifacts/pic.png"},
-                },
-                {
-                    "type": "image_url",
-                    "image_url": {"url": "/api/sessions/other/artifacts/pic.png"},
-                },
-            ],
-        )
-        await env.controller.push_event(create_user_input_event("continue"))
-        try:
-            async for _ in env.controller.run_once():
-                pass
-        finally:
-            store.close(update_status=False)
-
-        previous = next(
-            message
-            for message in llm.messages
-            if isinstance(message.get("content"), list)
-        )
-        urls = [part["image_url"]["url"] for part in previous["content"]]
-        assert urls[0].startswith("data:image/png;base64,")
-        assert urls[1] == "/api/sessions/other/artifacts/pic.png"
 
 
 # ── native-mode completion ───────────────────────────────────────

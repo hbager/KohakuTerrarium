@@ -37,12 +37,28 @@ from kohakuterrarium.core.config_types import (
 )
 from kohakuterrarium.modules.tool.base import ToolContext
 from kohakuterrarium.session.store import SessionStore
+import kohakuterrarium.terrarium.session_coord as _session_coord
+from kohakuterrarium.terrarium.drive.store import (
+    DriveRepositoryClosedError,
+    SqliteDriveRepository,
+)
 from kohakuterrarium.terrarium.config import (
     ChannelConfig,
     CreatureConfig,
     RootConfig,
     TerrariumConfig,
 )
+from kohakuterrarium.terrarium.drive.config import (
+    DriveRuntimeConfig,
+    default_registrations,
+)
+from kohakuterrarium.terrarium.drive.models import ActorRef, DriveStatus
+from kohakuterrarium.terrarium.drive.registration import (
+    DriveRegistrationDescriptor,
+    GenericDriveRegistration,
+)
+from kohakuterrarium.terrarium.drive.requests import CreateDriveRequest, DriveQuery
+from kohakuterrarium.testing.llm import ScriptEntry
 from kohakuterrarium.terrarium.engine import Terrarium
 from kohakuterrarium.terrarium.events import EventFilter, EventKind
 from kohakuterrarium.terrarium.output_log import OutputLogCapture
@@ -159,6 +175,7 @@ def _ctx_for(service: LocalTerrariumService, creature_id: str) -> ToolContext:
     env = engine._environments[creature.graph_id]
     return ToolContext(
         agent_name=creature.name,
+        creature_id=creature.creature_id,
         session=None,
         working_dir=Path("."),
         environment=env,
@@ -185,6 +202,25 @@ async def _settle() -> None:
     sync call returns. A few event-loop turns let it land."""
     for _ in range(5):
         await asyncio.sleep(0)
+
+
+class _TwoPartyReviewReg(GenericDriveRegistration):
+    """A ``review``-kind registration whose terminal completion needs a distinct
+    approver (verifier_mode ``two_party``), so a propose_transition PERSISTS a
+    pending proposal and emits ``drive_proposal_pending`` (item 5 event surface)."""
+
+    name = "review"
+    kind = "review"
+
+    def descriptor(self) -> DriveRegistrationDescriptor:
+        return DriveRegistrationDescriptor(
+            name=self.name,
+            kind=self.kind,
+            schema_version=1,
+            required_roles=frozenset({"spec", "transition", "readiness"}),
+            optional_roles=frozenset({"projection", "verifier", "prompt"}),
+            verifier_mode="two_party",
+        )
 
 
 # ===========================================================================
@@ -585,7 +621,7 @@ class TestTerrariumIntegration:
             context=ctx,
         )
         assert bad_target.error is not None
-        assert "not in your group" in bad_target.error
+        assert "not a creature in caller" in bad_target.error
         # unwire a channel not in the graph is rejected.
         bad_unwire = await GroupChannelTool()._execute(
             {
@@ -614,7 +650,7 @@ class TestTerrariumIntegration:
         assert gw_add.error is None, gw_add.error
         gw_edge_id = json.loads(gw_add.output)["edge_id"]
         assert gw_edge_id
-        assert any(e["to"] == "worker" for e in engine.list_output_wiring("lead"))
+        assert any(e["to"] == worker_id for e in engine.list_output_wiring("lead"))
         gw_rm = await GroupWireTool()._execute(
             {"action": "remove", "edge_id": gw_edge_id}, context=ctx
         )
@@ -709,9 +745,13 @@ class TestTerrariumIntegration:
         rm_res = await GroupRemoveNodeTool()._execute(
             {"creature_id": worker_id}, context=ctx
         )
-        assert rm_res.error is None, rm_res.error
-        assert worker_id not in service.engine
-        assert {c.creature_id for c in await service.list_creatures()} == {"lead"}
+        assert rm_res.error is not None
+        assert "not a creature in caller" in rm_res.error
+        assert worker_id in service.engine
+        assert {c.creature_id for c in await service.list_creatures()} == {
+            "lead",
+            worker_id,
+        }
         # The privileged node may NOT be removed via the tool.
         deny = await GroupRemoveNodeTool()._execute(
             {"creature_id": "lead"}, context=ctx
@@ -865,6 +905,127 @@ class TestTerrariumIntegration:
         snap = await service.status_snapshot()
         assert set(snap["creatures"]) == {"alice", "carol"}
         assert len(snap["graphs"]) == 2
+
+    async def test_split_drive_lifecycle_no_repo_race(
+        self, make_service, tmp_path, monkeypatch
+    ):
+        """Regression: a Drive-default-on split must not open a second store at
+        the parent's live path, nor let a barrier-gated reconcile race the
+        repository teardown.
+
+        Two lifecycle bugs collided here. (1) The largest split child keeps the
+        original graph_id, so its target file equals the parent's still-open
+        ``<gid>.kohakutr``; ``apply_split`` used to open a SECOND ``SessionStore``
+        there, duplicating events and racing the live connection
+        (``SQLite error: disk I/O error`` under WAL). (2) an in-flight
+        ``_reconcile_when_ready`` task was not drained before the split rebound
+        the graph's Drive repository, so it started a manager on a shut executor
+        (``DriveRepositoryClosedError``). This drives a real split with an
+        in-flight reconcile forced and asserts NEITHER escapes."""
+        service = make_service()
+        engine = service.engine
+
+        alice = await service.add_creature(
+            _agent_config("alice", tmp_path), creature_id="alice"
+        )
+        gid = alice.graph_id
+        await service.add_creature(
+            _agent_config("bob", tmp_path), graph_id=gid, creature_id="bob"
+        )
+        await service.add_creature(
+            _agent_config("carol", tmp_path), graph_id=gid, creature_id="carol"
+        )
+        await service.add_channel(gid, "ab", "")
+        await service.add_channel(gid, "bc", "")
+        await service.connect("alice", "bob", channel="ab")
+        await service.connect("bob", "carol", channel="bc")
+
+        # Attach the session at exactly ``<gid>.kohakutr`` so the largest split
+        # child's target path equals the parent's live path (the collision case).
+        store = SessionStore(tmp_path / "sessions" / f"{gid}.kohakutr")
+        store.init_meta(
+            session_id=gid,
+            config_type="terrarium",
+            config_path="",
+            pwd=str(tmp_path),
+            agents=["alice", "bob", "carol"],
+        )
+        await engine.attach_session(gid, store)
+        for _ in range(20):  # settle: managers started, initial reconciles done
+            await asyncio.sleep(0)
+
+        # Detect the double-open: a fresh split store minted at the parent's own
+        # live path (would duplicate events + race the open connection).
+        parent_live = str(store.path)
+        collisions: list[str] = []
+        orig_split = _session_coord.split_session_store
+
+        def _probe_split(old_store, new_paths):
+            for p in new_paths:
+                if str(p) == parent_live:
+                    collisions.append(str(p))
+            return orig_split(old_store, new_paths)
+
+        monkeypatch.setattr(_session_coord, "split_session_store", _probe_split)
+
+        # Capture any orphaned-task crash (the reconcile racing a closed repo).
+        loop_errors: list[BaseException] = []
+        loop = asyncio.get_running_loop()
+        prev_handler = loop.get_exception_handler()
+
+        def _handler(lp, context):
+            exc = context.get("exception")
+            if exc is not None:
+                loop_errors.append(exc)
+
+        loop.set_exception_handler(_handler)
+
+        # Widen the reconcile window: slow the Drive repo's worker hops so a
+        # freshly scheduled reconcile is suspended inside ``manager.start`` when
+        # the split tears its repository down.
+        slow = {"on": False}
+        orig_run = SqliteDriveRepository._run
+
+        async def _slow_run(self, fn):
+            if slow["on"]:
+                await asyncio.sleep(0.02)
+            return await orig_run(self, fn)
+
+        monkeypatch.setattr(SqliteDriveRepository, "_run", _slow_run)
+
+        try:
+            slow["on"] = True
+            engine._drive_runtime.schedule_reconcile(engine.get_creature("alice"))
+            engine._drive_runtime.schedule_reconcile(engine.get_creature("carol"))
+            await asyncio.sleep(0.005)  # let reconciles suspend inside start()
+
+            await service.remove_creature("bob")
+
+            for _ in range(30):  # let any orphaned task resume + (pre-fix) crash
+                await asyncio.sleep(0.01)
+        finally:
+            loop.set_exception_handler(prev_handler)
+            slow["on"] = False
+
+        # Fix A: no second store opened at the parent's live path.
+        assert collisions == []
+        # Fix A: the child keeping the original graph_id reuses the live parent
+        # store object in place (not a re-opened duplicate).
+        assert engine._session_stores[gid] is store
+        # Fix B: no reconcile crashed against a torn-down repository.
+        closed = [e for e in loop_errors if isinstance(e, DriveRepositoryClosedError)]
+        assert closed == [], f"reconcile raced repo teardown: {closed}"
+        assert loop_errors == [], f"unexpected orphaned-task errors: {loop_errors}"
+
+        # The split still produced the correct topology + lineage.
+        graphs = await service.list_graphs()
+        assert len(graphs) == 2
+        members = sorted(sorted(g.creature_ids) for g in graphs)
+        assert members == [["alice"], ["carol"]]
+        alice_gid = (await service.get_creature_info("alice")).graph_id
+        carol_gid = (await service.get_creature_info("carol")).graph_id
+        assert engine._session_stores[alice_gid].meta["parent_session_ids"] == [gid]
+        assert engine._session_stores[carol_gid].meta["parent_session_ids"] == [gid]
 
         await service.shutdown()
 
@@ -1195,7 +1356,7 @@ class TestTerrariumIntegration:
         # navigator promote before the post-turn resync lands. ``False``
         # is reserved for refused edits.
         regen = await service.regenerate("writer")
-        assert regen["status"] == "regenerating"
+        assert regen["status"] == "completed"
         assert isinstance(regen["turn_index"], int) and regen["turn_index"] >= 1
         assert isinstance(regen["branch_id"], int) and regen["branch_id"] >= 1
         # find the user message index to edit (the "hello writer" turn).
@@ -1205,7 +1366,7 @@ class TestTerrariumIntegration:
         )
         edited = await service.edit_message("writer", user_idx, "edited writer message")
         assert isinstance(edited, dict)
-        assert edited["status"] == "edited"
+        assert edited["status"] == "completed"
         assert isinstance(edited["branch_id"], int) and edited["branch_id"] >= 1
         hist3 = await service.chat_history("writer")
         joined3 = " ".join(
@@ -1288,15 +1449,13 @@ class TestTerrariumIntegration:
         assert len((await service.chat_history("writer"))["messages"]) == writer_pre
         assert await service.unwire_output("scout", stopped_wire["edge_id"]) is True
         await service.start_creature("writer")
-        # A wire to a creature that does NOT exist is silently dropped
-        # (the resolver warns once and skips) — the source turn still ok.
-        ghost_wire = await service.wire_output(
-            "scout", {"to": "no_such_target", "with_content": True}
-        )
-        async for _ in service.chat("scout", "to a ghost"):
-            pass
-        await asyncio.sleep(0.05)
-        assert await service.unwire_output("scout", ghost_wire["edge_id"]) is True
+        # Unknown targets fail closed at wiring time; no dead edge is stored.
+        from kohakuterrarium.terrarium.graph_identity import TargetNotFoundError
+
+        with pytest.raises(TargetNotFoundError):
+            await service.wire_output(
+                "scout", {"to": "no_such_target", "with_content": True}
+            )
 
         # --- OutputLogCapture — tee a creature's output into a ring buffer.
         # ``creature_host`` exposes ``output_log`` + ``get_log_entries`` /
@@ -1333,3 +1492,428 @@ class TestTerrariumIntegration:
         writer_creature.output_log = None
 
         await service.shutdown()
+
+    @pytest.mark.timeout(60)
+    async def test_group_tools_visible_in_prompt_with_drive_off(
+        self, patched_llm, tmp_path
+    ):
+        """UXI-10 blocker: the group_* tools + ``group_status`` guidance must
+        reach the model even when Drive is OFF.
+
+        Registration happens AFTER the agent is built, so without a prompt
+        rebuild the tools are frozen out of ``## Available Functions`` in
+        bracket/text mode. It only ever worked because the Drive plugin
+        install rebuilt the prompt — so a Drive-DISABLED privileged creature
+        could not spawn/wire graph creatures at all. ``_register_named`` now
+        refreshes the prompt; this pins that it holds with Drive off.
+        """
+        engine = Terrarium(
+            pwd=str(tmp_path), drive_config=DriveRuntimeConfig(enabled=False)
+        )
+        # Prove Drive is genuinely off (so the prompt refresh is NOT coming
+        # from the Drive plugin install).
+        assert engine.drives is None
+        async with engine:
+            root = await engine.add_creature(
+                _agent_config("root", tmp_path),
+                creature_id="root",
+                is_privileged=True,
+            )
+            prompt = root.agent.get_system_prompt()
+            # The privileged surface AND the paradigm guidance are live.
+            assert "group_spawn_child" in prompt
+            assert "send_channel" in prompt
+            assert "unbounded sub-agent" in prompt
+            # A non-privileged creature gets the comm tools but not the
+            # graph-mutating surface.
+            worker = await engine.add_creature(
+                _agent_config("worker", tmp_path),
+                graph=root.graph_id,
+                creature_id="worker",
+            )
+            wprompt = worker.agent.get_system_prompt()
+            assert "send_channel" in wprompt
+            assert "group_spawn_child" not in wprompt
+
+    @pytest.mark.timeout(120)
+    async def test_drive_runtime_local_mvp(self, patched_llm, tmp_path):
+        """M1 Drive workflow through explicit constructor args.
+
+        A creature calls ``drive_create`` via real LLM tool syntax; the
+        engine delivers ``drive_ready`` as an ordinary ``TriggerEvent`` and
+        the creature processes it. Stopping the creature defers a
+        newly-assigned drive with no admission; restarting reconciles and
+        admits it after the restoration barrier. A terminal proposal moves
+        the first drive to COMPLETED in the repository. A Drive-disabled
+        engine remains Drive-free — no recipe/config change is involved."""
+        patched_llm.set_script(
+            "worker",
+            [
+                ScriptEntry(
+                    "[/drive_create]\n@@title=deploywatch\n[drive_create/]",
+                    match="create please",
+                ),
+                "drive is created and acknowledged the drive",
+                "acknowledged the drive",
+            ],
+        )
+        engine = Terrarium(
+            pwd=str(tmp_path),
+            drive_config=DriveRuntimeConfig(enabled=True),
+            drive_registrations=list(default_registrations()) + [_TwoPartyReviewReg()],
+        )
+        events: list = []
+        async with engine:
+            worker = await engine.add_creature(
+                _agent_config("worker", tmp_path), creature_id="worker"
+            )
+            manager = engine.drives.manager
+
+            # Injection: the five self-service tools + generic prompt landed.
+            tools = worker.agent.registry.list_tools()
+            for name in (
+                "drive_create",
+                "drive_status",
+                "drive_update",
+                "drive_report",
+                "drive_transition",
+            ):
+                assert name in tools, f"{name} not injected"
+            assert "Drive kind: generic" in worker.agent.get_system_prompt()
+
+            async def _collect():
+                async for ev in engine.subscribe():
+                    events.append(ev)
+
+            collector = asyncio.create_task(_collect())
+
+            # A subscriber filtered to worker's graph must see only THIS graph's
+            # Drive events (Defect 5: Drive events must carry their graph_id so
+            # graph-filtered subscribers match and events stay isolated).
+            gid_a = worker.graph_id
+            graph_a_events: list = []
+
+            async def _collect_graph_a():
+                async for ev in engine.subscribe(EventFilter(graph_ids={gid_a})):
+                    graph_a_events.append(ev)
+
+            collector_a = asyncio.create_task(_collect_graph_a())
+            await asyncio.sleep(0)
+
+            # 1) A real LLM tool turn creates a caller-owned ACTIVE drive.
+            await worker.inject_input("create please")
+            drive_id = None
+            for _ in range(150):
+                drives = await manager.list_drives(DriveQuery())
+                if drives:
+                    drive_id = drives[0].drive_id
+                    break
+                await asyncio.sleep(0.03)
+            assert drive_id is not None, "drive_create tool turn produced no drive"
+            record = await manager.get_drive(drive_id)
+            assert record.owner == ActorRef("creature", "worker")
+            assert record.scope_type == "creature"
+            assert record.status is DriveStatus.ACTIVE
+
+            # 2) drive_ready delivered as an ORDINARY TriggerEvent + processed.
+            for _ in range(150):
+                deliveries = await manager.list_deliveries(drive_id)
+                if any(d.state == "acknowledged" for d in deliveries):
+                    break
+                await asyncio.sleep(0.03)
+            deliveries = await manager.list_deliveries(drive_id)
+            admitted = [
+                d for d in deliveries if d.state in ("admitted", "acknowledged")
+            ]
+            # Exactly one logical admission reached the creature (§5.3 dedupe).
+            assert len(admitted) == 1, [d.state for d in deliveries]
+            joined = " ".join(
+                m.get("content", "") if isinstance(m.get("content"), str) else ""
+                for m in worker.agent.conversation_history
+            )
+            assert "acknowledged the drive" in joined
+            await asyncio.sleep(0.05)
+            assert any(ev.kind == EventKind.DRIVE_READY for ev in events)
+            assert any(ev.kind == EventKind.DRIVE_CREATED for ev in events)
+            # The graph-A-filtered subscriber received graph A's Drive events,
+            # each stamped with graph A's id (this collected NOTHING before the
+            # fix, when every Drive event carried graph_id=None).
+            assert any(ev.kind == EventKind.DRIVE_CREATED for ev in graph_a_events)
+            assert graph_a_events and all(ev.graph_id == gid_a for ev in graph_a_events)
+
+            # 3) Stop the worker; a drive assigned while stopped is deferred.
+            await engine.stop("worker")
+            assert worker.stop_requested
+            actor = ActorRef("user", "alice")
+            drive2 = await manager.create_drive(
+                CreateDriveRequest(
+                    kind="generic",
+                    title="watch2",
+                    scope_type="graph",
+                    scope_id=worker.graph_id,
+                    owner=actor,
+                    owner_scope="graph",
+                    created_by=actor,
+                    assignee_creature_id="worker",
+                ),
+                actor=actor,
+                graph_id=worker.graph_id,
+                is_privileged=True,
+            )
+            for _ in range(20):
+                await asyncio.sleep(0.03)
+            d2 = await manager.list_deliveries(drive2.drive_id)
+            assert d2, "no delivery enqueued for the stopped-worker drive"
+            assert not any(x.state in ("admitted", "acknowledged") for x in d2), [
+                x.state for x in d2
+            ]
+
+            # 4) Restart -> reconcile admits it after the restoration barrier.
+            await engine.start("worker")
+            assert not worker.stop_requested
+            for _ in range(200):
+                d2 = await manager.list_deliveries(drive2.drive_id)
+                if any(x.state == "acknowledged" for x in d2):
+                    break
+                await asyncio.sleep(0.03)
+            d2 = await manager.list_deliveries(drive2.drive_id)
+            assert any(x.state == "acknowledged" for x in d2), [x.state for x in d2]
+
+            # 5) Terminal proposal -> repository shows COMPLETED.
+            record = await manager.get_drive(drive_id)
+            await manager.propose_transition(
+                drive_id,
+                DriveStatus.COMPLETED,
+                actor=ActorRef("creature", "worker"),
+                evidence={"ok": True},
+                expected_revision=record.revision,
+            )
+            final = await manager.get_drive(drive_id)
+            assert final.status is DriveStatus.COMPLETED
+
+            # 6) Structural events reach a real subscriber (item 5). Stop the
+            # worker first so these manager calls don't spawn LLM turns; the
+            # observation->EngineEvent bridge is independent of delivery.
+            await engine.stop("worker")
+            await manager.report_progress(
+                drive2.drive_id, summary="halfway", evidence=None, actor=actor
+            )
+            review = await manager.create_drive(
+                CreateDriveRequest(
+                    kind="review",
+                    title="review-me",
+                    scope_type="graph",
+                    scope_id=worker.graph_id,
+                    owner=actor,
+                    owner_scope="graph",
+                    created_by=actor,
+                    assignee_creature_id="worker",
+                ),
+                actor=actor,
+                graph_id=worker.graph_id,
+                is_privileged=True,
+            )
+            proposal = await manager.propose_transition(
+                review.drive_id,
+                DriveStatus.COMPLETED,
+                actor=actor,
+                evidence={"ok": True},
+                expected_revision=review.revision,
+            )
+            await _settle()
+            await asyncio.sleep(0.05)
+            # drive_progress and drive_proposal_pending must arrive as EngineEvents
+            # (the frontend depends on both; they were silently dropped before).
+            assert any(ev.kind == EventKind.DRIVE_PROGRESS for ev in events)
+            pending = [
+                ev for ev in events if ev.kind == EventKind.DRIVE_PROPOSAL_PENDING
+            ]
+            assert pending, "drive_proposal_pending never reached the subscriber"
+            assert pending[0].payload["proposal_id"] == proposal.proposal_id
+
+            # 7) Graph isolation: a Drive in a SECOND graph must not leak into
+            # the graph-A-filtered subscriber. A fresh creature (no graph_id)
+            # lands in its own singleton graph; it is stopped so its Drive never
+            # spawns an (unscripted) LLM turn.
+            worker_b = await engine.add_creature(
+                _agent_config("worker_b", tmp_path), creature_id="worker_b"
+            )
+            gid_b = worker_b.graph_id
+            assert gid_b != gid_a
+            await engine.stop("worker_b")
+            drive_b = await engine.drives.manager_for(gid_b).create_drive(
+                CreateDriveRequest(
+                    kind="generic",
+                    title="watch-b",
+                    scope_type="graph",
+                    scope_id=gid_b,
+                    owner=actor,
+                    owner_scope="graph",
+                    created_by=actor,
+                ),
+                actor=actor,
+                graph_id=gid_b,
+                is_privileged=True,
+            )
+            await _settle()
+            await asyncio.sleep(0.05)
+            # The unfiltered subscriber sees graph B's event, stamped with gid_b.
+            b_created = [
+                ev
+                for ev in events
+                if ev.kind == EventKind.DRIVE_CREATED
+                and ev.payload.get("drive_id") == drive_b.drive_id
+            ]
+            assert b_created and b_created[0].graph_id == gid_b
+            # The graph-A-filtered subscriber never saw any graph B event.
+            assert all(ev.graph_id == gid_a for ev in graph_a_events)
+            assert not any(
+                ev.payload.get("drive_id") == drive_b.drive_id for ev in graph_a_events
+            )
+
+            collector_a.cancel()
+            collector.cancel()
+
+        # Bare engines now enable the generic + goal Drive runtime by default.
+        assert Terrarium().drives is not None
+
+    @pytest.mark.timeout(60)
+    async def test_drive_topology_merge_then_split_moves_rows(
+        self, patched_llm, tmp_path
+    ):
+        """A real-engine graph merge then split moves Drive rows between the
+        per-graph repositories (design §6.6-6.7): ``connect`` merges A + B so the
+        survivor's manager holds BOTH graphs' Drives (B's rehomed); ``disconnect``
+        splits so each assigned Drive follows its assignee's child graph. WAITING
+        Drives keep this deterministic — no delivery, pure row movement."""
+        svc = ActorRef("service", "ops")
+
+        def _req(graph_id: str, assignee: str) -> CreateDriveRequest:
+            return CreateDriveRequest(
+                kind="generic",
+                title=f"watch-{assignee}",
+                scope_type="graph",
+                scope_id=graph_id,
+                owner=svc,
+                owner_scope="service",
+                created_by=svc,
+                assignee_creature_id=assignee,
+                spec={},
+            )
+
+        engine = Terrarium(
+            pwd=str(tmp_path),
+            drive_config=DriveRuntimeConfig(enabled=True),
+            drive_registrations=default_registrations(),
+        )
+        async with engine:
+            alice = await engine.add_creature(
+                _agent_config("alice", tmp_path), creature_id="alice"
+            )
+            bob = await engine.add_creature(
+                _agent_config("bob", tmp_path), creature_id="bob"
+            )
+            # Separate singleton graphs -> two isolated Drive repositories.
+            alice_gid0, bob_gid0 = alice.graph_id, bob.graph_id
+            assert alice_gid0 != bob_gid0
+            da = await engine.drives.manager_for(alice_gid0).create_drive(
+                _req(alice_gid0, "alice"),
+                actor=svc,
+                graph_id=alice_gid0,
+                is_privileged=True,
+                initial_status=DriveStatus.WAITING,
+            )
+            db = await engine.drives.manager_for(bob_gid0).create_drive(
+                _req(bob_gid0, "bob"),
+                actor=svc,
+                graph_id=bob_gid0,
+                is_privileged=True,
+                initial_status=DriveStatus.WAITING,
+            )
+
+            # MERGE: the real engine drains B's Drive rows into the survivor.
+            result = await engine.connect("alice", "bob", channel="ab")
+            assert result.delta_kind == "merge"
+            survivor = result.graph_id
+            smgr = engine.drives.manager_for(survivor)
+            assert await smgr.get_drive(da.drive_id) is not None
+            moved = await smgr.get_drive(db.drive_id)
+            assert moved is not None and moved.scope_id == survivor
+            # The non-survivor source graph's manager was dropped (§6.6).
+            other = bob_gid0 if survivor == alice_gid0 else alice_gid0
+            assert engine.drives.peek_manager(other) is None
+
+            # SPLIT: each assigned Drive follows its assignee's child graph.
+            disc = await engine.disconnect("alice", "bob", channel="ab")
+            assert disc.delta_kind == "split"
+            agid = engine.get_creature("alice").graph_id
+            bgid = engine.get_creature("bob").graph_id
+            assert agid != bgid
+            amgr = engine.drives.manager_for(agid)
+            bmgr = engine.drives.manager_for(bgid)
+            assert await amgr.get_drive(da.drive_id) is not None
+            assert await amgr.get_drive(db.drive_id) is None
+            assert await bmgr.get_drive(db.drive_id) is not None
+            assert await bmgr.get_drive(da.drive_id) is None
+
+    @pytest.mark.timeout(120)
+    async def test_drive_delivery_waits_for_startup_trigger(
+        self, patched_llm, tmp_path
+    ):
+        """Restoration barrier (§6.5): a drive assigned to a creature that has
+        a startup trigger is NOT delivered until the startup turn settles — the
+        startup response precedes the drive response in the conversation."""
+        patched_llm.set_script(
+            "worker",
+            [
+                ScriptEntry("STARTUP-DONE-MARKER", match="startup wake"),
+                "DRIVE-DONE-MARKER",
+            ],
+        )
+        engine = Terrarium(
+            pwd=str(tmp_path),
+            drive_config=DriveRuntimeConfig(enabled=True),
+            drive_registrations=default_registrations(),
+        )
+        async with engine:
+            cfg = _agent_config("worker", tmp_path)
+            cfg.startup_trigger = {"prompt": "startup wake"}
+            # start=False so a drive is seeded BEFORE the barrier is crossed.
+            worker = await engine.add_creature(cfg, creature_id="worker", start=False)
+            actor = ActorRef("user", "alice")
+            record = await engine.drives.manager.create_drive(
+                CreateDriveRequest(
+                    kind="generic",
+                    title="watch",
+                    scope_type="graph",
+                    scope_id=worker.graph_id,
+                    owner=actor,
+                    owner_scope="graph",
+                    created_by=actor,
+                    assignee_creature_id="worker",
+                ),
+                actor=actor,
+                graph_id=worker.graph_id,
+                is_privileged=True,
+            )
+            # Start: the startup trigger fires; the drive is deferred behind
+            # the barrier and delivered only after startup settles.
+            await engine.start("worker")
+            for _ in range(200):
+                deliveries = await engine.drives.manager.list_deliveries(
+                    record.drive_id
+                )
+                if any(d.state == "acknowledged" for d in deliveries):
+                    break
+                await asyncio.sleep(0.03)
+            assistant_text = " || ".join(
+                m.get("content", "") if isinstance(m.get("content"), str) else ""
+                for m in worker.agent.conversation_history
+                if m.get("role") == "assistant"
+            )
+            assert "STARTUP-DONE-MARKER" in assistant_text
+            assert "DRIVE-DONE-MARKER" in assistant_text
+            # Ordering: startup settled BEFORE the drive turn ran.
+            assert assistant_text.index("STARTUP-DONE-MARKER") < assistant_text.index(
+                "DRIVE-DONE-MARKER"
+            )

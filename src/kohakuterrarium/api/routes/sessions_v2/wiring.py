@@ -1,9 +1,7 @@
-"""Sessions wiring — runtime ``config.output_wiring`` edges.
+"""Manage runtime output-wiring edges and secondary sinks.
 
-Service-driven: each op routes by creature ``_home`` in multi-node
-mode.  Topology refresh events come from the engine layer; the route
-no longer emits a second TOPOLOGY_CHANGED (was causing duplicate
-events — fixed per kt-audit M3).
+Operations route to each creature's home node. The engine owns topology-change
+emission, so these routes must not emit duplicate refresh events.
 """
 
 from typing import Any
@@ -19,7 +17,7 @@ router = APIRouter()
 
 
 class OutputWirePayload(BaseModel):
-    """Body for adding one runtime output-wiring edge."""
+    """Describe one runtime output-wiring edge."""
 
     to: str
     with_content: bool = True
@@ -61,8 +59,11 @@ async def wire_creature_output(
 ):
     """Add a direct output-wiring edge for a creature."""
     cid = await resolve_creature_id(service, creature_id, session_id)
+    entry = req.as_entry()
+    if req.to != "root":
+        entry["to"] = await resolve_creature_id(service, req.to, session_id)
     try:
-        result = await service.wire_output(cid, req.as_entry())
+        result = await service.wire_output(cid, entry)
     except KeyError:
         raise HTTPException(404, f"creature {creature_id!r} not found")
     except ValueError as exc:
@@ -96,10 +97,10 @@ async def list_creature_sinks(
     creature_id: str,
     service: TerrariumService = Depends(get_service),
 ):
-    """Return secondary-sink ids attached to a creature.
+    """Check creature existence and return the currently enumerable sinks.
 
-    No engine-level sink enumerator yet; this endpoint is kept for
-    callers that only need to check creature existence.
+    The engine does not expose sink enumeration, so a valid creature currently
+    returns an empty list.
     """
     cid = await resolve_creature_id(service, creature_id, session_id)
     try:

@@ -1,9 +1,7 @@
-"""Delete-trigger tool — stop and remove a previously-installed trigger.
+"""Stop and remove triggers installed on the current agent.
 
-Counterpart to the ``add_timer`` / ``add_schedule`` / ``watch_channel``
-creation tools. Triggers live exclusively in
-``agent.trigger_manager._triggers``; this dedicated tool mirrors the
-creation API while ``stop_task`` also accepts trigger ids.
+Triggers are managed separately from executor and sub-agent jobs, so task
+cancellation cannot remove them.
 """
 
 from typing import Any

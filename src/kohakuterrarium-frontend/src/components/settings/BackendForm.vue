@@ -7,17 +7,9 @@
     <div>
       <label class="text-[11px] text-warm-400 mb-1 block">{{ t("settings.backends.backendType") }}</label>
       <el-select :model-value="form.backend_type" size="small" class="w-full" @update:model-value="updateField('backend_type', $event)">
-        <el-option value="openai" label="openai (/chat/completions)" />
-        <el-option value="openai_responses" label="openai_responses (/responses)" />
+        <el-option value="openai" label="openai" />
         <el-option value="codex" label="openai-responses (codex)" />
         <el-option value="anthropic" label="anthropic" />
-      </el-select>
-    </div>
-    <div class="col-span-2">
-      <label class="text-[11px] text-warm-400 mb-1 block">{{ t("settings.backends.authentication") }}</label>
-      <el-select :model-value="form.auth_mode" size="small" class="w-full" @update:model-value="updateField('auth_mode', $event)">
-        <el-option value="api_key" :label="t('settings.backends.authApiKey')" />
-        <el-option value="none" :label="t('settings.backends.authNone')" :disabled="form.backend_type !== 'openai'" />
       </el-select>
     </div>
     <div class="col-span-2">

@@ -10,26 +10,32 @@ the change out to live agents (channel-trigger injection, environment
 union on graph merge, session-store copy on graph split).
 """
 
-import asyncio
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import kohakuterrarium.terrarium.autosession as _autosession
 import kohakuterrarium.terrarium.channel_lifecycle as _lifecycle
 import kohakuterrarium.terrarium.channels as _channels
+import kohakuterrarium.terrarium.engine_creature_add as _engine_creature_add
+import kohakuterrarium.terrarium.engine_observability as _observability
+import kohakuterrarium.terrarium.graph_checkpoint as _checkpoint
 import kohakuterrarium.terrarium.recipe as _recipe
+import kohakuterrarium.terrarium.recipe_identity as _recipe_identity
+import kohakuterrarium.terrarium.recipe_transaction as _recipe_transaction
 import kohakuterrarium.terrarium.resume as _resume
 import kohakuterrarium.terrarium.root as _root
 import kohakuterrarium.terrarium.topology as _topo
-import kohakuterrarium.terrarium.topology_snapshot as _topo_snap
 import kohakuterrarium.terrarium.wiring as _wiring
+import kohakuterrarium.terrarium.drive.runtime as _drive_runtime
+from kohakuterrarium.terrarium.drive.store import (
+    DriveRepositoryClosedError,
+)
 from kohakuterrarium.core.environment import Environment
+from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.terrarium.creature_host import (
     Creature,
     CreatureBuildInput,
-    apply_creature_name,
     build_creature,
 )
 from kohakuterrarium.terrarium.events import (
@@ -40,6 +46,7 @@ from kohakuterrarium.terrarium.events import (
     EventKind,
     RootAssignment,
 )
+import kohakuterrarium.terrarium.graph_identity_engine as _identity
 from kohakuterrarium.terrarium.runtime_prompt import RuntimeGraphPrompt
 from kohakuterrarium.terrarium.tools_group import (
     force_register_basic_tools,
@@ -54,7 +61,6 @@ from kohakuterrarium.terrarium.topology import (
 from kohakuterrarium.utils.logging import get_logger
 
 if TYPE_CHECKING:
-    from kohakuterrarium.session.store import SessionStore
     from kohakuterrarium.terrarium.config import TerrariumConfig
 
 _logger = get_logger(__name__)
@@ -75,15 +81,16 @@ class Terrarium:
     the three common construction shapes.
     """
 
-    # ------------------------------------------------------------------
-    # construction
-    # ------------------------------------------------------------------
+    # Construction
 
     def __init__(
         self,
         *,
         pwd: str | None = None,
         session_dir: str | None = None,
+        drive_config: Any = None,
+        drive_registrations: "tuple[Any, ...] | list[Any] | None" = None,
+        drive_store: Any = None,
     ) -> None:
         """Create an engine.
 
@@ -92,17 +99,28 @@ class Terrarium:
         merge/split children land there too).  Without it, persistence
         is opt-in per call via ``add_creature(session=...)`` /
         ``apply_recipe(session=...)`` / ``attach_session``.
+
+        Drive is enabled by default with fresh generic and goal registrations.
+        ``DriveRuntimeConfig(enabled=False)`` explicitly opts out, while an
+        explicitly empty registration set is invalid for an enabled runtime.
+        ``drive_store`` overrides the default in-memory repository. The engine
+        never reads Studio settings or ``~/.kohakuterrarium``.
         """
         self._pwd = pwd
         self._session_dir = session_dir
+        # Built by default; an explicitly disabled config opts out.
+        self._drive_runtime = _drive_runtime.build_drive_runtime(
+            self, drive_config, drive_registrations, drive_store
+        )
         self._topology = TopologyState()
         self._creatures: dict[str, Creature] = {}
+        self._recipe_identities = _recipe_identity.RecipeIdentityReservations()
+        self._recipe_graph_locks: dict[str, asyncio.Lock] = {}
         self._environments: dict[str, Environment] = {}
-        # graph_id -> attached SessionStore.
         self._session_stores: dict[str, "SessionStore"] = {}
         # graph_ids whose stores THIS engine minted (closed on shutdown).
         self._owned_sessions: set[str] = set()
-        self._subscribers: list[_Subscriber] = []
+        self._subscribers: list[_observability.Subscriber] = []
         self._running = True
         # Live runtime-graph prompt block — refreshed reactively when the
         # engine emits topology / wire / parent-link events. Attaches
@@ -116,12 +134,21 @@ class Terrarium:
         recipe: "TerrariumConfig | str",
         *,
         pwd: str | None = None,
+        drive_config: Any = None,
+        drive_registrations: "tuple[Any, ...] | list[Any] | None" = None,
+        drive_store: Any = None,
     ) -> "Terrarium":
-        """Build a Terrarium from a recipe.  See :meth:`apply_recipe`.
+        """Build a Terrarium from a recipe.
 
-        Example: ``async with await Terrarium.from_recipe("t.yaml") as t``.
+        Drive configuration belongs to the engine constructor and is never read
+        from the recipe. See :meth:`apply_recipe`.
         """
-        engine = cls(pwd=pwd)
+        engine = cls(
+            pwd=pwd,
+            drive_config=drive_config,
+            drive_registrations=drive_registrations,
+            drive_store=drive_store,
+        )
         await engine.apply_recipe(recipe, pwd=pwd)
         return engine
 
@@ -131,30 +158,39 @@ class Terrarium:
         store: "SessionStore | str",
         *,
         pwd: str | None = None,
+        workspace_overrides: dict[str, str] | None = None,
         llm: Any = None,
+        drive_config: Any = None,
+        drive_registrations: "tuple[Any, ...] | list[Any] | None" = None,
+        drive_store: Any = None,
     ) -> "Terrarium":
-        """Build a fresh engine and adopt a saved session into it.
+        """Preflight and adopt a saved session into a fresh engine.
 
-        Example: ``async with await Terrarium.resume("s.kohakutr") as t``.
-        """
-        engine = cls(pwd=pwd)
-        engine._running = True
-        await _resume.resume_into_engine(engine, store, pwd=pwd, llm=llm)
-        return engine
+        A failed preflight cannot create Drive/runtime side effects."""
+        return await _resume.resume_new_engine(
+            cls,
+            store,
+            pwd=pwd,
+            workspace_overrides=workspace_overrides,
+            llm=llm,
+            drive_config=drive_config,
+            drive_registrations=drive_registrations,
+            drive_store=drive_store,
+        )
 
     async def adopt_session(
         self,
         store: "SessionStore | str",
         *,
         pwd: str | None = None,
+        workspace_overrides: dict[str, str] | None = None,
         llm: Any = None,
     ) -> str:
-        """Adopt a saved session into this running engine.  Returns ``graph_id``.
-
-        Same body as :meth:`resume` but on an existing engine instance —
-        the HTTP / programmatic hot-resume entry point.
-        """
-        return await _resume.resume_into_engine(self, store, pwd=pwd, llm=llm)
+        """Adopt a saved session into this engine and return its graph ID."""
+        kwargs = {"pwd": pwd, "llm": llm}
+        if workspace_overrides is not None:
+            kwargs["workspace_overrides"] = workspace_overrides
+        return await _resume.resume_into_engine(self, store, **kwargs)
 
     @classmethod
     async def with_creature(
@@ -162,14 +198,21 @@ class Terrarium:
         config: "CreatureBuildInput | Creature",
         *,
         pwd: str | None = None,
+        drive_config: Any = None,
+        drive_registrations: "tuple[Any, ...] | list[Any] | None" = None,
+        drive_store: Any = None,
     ) -> "tuple[Terrarium, Creature]":
-        """Construct a Terrarium and add a single creature in one call.
-
-        Returns ``(terrarium, creature)``.  One-liner for solo agents::
+        """Construct a Terrarium and add a single creature in one call; Drive
+        args go to the constructor. Returns ``(terrarium, creature)``::
 
             t, alice = await Terrarium.with_creature("alice.yaml")
         """
-        engine = cls(pwd=pwd)
+        engine = cls(
+            pwd=pwd,
+            drive_config=drive_config,
+            drive_registrations=drive_registrations,
+            drive_store=drive_store,
+        )
         creature = await engine.add_creature(config)
         return engine, creature
 
@@ -180,6 +223,8 @@ class Terrarium:
     async def __aenter__(self) -> "Terrarium":
         self._running = True
         self._runtime_prompt.attach()
+        if self._drive_runtime is not None:
+            await self._drive_runtime.start()
         return self
 
     async def __aexit__(self, *exc) -> None:
@@ -187,12 +232,32 @@ class Terrarium:
         await self.shutdown()
 
     # ------------------------------------------------------------------
-    # creature CRUD
+    # Drive runtime (optional; None when the engine is Drive-disabled)
     # ------------------------------------------------------------------
+
+    @property
+    def drives(self):
+        """The engine's :class:`DriveRuntime`, or ``None`` when Drive-disabled.
+
+        The façade over the DriveManager (create / list / update / assign /
+        transition Drives, reconcile, reconfigure).  ``None`` means the engine
+        was constructed without ``drive_config`` — no manager exists.
+        """
+        return self._drive_runtime
+
+    def reconfigure_drives(self, drive_registrations) -> str:
+        """Apply a Drive registry change; returns ``applied_live`` /
+        ``restart_required`` / ``rejected``. Raises when the
+        engine has no Drive runtime."""
+        if self._drive_runtime is None:
+            raise RuntimeError("this terrarium has no Drive runtime to reconfigure")
+        return self._drive_runtime.reconfigure(drive_registrations)
+
+    # creature CRUD
 
     async def add_creature(
         self,
-        config: "CreatureBuildInput | Creature",
+        config: CreatureBuildInput | Creature,
         *,
         graph: GraphRef | None = None,
         creature_id: str | None = None,
@@ -203,163 +268,34 @@ class Terrarium:
         parent_creature_id: str | None = None,
         io: str = "config",
         strict: bool = True,
-        session: "bool | str | Path | SessionStore | None" = None,
+        session: bool | str | Path | SessionStore | None = None,
         name: str | None = None,
         tools: list[Any] | None = None,
         plugins: list[Any] | None = None,
+        _identity_reserved: bool = False,
     ) -> Creature:
-        """Add a creature to the engine.
-
-        ``config`` may be a path (or ``@pkg/...`` reference),
-        ``AgentConfig``, ``CreatureConfig``, or a pre-built ``Creature``
-        (tests / advanced callers).  With ``graph=None`` a fresh
-        singleton graph is minted.  ``start`` toggles auto-start of the
-        underlying agent.
-
-        ``llm`` binds the creature's LLM — a provider instance, a
-        selector string, an ``LLMProfile``, or None (resolve from the
-        config).
-
-        ``io`` selects how much of the config's I/O boots:
-        ``"config"`` (as declared), ``"none"`` (input suppressed —
-        Studio / Lab managed spawns driven via the attach WebSocket),
-        or ``"headless"`` (input suppressed AND default output
-        silenced — batch / programmatic runs).
-
-        ``session`` controls persistence (E2 — no more manual
-        ``SessionStore`` + ``init_meta`` + ``attach_session`` ceremony):
-        a path mints the store at exactly that file; ``True`` mints in
-        the default session dir; ``False`` disables persistence even
-        under autosession; a ``SessionStore`` attaches as-is; ``None``
-        (default) follows the engine — autosession when
-        ``Terrarium(session_dir=...)`` was set, joins the graph's
-        existing store otherwise, else no persistence.
-
-        ``name`` is a spawn-time display-name override (the name the
-        user typed in the Studio "new creature" form).  When set it is
-        applied across the creature + its nested objects, so a creature
-        spawned on a worker carries the user's chosen name — not the
-        config file's own ``name``.
-
-        ``tools`` / ``plugins`` are INSTANCES (e.g. ``kt.tool``
-        adapters, ``BasePlugin`` subclass objects) injected into the
-        underlying agent at build time — same contract as
-        ``Agent.build(tools=, plugins=)``.  Not applicable to a
-        pre-built ``Creature`` (raises like the other build kwargs).
-
-        ``is_privileged`` marks the creature as having access to the
-        group_* tool surface — set by direct user actions (solo
-        ``kt run``, Studio "new creature") and by recipe-root assignment
-        (via :meth:`assign_root`). False for tool-spawned workers.
-        **Elevate-only**: passing ``False`` here on a pre-built
-        :class:`Creature` whose ``is_privileged`` is already ``True``
-        (tests, advanced callers) does not demote it. Callers cannot
-        downgrade privilege through this method.
-
-        ``parent_creature_id`` is also additive: it overwrites only when
-        non-None. None means "leave whatever the pre-built creature
-        already has."
-
-        Example: ``alice = await t.add_creature("alice.yaml")``.
-        """
-        if isinstance(config, Creature):
-            # Build-time kwargs cannot apply to an already-built
-            # creature — silently ignoring them hid real caller bugs.
-            ignored = [
-                kw
-                for kw, val in (
-                    ("llm", llm),
-                    ("pwd", pwd),
-                    ("io", io),
-                    ("tools", tools),
-                    ("plugins", plugins),
-                )
-                if val not in (None, "config")
-            ]
-            if ignored:
-                raise ValueError(
-                    f"add_creature received a pre-built Creature; build-time "
-                    f"argument(s) {', '.join(ignored)} cannot be applied. "
-                    f"Pass them to build_creature / the config-based overload."
-                )
-            creature = config
-        else:
-            creature = build_creature(
-                config,
-                creature_id=creature_id,
-                pwd=pwd if pwd is not None else self._pwd,
-                llm=llm,
-                io=io,
-                strict=strict,
-                tools=tools,
-                plugins=plugins,
-            )
-        if creature_id and creature.creature_id != creature_id:
-            creature.creature_id = creature_id
-        if name and name.strip():
-            apply_creature_name(creature, name.strip())
-        if creature.creature_id in self._creatures:
-            raise ValueError(f"creature_id {creature.creature_id!r} already exists")
-
-        graph_id = self._resolve_graph_id(graph) if graph is not None else None
-        gid = _topo.add_creature(
-            self._topology, creature.creature_id, graph_id=graph_id
+        """Build and insert one creature into the engine."""
+        return await _engine_creature_add.add_creature(
+            self,
+            config,
+            graph=graph,
+            creature_id=creature_id,
+            llm=llm,
+            pwd=pwd,
+            start=start,
+            is_privileged=is_privileged,
+            parent_creature_id=parent_creature_id,
+            io=io,
+            strict=strict,
+            session=session,
+            name=name,
+            tools=tools,
+            plugins=plugins,
+            identity_reserved=_identity_reserved,
+            builder=build_creature,
+            register_basic=force_register_basic_tools,
+            register_privileged=force_register_privileged_tools,
         )
-        creature.graph_id = gid
-        # ``is_privileged`` and ``parent_creature_id`` are additive. A
-        # pre-built creature (tests, advanced callers) may already carry
-        # these flags; we never demote them via add_creature.
-        if is_privileged:
-            creature.is_privileged = True
-        if parent_creature_id is not None:
-            creature.parent_creature_id = parent_creature_id
-        # Allocate or reuse the graph's environment, then bind the
-        # creature's agent + executor to it so ToolContext is correct
-        # even when joining a non-empty graph.
-        if gid not in self._environments:
-            self._environments[gid] = Environment(env_id=f"env_{gid}")
-        graph_env = self._environments[gid]
-        _channels.bind_creature_to_environment(creature, graph_env)
-        _channels.register_engine_handle(graph_env, self)
-        self._creatures[creature.creature_id] = creature
-        _wiring.install_output_wiring_resolver(self)
-
-        # Every engine-backed creature gets the basic comm tools
-        # (``send_channel`` / ``group_send``); only privileged creatures
-        # additionally get the graph-mutating ``group_*`` surface.
-        force_register_basic_tools(creature.agent)
-        if creature.is_privileged:
-            force_register_privileged_tools(creature.agent)
-
-        self._emit(
-            EngineEvent(
-                kind=EventKind.CREATURE_ADDED,
-                creature_id=creature.creature_id,
-                graph_id=gid,
-            )
-        )
-        if start:
-            await creature.start()
-        # Persistence (E2): resolve the ``session=`` argument AFTER the
-        # agent starts (matching the Studio attach ordering the turn
-        # viewer depends on).  Minted meta is written BEFORE
-        # ``attach_session`` assigns ``_session_stores`` (the Lab
-        # worker's observing dict snapshots ``load_meta()`` on that
-        # assignment).
-        await _autosession.attach_for_new_creature(
-            self, creature, config=config, session=session
-        )
-        if start:
-            # STARTED fires only when the agent actually started —
-            # ``start=False`` adds used to emit it anyway.
-            self._emit(
-                EngineEvent(
-                    kind=EventKind.CREATURE_STARTED,
-                    creature_id=creature.creature_id,
-                    graph_id=gid,
-                )
-            )
-        return creature
 
     async def remove_creature(self, creature: CreatureRef) -> None:
         """Stop and remove a creature.  May split the graph it lived in.
@@ -372,13 +308,44 @@ class Terrarium:
             raise KeyError(f"creature {cid!r} not in engine")
         old_gid = c.graph_id
         if c.is_running:
-            await c.stop()
+            await c.stop(requested=False)
+        # A creature-scoped Drive orphans-and-blocks on removal,
+        # a graph-scoped one unassigns / auto-assigns among the remaining
+        # graph members — never a silent semantic reassignment.
+        # Drive cleanup must never block the creature removal itself: the
+        # repository may already be closed (Windows closes a session-backed
+        # repo's sqlite connection when its store closes; a stale registry
+        # entry can survive a merge/split). Treat that as quiescence and
+        # continue the topology removal below.
+        if self._drive_runtime is not None:
+            old_graph = self._topology.graphs.get(old_gid)
+            members = (
+                frozenset(old_graph.creature_ids) - {cid}
+                if old_graph is not None
+                else frozenset()
+            )
+            try:
+                await self._drive_runtime.on_creature_removed(
+                    cid, graph_id=old_gid, graph_member_ids=members
+                )
+            except DriveRepositoryClosedError as exc:
+                _logger.warning(
+                    "Drive cleanup skipped during creature removal "
+                    "(repository closed)",
+                    creature_id=cid,
+                    error=str(exc),
+                )
         delta = _topo.remove_creature(self._topology, cid)
         self._creatures.pop(cid, None)
         _wiring.install_output_wiring_resolver(self)
-        # Drop the environment if its graph went away.
+        # Drop the environment + the graph's Drive manager if the graph went
+        # away entirely (a split re-homes the manager instead).
         if old_gid not in self._topology.graphs:
             self._environments.pop(old_gid, None)
+            await _checkpoint.checkpoint(self, old_gid)
+            _checkpoint.discard(self, old_gid)
+            if self._drive_runtime is not None:
+                self._drive_runtime.registry.drop_graph(old_gid)
         self._emit(
             EngineEvent(
                 kind=EventKind.CREATURE_STOPPED,
@@ -392,42 +359,8 @@ class Terrarium:
         # their new graph_id, and session stores are coordinated.
         # ``apply_split_bookkeeping`` is a no-op for non-split deltas.
         _lifecycle.apply_split_bookkeeping(self, delta)
-
-    async def remove_graph(self, graph: GraphRef) -> None:
-        """Stop and remove an entire graph without intermediate splits."""
-        gid = self._resolve_graph_id(graph)
-        g = self._topology.graphs.get(gid)
-        if g is None:
-            raise KeyError(f"graph {gid!r} not in engine")
-        creature_ids = list(g.creature_ids)
-        for cid in creature_ids:
-            creature = self._creatures.get(cid)
-            if creature is not None and creature.is_running:
-                await creature.stop()
-        for cid in creature_ids:
-            self._topology.creature_to_graph.pop(cid, None)
-            self._creatures.pop(cid, None)
-            self._emit(
-                EngineEvent(
-                    kind=EventKind.CREATURE_STOPPED,
-                    creature_id=cid,
-                    graph_id=gid,
-                )
-            )
-        self._topology.graphs.pop(gid, None)
-        self._environments.pop(gid, None)
-        store = self._session_stores.pop(gid, None)
-        self._owned_sessions.discard(gid)
-        if store is not None:
-            try:
-                store.close()
-            except Exception:  # pragma: no cover - defensive
-                _logger.warning(
-                    "remove_graph: closing session store failed",
-                    graph_id=gid,
-                    exc_info=True,
-                )
-        _wiring.install_output_wiring_resolver(self)
+        await _checkpoint.checkpoint_many(self, delta.new_graph_ids)
+        await self._drain_drive_topology()
 
     def get_creature(self, creature_id: str) -> Creature:
         """Return the creature with the given id.  Raises ``KeyError``."""
@@ -486,7 +419,7 @@ class Terrarium:
         _channels.register_channel_in_environment(
             env.shared_channels, info, engine=self, graph_id=gid
         )
-        _topo_snap.snapshot(self, gid)
+        await _checkpoint.checkpoint(self, gid)
         return info
 
     def environment(self, graph: GraphRef):
@@ -520,7 +453,8 @@ class Terrarium:
         delta = await _lifecycle.remove_channel_from_graph(self, gid, name)
         # remove_channel may auto-split; snapshot every store-attached
         # graph so each one reflects its post-removal topology.
-        _topo_snap.snapshot_all(self)
+        await _checkpoint.checkpoint_many(self, delta.new_graph_ids)
+        await self._drain_drive_topology()
         return delta
 
     async def connect(
@@ -539,12 +473,10 @@ class Terrarium:
 
         Body lives in ``terrarium.channels.connect_creatures``.
         """
-        result = await _channels.connect_creatures(
-            self, sender, receiver, channel=channel
-        )
-        # connect may merge graphs; snapshot every store-attached graph
-        # so each one reflects the post-connect topology.
-        _topo_snap.snapshot_all(self)
+        endpoints = _identity.resolve_and_guard_connect(self, sender, receiver)
+        result = await _channels.connect_creatures(self, *endpoints, channel=channel)
+        await _checkpoint.checkpoint(self, result.graph_id)
+        await self._drain_drive_topology()
         return result
 
     async def disconnect(
@@ -563,11 +495,13 @@ class Terrarium:
         result = await _lifecycle.disconnect_creatures(
             self, sender, receiver, channel=channel
         )
-        # ``DisconnectionResult`` doesn't carry the affected gids; the
-        # mutation may also split a graph into multiple. Snapshot every
-        # store-attached graph so each one's saved topology reflects
-        # the post-disconnect wires.
-        _topo_snap.snapshot_all(self)
+        graph_ids = (
+            graph.graph_id
+            for graph in self.list_graphs()
+            if graph.graph_id in self._session_stores
+        )
+        await _checkpoint.checkpoint_many(self, graph_ids)
+        await self._drain_drive_topology()
         return result
 
     # ------------------------------------------------------------------
@@ -586,6 +520,7 @@ class Terrarium:
                 payload={"edge_id": edge_id},
             )
         )
+        await _checkpoint.checkpoint(self, c.graph_id)
         return edge_id
 
     async def unwire_output(self, creature: CreatureRef, edge_id: str) -> bool:
@@ -601,6 +536,7 @@ class Terrarium:
                     payload={"edge_id": edge_id},
                 )
             )
+            await _checkpoint.checkpoint(self, c.graph_id)
         return removed
 
     def list_output_wiring(self, creature: CreatureRef) -> list[dict]:
@@ -642,7 +578,11 @@ class Terrarium:
 
         Body lives in :func:`terrarium.root.assign_root_to`.
         """
-        return await _root.assign_root_to(self, creature, report_channel=report_channel)
+        result = await _root.assign_root_to(
+            self, creature, report_channel=report_channel
+        )
+        await _checkpoint.checkpoint(self, result.graph_id)
+        return result
 
     # ------------------------------------------------------------------
     # graphs
@@ -654,6 +594,12 @@ class Terrarium:
         if g is None:
             raise KeyError(f"graph {graph_id!r} does not exist")
         return g
+
+    def _create_restore_graph(self, graph_id: str) -> GraphTopology:
+        """Create an empty graph with a session-persisted identifier."""
+        graph = _topo.create_graph(self._topology, graph_id)
+        self._environments[graph_id] = Environment(env_id=f"env_{graph_id}")
+        return graph
 
     def list_graphs(self) -> list[GraphTopology]:
         """All currently-active graphs."""
@@ -671,32 +617,51 @@ class Terrarium:
         pwd: str | None = None,
         llm: Any = None,
         strict: bool = True,
+        start: bool = True,
         session: "bool | str | Path | SessionStore | None" = None,
         creature_builder=None,
-        _on_graph_created=None,
+        created_ids: list[str] | None = None,
     ) -> GraphTopology:
         """Apply a terrarium recipe into this engine.
 
-        ``session`` follows the same contract as ``add_creature`` but
-        mints ONE terrarium-typed store for the whole graph, with the
-        recipe path recorded as ``config_path`` so resume can rebuild
-        the topology.
+        ``session`` follows ``add_creature`` and creates one graph store.
+        ``created_ids`` collects only creatures added by this call.
         """
         kwargs = {
             "graph": graph,
             "pwd": pwd if pwd is not None else self._pwd,
             "strict": strict,
+            "start": start,
             "creature_builder": creature_builder,
+            "created_ids": created_ids,
         }
-        if _on_graph_created is not None:
-            kwargs["_on_graph_created"] = _on_graph_created
         if llm is not None:
             kwargs["llm"] = llm
-        topo = await _recipe.apply_recipe(self, recipe, **kwargs)
-        if topo is not None:
-            await _autosession.attach_for_recipe(
-                self, topo.graph_id, recipe=recipe, session=session
-            )
+        transaction = _recipe_transaction.RecipeApplyTransaction(self)
+        kwargs["transaction"] = transaction
+        topo = None
+        try:
+            with _checkpoint.suppress(self):
+                topo = await _recipe.apply_recipe(self, recipe, **kwargs)
+                if topo is not None:
+                    previous_store = self._session_stores.get(topo.graph_id)
+                    if (
+                        previous_store is not None
+                        and session is not False
+                        and not _autosession.recipe_session_reuses_store(
+                            previous_store, session
+                        )
+                    ):
+                        transaction.stage_session_replacement(topo.graph_id)
+                    await _autosession.attach_for_recipe(
+                        self, topo.graph_id, recipe=recipe, session=session
+                    )
+            if topo is not None:
+                await _checkpoint.checkpoint(self, topo.graph_id)
+        except BaseException:
+            await _recipe_transaction.rollback_shielded(transaction)
+            raise
+        await transaction.commit()
         return topo
 
     # ------------------------------------------------------------------
@@ -708,12 +673,16 @@ class Terrarium:
         deferred via ``add_creature(..., start=False)``."""
         c = self._creature(creature)
         await c.start()
+        # Re-arm Drive reconciliation behind the restoration barrier.
+        if self._drive_runtime is not None:
+            self._drive_runtime.schedule_reconcile(c)
 
     async def stop(self, creature: CreatureRef) -> None:
         """Stop a running creature without removing it from the graph."""
         c = self._creature(creature)
-        if c.is_running:
-            await c.stop()
+        await c.stop()
+        if self._drive_runtime is not None:
+            await self._drive_runtime.on_creature_stopped(c.creature_id)
 
     async def stop_graph(self, graph: GraphRef) -> None:
         """Stop every creature in a graph (without removing them)."""
@@ -723,8 +692,10 @@ class Terrarium:
             return
         for cid in list(g.creature_ids):
             c = self._creatures.get(cid)
-            if c is not None and c.is_running:
+            if c is not None:
                 await c.stop()
+                if self._drive_runtime is not None:
+                    await self._drive_runtime.on_creature_stopped(cid)
 
     async def shutdown(self) -> None:
         """Stop every creature in every graph.  Safe to call repeatedly.
@@ -733,23 +704,44 @@ class Terrarium:
         """
         if not self._creatures and not self._running:
             return
-        for c in list(self._creatures.values()):
-            if c.is_running:
+        # The stop loop can be cancelled mid-await; run store closure +
+        # subscriber teardown in ``finally`` so a leaked writer lock (which
+        # blocks any later adopt of the same file) can't outlive shutdown.
+        try:
+            # Stop claiming new Drive deliveries + drain settlements BEFORE
+            # creatures stop and owned stores close.
+            if self._drive_runtime is not None:
                 try:
-                    await c.stop()
+                    await self._drive_runtime.stop()
                 except Exception as e:  # pragma: no cover - defensive
-                    _shutdown_log_warning(c.creature_id, str(e))
-        # Close every store owned by this engine — without this, files
-        # stay status="running" forever (the HW4 case: 61 stuck files).
-        _autosession.close_owned_stores(self)
-        # Terminate live subscribers — ``async for ev in t.subscribe()``
-        # used to hang forever after shutdown.
-        for sub in list(self._subscribers):
-            try:
-                sub.queue.put_nowait(None)
-            except Exception:  # pragma: no cover - defensive
-                pass
-        self._running = False
+                    _logger.warning("drive runtime stop failed", error=str(e))
+            for c in list(self._creatures.values()):
+                if c.is_running:
+                    try:
+                        await c.stop(requested=False)
+                    except Exception as e:  # pragma: no cover - defensive
+                        _shutdown_log_warning(c.creature_id, str(e))
+        finally:
+            for graph_id in sorted(self._session_stores):
+                try:
+                    await _checkpoint.checkpoint(self, graph_id)
+                except Exception as e:
+                    _logger.warning(
+                        "final graph manifest checkpoint failed",
+                        graph_id=graph_id,
+                        error=str(e),
+                    )
+            # Close every store this engine minted — without this, files
+            # stay status="running" forever (the HW4 case: 61 stuck files).
+            _autosession.close_owned_stores(self)
+            # Terminate live subscribers — ``async for ev in t.subscribe()``
+            # used to hang forever after shutdown.
+            for sub in list(self._subscribers):
+                try:
+                    sub.queue.put_nowait(None)
+                except Exception:  # pragma: no cover - defensive
+                    pass
+            self._running = False
 
     # ------------------------------------------------------------------
     # observability
@@ -773,24 +765,9 @@ class Terrarium:
                 async for ev in t.subscribe():
                     print(ev.kind, ev.creature_id)
         """
-        sub = _Subscriber(filter=filter)
+        sub = _observability.Subscriber(filter=filter)
         self._subscribers.append(sub)
-        return self._subscription_iter(sub)
-
-    async def _subscription_iter(
-        self, sub: "_Subscriber"
-    ) -> AsyncIterator[EngineEvent]:
-        try:
-            while True:
-                ev = await sub.queue.get()
-                if ev is None:
-                    return
-                yield ev
-        finally:
-            try:
-                self._subscribers.remove(sub)
-            except ValueError:
-                pass
+        return _observability.subscription_iter(self, sub)
 
     def status(self, creature: CreatureRef | None = None) -> dict:
         """Status dict for one creature, or a roll-up if ``None``.
@@ -799,19 +776,7 @@ class Terrarium:
         the same shape every API / WS endpoint reads. The roll-up
         shape (no argument) lists every creature plus graph membership.
         """
-        if creature is not None:
-            return self._creature(creature).get_status()
-        return {
-            "running": self._running,
-            "creatures": {cid: c.get_status() for cid, c in self._creatures.items()},
-            "graphs": {
-                gid: {
-                    "creature_ids": sorted(g.creature_ids),
-                    "channels": sorted(g.channels),
-                }
-                for gid, g in self._topology.graphs.items()
-            },
-        }
+        return _observability.status(self, creature)
 
     # ------------------------------------------------------------------
     # session attach
@@ -829,11 +794,13 @@ class Terrarium:
         gid = self._resolve_graph_id(graph)
         # Replacing a graph's store: close the previous one first so its
         # native handles + writer lock are released before the new (or a
-        # freshly-minted) store opens the same file. Without this, an
-        # autosession-minted store that is then re-attached gets orphaned
-        # with its writer lock still held, which blocks a later resume.
+        # freshly-minted) store opens the same file. Detach the graph's Drive
+        # manager first so its dispatcher releases claims against a LIVE
+        # connection, not the companion repo the store close is about to drop.
         previous = self._session_stores.get(gid)
         if previous is not None and previous is not store:
+            if self._drive_runtime is not None:
+                await self._drive_runtime.detach_graph(gid)
             try:
                 previous.close(update_status=False)
             except Exception:  # pragma: no cover - defensive
@@ -846,6 +813,10 @@ class Terrarium:
             store = _autosession.mint_store(self, gid, path=store, agents=names)
             self._owned_sessions.add(gid)
         self._session_stores[gid] = store
+        # Bind the graph's session-backed Drive repository before its creatures
+        # reach restoration-ready.
+        if self._drive_runtime is not None:
+            await self._drive_runtime.bind_graph_store(gid, store)
         g = self._topology.graphs.get(gid)
         if g is None:
             return
@@ -865,6 +836,7 @@ class Terrarium:
                 c.agent.attach_session_store(store)
             elif hasattr(c.agent, "session_store"):
                 c.agent.session_store = store
+        await _checkpoint.checkpoint(self, gid)
 
     # ------------------------------------------------------------------
     # internal helpers
@@ -883,22 +855,18 @@ class Terrarium:
     def _creature(self, ref: CreatureRef) -> Creature:
         return self.get_creature(self._resolve_creature_id(ref))
 
+    async def checkpoint_graph(self, graph: GraphRef) -> bool:
+        """Persist the current authoritative manifest for one graph."""
+        return await _checkpoint.checkpoint(self, self._resolve_graph_id(graph))
+
+    async def _drain_drive_topology(self) -> None:
+        """Apply any Drive row movement stashed by a merge or split."""
+        if self._drive_runtime is not None:
+            await self._drive_runtime.drain_topology()
+
     def _emit(self, event: EngineEvent) -> None:
         """Fan out an event to every subscriber whose filter matches."""
-        for sub in list(self._subscribers):
-            if sub.filter is None or sub.filter.matches(event):
-                try:
-                    sub.queue.put_nowait(event)
-                except Exception:  # pragma: no cover - defensive
-                    pass
-
-
-@dataclass
-class _Subscriber:
-    """Pub-sub bookkeeping for :meth:`Terrarium.subscribe`."""
-
-    filter: EventFilter | None = None
-    queue: "asyncio.Queue[EngineEvent | None]" = field(default_factory=asyncio.Queue)
+        _observability.emit(self, event)
 
 
 def _shutdown_log_warning(creature_id: str, error: str) -> None:

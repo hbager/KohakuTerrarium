@@ -62,7 +62,7 @@
             <div v-if="maxContext > 0" class="mt-1">
               <div class="flex items-center justify-between mb-1">
                 <span class="text-warm-400">{{ t("common.context") }}</span>
-                <span class="font-mono text-[10px]" :class="contextPct >= 80 ? 'text-coral' : contextPct >= 60 ? 'text-amber' : 'text-warm-500'">{{ formatTokens(chat.activeTokenUsage.lastPrompt) }} / {{ formatTokens(maxContext) }} ({{ contextPct }}%)</span>
+                <span class="font-mono text-[10px]" :class="contextPct >= 80 ? 'text-coral' : contextPct >= 60 ? 'text-amber' : 'text-warm-500'">{{ formatTokens(totalUsage.lastPrompt) }} / {{ formatTokens(maxContext) }} ({{ contextPct }}%)</span>
               </div>
               <div class="relative w-full h-1.5 rounded-full bg-warm-100 dark:bg-warm-800 overflow-hidden">
                 <div class="h-full rounded-full transition-all duration-300" :class="contextPct >= 80 ? 'bg-coral' : contextPct >= 60 ? 'bg-amber' : 'bg-aquamarine'" :style="{ width: Math.min(contextPct, 100) + '%' }" />
@@ -92,13 +92,12 @@
 </template>
 
 <script setup>
-import { computed, onMounted, onUnmounted, ref, watch } from "vue"
+import { computed, onMounted, ref, watch } from "vue"
 
 import ModulesPanel from "@/components/panels/modules/ModulesPanel.vue"
 import { useChatStore } from "@/stores/chat"
 import { useI18n } from "@/utils/i18n"
 import { agentAPI, configAPI, terrariumAPI } from "@/utils/api"
-import { LAYOUT_EVENTS, onLayoutEvent } from "@/utils/layoutEvents"
 
 const props = defineProps({
   instance: { type: Object, default: null },
@@ -126,13 +125,8 @@ const agentLabel = computed(() => chat.sessionInfo.agentName || props.instance?.
 const modelLabel = computed(() => chat.modelDisplay || props.instance?.llm_name || props.instance?.model || "--")
 const sessionIdLabel = computed(() => chat.sessionInfo.sessionId || props.instance?.session_id || props.instance?.id || "--")
 
-let cleanupModelCatalog = null
 onMounted(() => {
   loadModels()
-  cleanupModelCatalog = onLayoutEvent(LAYOUT_EVENTS.MODEL_CATALOG_CHANGED, loadModels)
-})
-onUnmounted(() => {
-  if (cleanupModelCatalog) cleanupModelCatalog()
 })
 
 watch(
@@ -157,7 +151,7 @@ const currentModelProfile = computed(() => {
   const wantProvider = slash >= 0 ? base.slice(0, slash) : ""
   const wantName = slash >= 0 ? base.slice(slash + 1) : base
   const entries = availableModels.value || []
-  return wantProvider ? entries.find((m) => m.name === wantName && (m.provider || m.login_provider) === wantProvider) || null : entries.find((m) => m.name === wantName) || null
+  return entries.find((m) => m.name === wantName && (!wantProvider || (m.provider || m.login_provider) === wantProvider)) || entries.find((m) => m.name === wantName) || null
 })
 
 async function loadModels() {
@@ -173,19 +167,21 @@ const totalUsage = computed(() => {
   let prompt = 0
   let completion = 0
   let cached = 0
+  let lastPrompt = 0
   for (const usage of Object.values(chat.tokenUsage)) {
     prompt += usage.prompt || 0
     completion += usage.completion || 0
     cached += usage.cached || 0
+    if ((usage.lastPrompt || 0) > lastPrompt) lastPrompt = usage.lastPrompt || 0
   }
-  return { prompt, completion, cached }
+  return { prompt, completion, cached, lastPrompt }
 })
 
 const maxContext = computed(() => chat.activeModelInfo.maxContext || props.instance?.max_context || 0)
 
 const contextPct = computed(() => {
-  if (!maxContext.value || !chat.activeTokenUsage.lastPrompt) return 0
-  return Math.round((chat.activeTokenUsage.lastPrompt / maxContext.value) * 100)
+  if (!maxContext.value || !totalUsage.value.lastPrompt) return 0
+  return Math.round((totalUsage.value.lastPrompt / maxContext.value) * 100)
 })
 
 const compactThreshold = computed(() => chat.activeModelInfo.compactThreshold || props.instance?.compact_threshold || 0)
@@ -207,9 +203,12 @@ function formatTokens(value) {
 async function stopTask(jobId) {
   try {
     const sid = chat._instanceGraphId || chat._instanceId
-    const tab = chat.activeTab || "root"
-    await terrariumAPI.stopCreatureTask(sid, tab, jobId)
     const job = chat.runningJobs[jobId]
+    // Route to the job's OWN creature, not whatever tab is active — a
+    // background job started on tab A must be cancellable while the user
+    // is looking at tab B.
+    const tab = job?.tab || chat.activeTab || "root"
+    await terrariumAPI.stopCreatureTask(sid, tab, jobId)
     if (job) job.cancelling = true
   } catch (err) {
     console.error("Failed to stop task:", err)

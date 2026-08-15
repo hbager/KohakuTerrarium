@@ -1,31 +1,9 @@
-"""Cluster-aware multi-worker attach multiplexer (CF-1 / CF-2).
+"""Multiplex cluster-worker attachments through one client websocket.
 
-The single-worker IO attach (``studio.attach.io.attach_io`` →
-``_attach_io_remote``) routes a chat WS to ONE worker via
-``proxy_ws_to_lab``. That is correct for non-cluster sessions but
-fails the multi-node cluster invariant in two ways:
-
-- **CF-1 (B11)**: when the user types with ``target=<cross-worker
-  creature>``, the bound worker's ``_find_sibling_by_name`` searches
-  its local engine graph only — cross-cluster siblings miss and the
-  WS surfaces ``"Cannot route to creature X: not found in this
-  session."`` even though the cluster is meant to look like ONE
-  session.
-- **CF-2**: channel callbacks + history come from the bound worker's
-  replica. Channels in a cluster are replicated on every member
-  worker's engine; the bound worker only sees its own replica, so
-  messages sent via a peer worker never reach the chat WS history.
-
-This module hosts :func:`attach_io_cluster`, the cluster-aware
-multiplexer. It opens one upstream :class:`RemoteStream` per cluster
-member worker via the existing ``terrarium.attach`` APP namespace —
-every worker's ``TerrariumAttachAdapter`` runs its full producer
-behaviour (``StreamOutput`` + sibling subscribe + channel callbacks)
-and pumps frames into the host's per-worker upstream. The host
-merges every upstream onto the single client WS, deduping
-``channel_message`` frames by ``message_id``, and routes inbound
-input frames by ``target=`` to whichever worker hosts the named
-creature.
+A cluster must appear as one session even though creature routers and channel
+replicas are worker-local. One remote stream is opened per member worker; outbound
+frames are merged with replicated channel messages deduplicated, while targeted
+input is sent to the worker that owns the named creature.
 """
 
 import asyncio
@@ -42,7 +20,7 @@ logger = get_logger(__name__)
 
 
 async def _forward_queue(queue: asyncio.Queue, ws: WebSocket) -> None:
-    """Drain ``queue`` onto ``ws`` until a ``None`` sentinel arrives."""
+    """Forward queued frames until the shutdown sentinel arrives."""
     try:
         while True:
             msg = await queue.get()
@@ -53,31 +31,45 @@ async def _forward_queue(queue: asyncio.Queue, ws: WebSocket) -> None:
         logger.warning("cluster mux: forward queue error", error=str(e), exc_info=True)
 
 
+async def _forward_client_frame(
+    service: Any,
+    data: dict[str, Any],
+    target_routes: dict[str, tuple[str, str, RemoteStream]],
+    default_route: tuple[str, str, RemoteStream] | None,
+) -> bool:
+    """Forward one input operation to the worker that owns its target."""
+    if data.get("type") not in {"input", "input_edit", "input_cancel"}:
+        return False
+    target_name = (data.get("target") or "").strip()
+    route = target_routes.get(target_name) if target_name else default_route
+    if route is None:
+        route = default_route
+    if route is None:
+        return True
+    node_id, _member_sid, remote_stream = route
+    await service.host.request(
+        to_node=node_id,
+        namespace="terrarium.attach",
+        type="input",
+        body={"stream_id": remote_stream.stream_id, "frame": data},
+        timeout=10.0,
+    )
+    return True
+
+
 async def attach_io_cluster(
     websocket: WebSocket,
     service: "TerrariumService",
     primary_sid: str,
     bound_creature_id: str,
 ) -> None:
-    """Run the cluster IO multiplexer until ``websocket`` disconnects.
+    """Run the cluster attachment until the client websocket disconnects.
 
-    Inbound frames:
-    - ``input`` with ``target=<name>``: dispatched to the upstream whose
-      worker hosts ``<name>``. If unknown, surface the same
-      "not found in this session" error frame the single-worker path
-      emits so a genuine miss is still distinguishable.
-    - ``input`` with no target: dispatched to the upstream of the
-      URL-bound creature (default route).
-    - ``ui_reply`` / ``ui_dismiss``: broadcast to every upstream — only
-      the originating worker has the matching ``event_id`` in its
-      ``output_router``; peers reply with ``ack_status="unknown"`` and
-      the originating worker's ack reaches the client.
-
-    Outbound frames from every upstream are merged onto the client WS
-    in arrival order. ``channel_message`` frames are deduped by
-    ``message_id`` (with a fallback synthetic key on
-    ``(channel, sender, content, timestamp)``) so cluster-replicated
-    channels emit each message once.
+    Targeted input follows the owning worker; untargeted input uses the URL-bound
+    creature's worker. Interactive replies and dismissals are broadcast because only
+    the originating router recognizes the event ID. Outbound frames retain arrival
+    order, and replicated channel messages are deduplicated by message ID or a stable
+    content-derived fallback key.
     """
     members_fn = getattr(service, "_cluster_members_for", None)
     members: list[tuple[str, str]] = []
@@ -217,29 +209,33 @@ async def attach_io_cluster(
         while True:
             data = await websocket.receive_json()
             msg_type = data.get("type")
-            if msg_type == "input":
+            if msg_type in ("input", "input_edit", "input_cancel"):
                 target_name = (data.get("target") or "").strip()
-                route = default_route
-                if target_name:
-                    if target_name not in target_routes:
-                        try:
-                            queue.put_nowait(
-                                {
-                                    "type": "error",
-                                    "source": target_name,
-                                    "content": (
-                                        f"Cannot route to creature {target_name!r}: "
-                                        "not found in this session."
-                                    ),
-                                    "ts": time.time(),
-                                }
-                            )
-                        except asyncio.QueueFull:
-                            logger.debug("cluster mux: error queue full")
-                        continue
-                    route = target_routes[target_name]
-                if route is not None:
-                    await _send_input(route, dict(data))
+                if target_name and target_name not in target_routes:
+                    try:
+                        queue.put_nowait(
+                            {
+                                "type": "error",
+                                "source": target_name,
+                                "content": (
+                                    f"Cannot route to creature {target_name!r}: "
+                                    "not found in this session."
+                                ),
+                                "ts": time.time(),
+                            }
+                        )
+                    except asyncio.QueueFull:
+                        logger.debug("cluster mux: error queue full")
+                    continue
+                try:
+                    await _forward_client_frame(
+                        service,
+                        data,
+                        target_routes,
+                        default_route,
+                    )
+                except Exception as exc:
+                    logger.warning("cluster mux input forward failed", error=str(exc))
             elif msg_type in ("ui_reply", "ui_dismiss"):
                 for node_id, _sid, rs in upstreams:
                     try:

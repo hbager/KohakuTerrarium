@@ -104,13 +104,41 @@ class TestStreamOutputSync:
         so.on_activity_with_metadata(
             "tool_call",
             "[bash] ls",
-            metadata={"args": ["-la"], "job_id": "j1", "unknown_key": "x"},
+            metadata={
+                "args": ["-la"],
+                "job_id": "j1",
+                "pending_id": "c_input",
+                "unknown_key": "x",
+            },
         )
         msg = q.get_nowait()
         assert msg["args"] == ["-la"]
         assert msg["job_id"] == "j1"
+        assert msg["pending_id"] == "c_input"
         # Unknown keys are filtered.
         assert "unknown_key" not in msg
+
+    def test_tool_done_streams_preview_not_full_output(self, _stream):
+        so, q, _log = _stream
+        full = "x" * 200_000
+        so.on_activity_with_metadata(
+            "tool_done",
+            "[bash] big",
+            metadata={
+                "job_id": "j1",
+                "output": full,
+                "output_preview": full[:5000],
+            },
+        )
+        msg = q.get_nowait()
+        assert msg["type"] == "activity"
+        assert msg["output"] == full[:5000]
+        assert len(msg["output"]) == 5000
+        mirror = q.get_nowait()
+        assert mirror["type"] == "tool_done"
+        assert mirror["output"] == full[:5000]
+        # The raw full output never leaves the process over the stream.
+        assert full not in (msg["output"], mirror["output"])
 
     def test_on_assistant_image(self, _stream):
         so, q, _log = _stream
@@ -163,9 +191,12 @@ class TestStreamOutputEmit:
 
     async def test_processing_events(self, _stream):
         so, q, _log = _stream
-        await so.emit(_evt("processing_start"))
+        await so.emit(_evt("processing_start", payload={"request_id": "regen-1"}))
         await so.emit(_evt("processing_end"))
-        assert q.get_nowait()["type"] == "processing_start"
+        started = q.get_nowait()
+        assert started["type"] == "processing_start"
+        assert started["source"] == "src"
+        assert started["request_id"] == "regen-1"
         assert q.get_nowait()["type"] == "processing_end"
 
     async def test_user_input_skipped(self, _stream):

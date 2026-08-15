@@ -90,10 +90,6 @@ ALLOWLIST_600 = {
     # already extracted to agent_tools/agent_pre_dispatch/skill-hints;
     # the remaining code is a single cohesive lifecycle.
     "core/agent_handlers.py",
-    # Session memory facade: indexing/search/compaction/cleanup share the same
-    # three vault handles and embedder state; splitting would scatter lifecycle
-    # ownership for a module only marginally above the default limit.
-    "session/memory.py",
     # Session store facade — owns every KVault table + uniform per-table
     # getters/setters (meta, state, events, channels, subagents, jobs,
     # conversation, turn_rollup, fts). Heavy lifting for counters, fork,
@@ -127,12 +123,10 @@ ALLOWLIST_600 = {
     # the soft cap. Splitting transport-side bookkeeping from handler
     # dispatch would fragment a single cohesive lifecycle.
     "laboratory/_internal/client.py",
-    # TerrariumService Protocol + LocalTerrariumService — full
-    # per-creature API surface (chat / state / mutation / wiring /
-    # cluster snapshot). One cohesive Protocol definition with a
-    # uniform LocalImpl method per Protocol method; splitting along
-    # category lines would scatter related implementations across
-    # files that all consume the same engine handle.
+    # TerrariumService Protocol + the shared LocalTerrariumService
+    # facade. Command methods already live in local_command_service.py;
+    # the remaining methods keep one uniform engine-backed implementation
+    # beside the Protocol surface they implement.
     "terrarium/service.py",
     # RemoteTerrariumService — wire-call counterpart to service.py,
     # one method per Protocol entry. Same shape rationale.

@@ -1,82 +1,142 @@
 import { mount } from "@vue/test-utils"
 import { createPinia, setActivePinia } from "pinia"
 import { beforeEach, describe, expect, it, vi } from "vitest"
-import { nextTick } from "vue"
-
-vi.mock("@/stores/instances", () => ({
-  useInstancesStore: () => ({ current: null }),
-}))
-
-vi.mock("@/utils/i18n", () => ({
-  useI18n: () => ({ t: (key) => key }),
-}))
-
-vi.mock("@/components/common/MarkdownRenderer.vue", () => ({
-  default: { props: ["content"], template: "<div>{{ content }}</div>" },
-}))
-
-vi.mock("@/components/chat/ToolCallBlock.vue", () => ({
-  default: { template: "<div />" },
-}))
-
-vi.mock("@/components/chat/UIEventBlock.vue", () => ({
-  default: { template: "<div />" },
-}))
-
-vi.mock("@/components/cluster/SiteChip.vue", () => ({
-  default: { template: "<span />" },
-}))
 
 import ChatMessage from "./ChatMessage.vue"
 import { useChatStore } from "@/stores/chat"
 
-beforeEach(() => {
-  setActivePinia(createPinia())
-  vi.clearAllMocks()
-})
+vi.mock("@/utils/chatAttachments", () => ({
+  buildMessageParts: async (text) => text,
+  contentToEditableDraft: (content) => ({
+    text: typeof content === "string" ? content : "",
+    attachments: [],
+  }),
+  formatBytes: (size) => String(size),
+  MAX_ATTACHMENT_BYTES: 10_000,
+  MAX_IMAGE_BYTES: 10_000,
+}))
 
-function pendingPromise() {
-  let resolve
-  const promise = new Promise((r) => {
-    resolve = r
+function mountMessage(store, pinia) {
+  const message = {
+    role: "user",
+    content: "original draft",
+    turnIndex: 1,
+    branchId: 1,
+    latestBranch: 1,
+    userPosition: 0,
+  }
+  store.messagesByTab.main = [message]
+  store.activeTab = "main"
+  return mount(ChatMessage, {
+    props: { message, messageIdx: 0, tabId: "main" },
+    global: {
+      plugins: [pinia],
+      stubs: {
+        MarkdownRenderer: true,
+        ToolCallBlock: true,
+        ToolBatchGroup: true,
+        UIEventBlock: true,
+        ContentParts: true,
+      },
+    },
   })
-  return { promise, resolve }
 }
 
-describe("ChatMessage — edit rerun UX", () => {
-  it("closes the inline editor immediately after Save & Rerun starts", async () => {
-    const chat = useChatStore()
-    const pending = pendingPromise()
-    vi.spyOn(chat, "editMessage").mockReturnValue(pending.promise)
+describe("ChatMessage branch operations", () => {
+  let pinia
 
-    const wrapper = mount(ChatMessage, {
-      props: {
-        message: {
-          id: "u_1_1_2",
-          role: "user",
-          content: "old text",
-          turnIndex: 1,
-          userPosition: 0,
-          latestBranch: 1,
-        },
-        messageIdx: 0,
+  beforeEach(() => {
+    Object.defineProperty(window, "localStorage", {
+      configurable: true,
+      value: {
+        getItem: vi.fn(() => null),
+        setItem: vi.fn(),
+        removeItem: vi.fn(),
       },
     })
+    pinia = createPinia()
+    setActivePinia(pinia)
+  })
 
-    await wrapper.find('[aria-label="Edit and rerun message"]').trigger("click")
-    expect(wrapper.find("textarea").exists()).toBe(true)
+  it("keeps Save & Rerun bound to the message tab after the active tab changes", async () => {
+    const store = useChatStore()
+    store._instanceId = "instance"
+    const editSpy = vi.spyOn(store, "editMessage").mockResolvedValue({ ok: true })
+    const wrapper = mountMessage(store, pinia)
 
-    const textarea = wrapper.find("textarea")
-    await textarea.setValue("new text")
-    await wrapper
-      .findAll("button")
-      .find((btn) => btn.text() === "Save & Rerun")
-      .trigger("click")
-    await nextTick()
+    await wrapper.get('[aria-label="Edit and rerun message"]').trigger("click")
+    store.activeTab = "other"
+    await wrapper.get("textarea").setValue("updated draft")
+    await wrapper.get('[aria-label="Save and rerun"]').trigger("click")
 
-    expect(chat.editMessage).toHaveBeenCalledOnce()
-    expect(wrapper.find("textarea").exists()).toBe(false)
+    expect(editSpy).toHaveBeenCalledWith(
+      0,
+      "updated draft",
+      expect.objectContaining({ tabId: "main" }),
+    )
+  })
 
-    pending.resolve(true)
+  it("keeps the editor mounted and disabled until Save & Rerun is accepted", async () => {
+    const store = useChatStore()
+    store._instanceId = "instance"
+    let resolveEdit
+    store.editMessage = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          resolveEdit = resolve
+        }),
+    )
+    const wrapper = mountMessage(store, pinia)
+
+    await wrapper.get('[aria-label="Edit and rerun message"]').trigger("click")
+    const textarea = wrapper.get("textarea")
+    await textarea.setValue("updated draft")
+    await wrapper.get('[aria-label="Save and rerun"]').trigger("click")
+
+    expect(wrapper.get("textarea").attributes("disabled")).toBeDefined()
+    expect(wrapper.text()).toContain("Starting")
+    resolveEdit({ ok: true })
+    await vi.waitFor(() => expect(wrapper.find("textarea").exists()).toBe(false))
+  })
+
+  it("disables branch controls only for the active tab operation", async () => {
+    const store = useChatStore()
+    store._instanceId = "instance"
+    const wrapper = mountMessage(store, pinia)
+    store.branchOperationByTab.main = { type: "edit", phase: "starting" }
+    await wrapper.vm.$nextTick()
+    expect(
+      wrapper.get('[aria-label="Edit and rerun message"]').attributes("disabled"),
+    ).toBeDefined()
+
+    store.branchOperationByTab.main = null
+    store.branchOperationByTab.other = { type: "regenerate", phase: "starting" }
+    await wrapper.vm.$nextTick()
+    expect(
+      wrapper.get('[aria-label="Edit and rerun message"]').attributes("disabled"),
+    ).toBeUndefined()
+
+    await wrapper.setProps({ tabId: "other" })
+    await wrapper.vm.$nextTick()
+    expect(
+      wrapper.get('[aria-label="Edit and rerun message"]').attributes("disabled"),
+    ).toBeDefined()
+  })
+
+  it("preserves and refocuses the editor while showing a rejected operation error", async () => {
+    const store = useChatStore()
+    store._instanceId = "instance"
+    store.editMessage = vi.fn().mockResolvedValue({ ok: false, error: "branch collision" })
+    const wrapper = mountMessage(store, pinia)
+    document.body.appendChild(wrapper.element)
+
+    await wrapper.get('[aria-label="Edit and rerun message"]').trigger("click")
+    const textarea = wrapper.get("textarea")
+    await textarea.setValue("keep this draft")
+    await wrapper.get('[aria-label="Save and rerun"]').trigger("click")
+
+    await vi.waitFor(() => expect(wrapper.text()).toContain("branch collision"))
+    expect(wrapper.get("textarea").element.value).toBe("keep this draft")
+    expect(document.activeElement).toBe(wrapper.get("textarea").element)
   })
 })

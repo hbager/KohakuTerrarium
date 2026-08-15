@@ -111,6 +111,12 @@ class TestTogglePluginLoadPending:
             def is_enabled(self, name):
                 return name in self._enabled
 
+            def list_plugins(self):
+                return [
+                    {"name": name, "enabled": name in self._enabled}
+                    for name in self._registered
+                ]
+
             def enable(self, name):
                 self._enabled.add(name)
 
@@ -157,6 +163,21 @@ class TestSetModuleOptionsDispatch:
         out = co.agent_set_module_options(agent, "native_tool", "t1", {"a": 1})
         assert out == {"a": 1}
         assert store == {"t1": {"a": 1}}
+
+    def test_tool_dispatch(self):
+        store = {}
+
+        class _Helper:
+            def set(self, name, values):
+                store[name] = values
+                return values
+
+        agent = SimpleNamespace(tool_options=_Helper())
+        out = co.agent_set_module_options(
+            agent, "tool", "web_search", {"backend": "deepseek"}
+        )
+        assert out == {"backend": "deepseek"}
+        assert store == {"web_search": {"backend": "deepseek"}}
 
 
 # ---------------------------------------------------------------------------

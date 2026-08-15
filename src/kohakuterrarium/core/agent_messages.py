@@ -1,18 +1,28 @@
 """Message edit / regenerate / rewind mixin for Agent.
 
-Core feature: modify past messages and re-run the turn. Works from
-TUI, frontend, and programmatic API — all three call the same
-implementation.
+Modify past messages, regenerate responses, and replay conversation branches.
 """
 
-from kohakuterrarium.core.events import EventType, TriggerEvent
-from kohakuterrarium.llm.message import normalize_content_parts
-from kohakuterrarium.session.history import (
-    _index_parent_paths,
-    _resolve_selected_branches,
-    replay_conversation,
-    select_live_event_ids,
+import asyncio
+
+from kohakuterrarium.core.agent_message_history import (
+    live_user_turns as _live_user_turns,
+    max_branch_id_for_turn as _max_branch_id_for_turn,
+    previous_branch_user_content as _previous_branch_user_content,
+    reload_conversation_under_branch_view as _reload_branch_view,
+    resolve_edit_message_index as _resolve_edit_message_index,
+    turn_index_for_user_position as _turn_index_for_user_position,
+    user_message_content_for_turn as _user_message_content_for_turn,
 )
+from kohakuterrarium.core.agent_raw_history import (
+    raw_target_content,
+    reload_raw_prefix_for_target,
+)
+from kohakuterrarium.core.events import EventType, TriggerEvent
+from kohakuterrarium.errors import ConflictError
+from kohakuterrarium.llm.message import normalize_content_parts
+from kohakuterrarium.session.history import replay_conversation
+from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -26,6 +36,8 @@ class AgentMessagesMixin:
         *,
         turn_index: int | None = None,
         branch_view: dict[int, int] | None = None,
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
     ) -> None:
         """Regenerate an assistant response.
 
@@ -48,13 +60,20 @@ class AgentMessagesMixin:
         the resolved ``turn_index`` so the original branch is preserved
         and addressable via the ``<x/N>`` navigator.
         """
+        if target is not None:
+            await self.edit_and_rerun(
+                message_idx=-1,
+                new_content=raw_target_content(self, target, branch_view=branch_view),
+                turn_index=target.turn_index,
+                branch_view=branch_view,
+                request_id=request_id,
+                target=target,
+            )
+            return
+
         if turn_index is not None:
-            # Resolve the user_message content for this turn at the
-            # selected branch in our subtree, then route through
-            # edit_and_rerun with that same content — semantically
-            # "edit to identical content," which opens a new branch
-            # at the requested turn just like a tail regen would for
-            # the last turn.
+            # Reusing the selected branch's content gives regeneration the same
+            # branching semantics as an edit without changing the message.
             prev_content = self._user_message_content_for_turn(
                 turn_index, branch_view=branch_view
             )
@@ -82,6 +101,13 @@ class AgentMessagesMixin:
             )
             return
 
+        async with self._get_message_mutation_lock():
+            await self._regenerate_tail_response(request_id=request_id)
+
+    async def _regenerate_tail_response(self, *, request_id: str | None) -> None:
+        """Regenerate the current tail while holding the mutation lock."""
+        self._ensure_history_mutation_idle()
+        self._ensure_rerun_available()
         conv = self.controller.conversation
         last_user = conv.find_last_user_index()
         if last_user < 0:
@@ -124,7 +150,11 @@ class AgentMessagesMixin:
                 branch_id=self._branch_id,
                 parent_branch_path=ppath,
             )
-        await self._rerun_from_last()
+        self._branch_request_id = request_id
+        try:
+            await self._rerun_from_last()
+        finally:
+            self._branch_request_id = None
 
     async def edit_and_rerun(
         self,
@@ -134,6 +164,31 @@ class AgentMessagesMixin:
         turn_index: int | None = None,
         user_position: int | None = None,
         branch_view: dict[int, int] | None = None,
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
+    ) -> bool:
+        """Serialize conversation reconstruction and the resulting rerun turn."""
+        async with self._get_message_mutation_lock():
+            return await self._edit_and_rerun_locked(
+                message_idx,
+                new_content,
+                turn_index=turn_index,
+                user_position=user_position,
+                branch_view=branch_view,
+                request_id=request_id,
+                target=target,
+            )
+
+    async def _edit_and_rerun_locked(
+        self,
+        message_idx: int,
+        new_content: str,
+        *,
+        turn_index: int | None = None,
+        user_position: int | None = None,
+        branch_view: dict[int, int] | None = None,
+        request_id: str | None = None,
+        target: UserMessageSelector | None = None,
     ) -> bool:
         """Replace a user message and re-run from there.
 
@@ -148,11 +203,15 @@ class AgentMessagesMixin:
         truncation target resolves correctly even when the user has
         switched to an older subtree in the UI.
         """
-        # Reload conversation under the chosen subtree FIRST so the
-        # in-memory message list reflects what the user sees in the UI.
-        # Without this, edits on a non-latest branch silently fail
-        # because the agent's in-memory state is on a different branch.
-        if branch_view:
+        self._ensure_history_mutation_idle()
+        self._ensure_rerun_available()
+        # Canonical persisted targets reconstruct original context before
+        # mutating in-memory state, deliberately bypassing compact snapshots.
+        if target is not None:
+            reload_raw_prefix_for_target(self, target, branch_view=branch_view)
+            turn_index = target.turn_index
+            user_position = None
+        elif branch_view:
             self._reload_conversation_under_branch_view(branch_view)
 
         conv = self.controller.conversation
@@ -246,44 +305,67 @@ class AgentMessagesMixin:
                 branch_id=self._branch_id,
                 parent_branch_path=ppath,
             )
-        await self._rerun_from_last(new_user_content=new_content)
+        self._branch_request_id = request_id
+        try:
+            await self._rerun_from_last(new_user_content=new_content)
+        finally:
+            self._branch_request_id = None
         return True
 
     async def rewind_to(self, message_idx: int) -> None:
         """Drop messages from ``message_idx`` onward without re-running."""
-        conv = self.controller.conversation
-        removed = conv.truncate_from(message_idx)
-        logger.info("Rewound", index=message_idx, dropped=len(removed))
-        if self.session_store:
-            try:
-                self.session_store.save_conversation(
-                    self.config.name, conv.to_messages()
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to save conversation after rewind",
-                    error=str(e),
-                    exc_info=True,
-                )
+        async with self._get_message_mutation_lock():
+            self._ensure_history_mutation_idle()
+            conv = self.controller.conversation
+            removed = conv.truncate_from(message_idx)
+            logger.info("Rewound", index=message_idx, dropped=len(removed))
+            if self.session_store:
+                try:
+                    self.session_store.save_conversation(
+                        self.config.name, conv.snapshot_messages()
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to save conversation after rewind",
+                        error=str(e),
+                        exc_info=True,
+                    )
+
+    def _get_message_mutation_lock(self) -> asyncio.Lock:
+        """Return the per-agent lock guarding destructive history mutations."""
+        lock = getattr(self, "_message_mutation_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._message_mutation_lock = lock
+        return lock
+
+    def _ensure_history_mutation_idle(self) -> None:
+        """Reject destructive history changes while another turn can observe it."""
+        processing_lock = getattr(self, "_processing_lock", None)
+        inbox = getattr(self, "_event_inbox", None)
+        turn_active = processing_lock is not None and processing_lock.locked()
+        input_pending = inbox is not None and len(inbox) > 0
+        if turn_active or input_pending:
+            raise ConflictError(
+                "Cannot mutate conversation history while a turn is active"
+            )
+
+    def _ensure_rerun_available(self) -> None:
+        """Reject reruns before mutation when the event loop cannot admit them."""
+        if getattr(self, "_paused", False):
+            raise ConflictError("Cannot rerun conversation while the agent is paused")
+        if getattr(self, "_running", True) is False:
+            raise ConflictError(
+                "Cannot rerun conversation while the agent is not running"
+            )
 
     async def _rerun_from_last(self, new_user_content: str | list = "") -> None:
-        """Trigger a new LLM turn from the current conversation state.
+        """Trigger an LLM turn from the current conversation state.
 
-        ``new_user_content`` is empty for plain regenerate (no new
-        user message — we are re-running with the existing one) and
-        non-empty for edit+rerun (the controller and event log need
-        to record the edited content).
-
-        Multi-modal callers (frontend ``editMessage`` builds a list of
-        ``{type, text|image_url|file}`` dicts via ``buildMessageParts``)
-        must be normalised to ``ContentPart`` instances before the
-        TriggerEvent reaches ``_format_events_for_context`` — that
-        helper only matches ``TextPart`` / ``ImagePart`` / ``FilePart``
-        objects. A raw dict-list silently produces empty
-        ``combined_text``, which in native mode collapses to
-        ``skip_empty=True`` and the LLM ends up running with no new
-        user message at all (the symptom users saw: "edit + rerun
-        runs without the edit").
+        Empty content regenerates from the existing user message; non-empty
+        content records an edit. Normalization is required because downstream
+        context formatting recognizes content-part objects rather than raw
+        multimodal dictionaries.
         """
         edited = bool(new_user_content)
         normalised = normalize_content_parts(new_user_content)
@@ -292,14 +374,14 @@ class AgentMessagesMixin:
         event = TriggerEvent(
             type=EventType.USER_INPUT,
             content=normalised,
-            context={"rerun": True, "edited": edited},
+            context={
+                "rerun": True,
+                "edited": edited,
+                "request_id": getattr(self, "_branch_request_id", None),
+            },
             stackable=False,
         )
         await self._process_event(event)
-
-    # ------------------------------------------------------------------
-    # Branch resolution helpers
-    # ------------------------------------------------------------------
 
     def _resolve_edit_message_index(
         self,
@@ -310,32 +392,15 @@ class AgentMessagesMixin:
         user_position: int | None = None,
         branch_view: dict[int, int] | None = None,
     ) -> int | None:
-        """Resolve an edit target to an in-memory user-message index."""
-        # ``user_position`` is the precise clicked bubble. Keep it
-        # authoritative because mid-turn injected user bubbles share the
-        # same turn_index as the turn-starter.
-        if turn_index is not None and user_position is None:
-            pos = self._user_position_for_turn_index(
-                turn_index, branch_view=branch_view
-            )
-            if pos is not None:
-                user_position = pos
-            else:
-                return None
-        if user_position is not None:
-            if user_position < 0:
-                return None
-            seen = -1
-            for idx, msg in enumerate(msgs):
-                if msg.role != "user":
-                    continue
-                seen += 1
-                if seen == user_position:
-                    return idx
-            return None
-        if message_idx < 0 or message_idx >= len(msgs):
-            return None
-        return message_idx
+        """Resolve by turn metadata or exact unique legacy-content matching."""
+        return _resolve_edit_message_index(
+            self,
+            msgs,
+            message_idx,
+            turn_index=turn_index,
+            user_position=user_position,
+            branch_view=branch_view,
+        )
 
     def _user_position_for_turn_index(
         self,
@@ -344,8 +409,8 @@ class AgentMessagesMixin:
         branch_view: dict[int, int] | None = None,
     ) -> int | None:
         """Return the visible user-position for a live turn_index."""
-        for pos, ti in enumerate(self._live_user_turns(branch_view=branch_view)):
-            if ti == turn_index:
+        for pos, candidate in enumerate(self._live_user_turns(branch_view=branch_view)):
+            if candidate == turn_index:
                 return pos
         return None
 
@@ -365,38 +430,7 @@ class AgentMessagesMixin:
         Defers to ``select_live_event_ids`` from ``session/history.py``
         so this stays in lock-step with the replay logic.
         """
-        if self.session_store is None:
-            return []
-        try:
-            events = self.session_store.get_events(self.config.name)
-        except Exception as e:
-            logger.warning(
-                "Failed to read events for live turns", error=str(e), exc_info=True
-            )
-            return []
-        live_ids = select_live_event_ids(events, branch_view=branch_view)
-        seen_turns: set[int] = set()
-        live_user_turns: list[tuple[int, int]] = []
-        for evt in events:
-            if evt.get("type") != "user_message":
-                continue
-            eid = evt.get("event_id")
-            ti = evt.get("turn_index")
-            if not isinstance(eid, int) or not isinstance(ti, int):
-                continue
-            if eid not in live_ids:
-                continue
-            if ti in seen_turns:
-                # Tolerate legacy sessions that accumulated duplicates
-                # from the pre-fix double-append bug.
-                continue
-            seen_turns.add(ti)
-            live_user_turns.append((ti, eid))
-        # Sort by turn_index so position N maps to the Nth visible turn,
-        # not the Nth event in chronological order (which can scramble
-        # when sibling branches interleave in the event log).
-        live_user_turns.sort(key=lambda p: p[0])
-        return [ti for ti, _ in live_user_turns]
+        return _live_user_turns(self, branch_view=branch_view)
 
     def _turn_index_for_user_position(
         self,
@@ -411,30 +445,16 @@ class AgentMessagesMixin:
         ``branch_view`` (or the latest subtree when ``branch_view``
         is ``None``).
         """
-        live_user_turns = self._live_user_turns(branch_view=branch_view)
-        if user_position < 0 or user_position >= len(live_user_turns):
-            return None
-        return live_user_turns[user_position]
+        return _turn_index_for_user_position(
+            self,
+            user_position,
+            branch_view=branch_view,
+        )
 
     def _max_branch_id_for_turn(self, turn_index: int) -> int:
         """Return the largest ``branch_id`` recorded for ``turn_index``,
         or ``0`` if no branch yet exists."""
-        if self.session_store is None:
-            return 0
-        try:
-            events = self.session_store.get_events(self.config.name)
-        except Exception as e:
-            logger.warning(
-                "Failed to read events for branch lookup", error=str(e), exc_info=True
-            )
-            return 0
-        max_branch = 0
-        for evt in events:
-            if evt.get("turn_index") == turn_index:
-                bi = evt.get("branch_id")
-                if isinstance(bi, int) and bi > max_branch:
-                    max_branch = bi
-        return max_branch
+        return _max_branch_id_for_turn(self, turn_index)
 
     def _user_message_content_for_turn(
         self,
@@ -452,99 +472,26 @@ class AgentMessagesMixin:
         the user's current subtree (otherwise it picks the latest
         branch globally).
         """
-        if self.session_store is None:
-            return None
-        try:
-            events = self.session_store.get_events(self.config.name)
-        except Exception as e:
-            logger.warning(
-                "Failed to read events for turn-content lookup",
-                error=str(e),
-                exc_info=True,
-            )
-            return None
-        parent_paths = _index_parent_paths(events)
-        selected = _resolve_selected_branches(events, parent_paths, branch_view)
-        target_branch = selected.get(turn_index)
-        if target_branch is None:
-            return None
-        for evt in events:
-            if evt.get("type") != "user_message":
-                continue
-            if evt.get("turn_index") != turn_index:
-                continue
-            if evt.get("branch_id") != target_branch:
-                continue
-            return evt.get("content")
-        return None
+        return _user_message_content_for_turn(
+            self,
+            turn_index,
+            branch_view=branch_view,
+        )
 
     def _reload_conversation_under_branch_view(
         self,
         branch_view: dict[int, int],
     ) -> None:
-        """Replay events under ``branch_view`` and reset in-memory
-        conversation + agent state to match.
+        """Replay ``branch_view`` and align the conversation and agent state.
 
-        Frontend ``selectBranch`` is a view-only operation; the
-        agent's runtime state stays on whatever branch it last ran.
-        When the user then triggers edit/retry on the switched view,
-        the runtime state must match the user's view before truncate
-        + rerun, or the resolution lands on the wrong message and
-        the edit silently fails (the "can't edit on old branch" bug).
+        Branch selection changes only the displayed view, so runtime state must
+        be reseated before an edit or retry can resolve the intended message.
         """
-        if self.session_store is None:
-            return
-        try:
-            events = self.session_store.get_events(self.config.name)
-        except Exception as e:
-            logger.warning(
-                "Failed to read events for branch_view reload",
-                error=str(e),
-                exc_info=True,
-            )
-            return
-
-        # Compute the chosen subtree's leaf state up front so we can
-        # set agent metadata after reseating the conversation.
-        parent_paths = _index_parent_paths(events)
-        selected = _resolve_selected_branches(events, parent_paths, branch_view)
-
-        messages = replay_conversation(events, branch_view=branch_view)
-        conv = self.controller.conversation
-        # Keep the system prompt (it carries tool docs and agent
-        # personality). ``replay_conversation`` does not emit system
-        # messages from the event log, so we preserve whatever the
-        # controller set up at boot.
-        existing_system = [m for m in conv.get_messages() if m.role == "system"]
-        conv._messages.clear()
-        conv._messages.extend(existing_system)
-        for msg in messages:
-            role = msg.get("role")
-            if role == "system":
-                continue
-            content = msg.get("content", "")
-            extra: dict = {}
-            if msg.get("tool_calls"):
-                extra["tool_calls"] = msg["tool_calls"]
-            if msg.get("tool_call_id"):
-                extra["tool_call_id"] = msg["tool_call_id"]
-            if msg.get("name"):
-                extra["name"] = msg["name"]
-            conv.append(role, content, **extra)
-
-        # Reseat agent state to the chosen subtree's leaf so the next
-        # operation (edit/retry/continue) operates within this view.
-        if selected:
-            max_turn = max(selected.keys())
-            self._turn_index = max_turn
-            self._branch_id = selected[max_turn]
-            self._parent_branch_path = [
-                (t, b) for t, b in sorted(selected.items()) if t < max_turn
-            ]
-        else:
-            self._turn_index = 0
-            self._branch_id = 0
-            self._parent_branch_path = []
+        _reload_branch_view(
+            self,
+            branch_view,
+            replay=replay_conversation,
+        )
 
     def _previous_branch_user_content(self):
         """Return the ``user_message`` content recorded for the most
@@ -555,33 +502,4 @@ class AgentMessagesMixin:
         ``user_message`` event with the same wording as the original
         branch (pure regen does not change the user message).
         """
-        if self.session_store is None:
-            return None
-        try:
-            events = self.session_store.get_events(self.config.name)
-        except Exception as e:
-            logger.warning(
-                "Failed to read events for prev-branch user",
-                error=str(e),
-                exc_info=True,
-            )
-            return None
-        latest_for_turn: dict | None = None
-        latest_branch = -1
-        for evt in events:
-            if evt.get("type") != "user_message":
-                continue
-            if evt.get("turn_index") != self._turn_index:
-                continue
-            bi = evt.get("branch_id")
-            if not isinstance(bi, int):
-                continue
-            # We want the highest branch_id that is BELOW the current
-            # branch we are about to write — that's the one to copy
-            # the wording from.
-            if bi < self._branch_id and bi > latest_branch:
-                latest_branch = bi
-                latest_for_turn = evt
-        if latest_for_turn is None:
-            return None
-        return latest_for_turn.get("content")
+        return _previous_branch_user_content(self)

@@ -1,4 +1,4 @@
-"""Worker sub-agent - general-purpose implementation worker."""
+"""Built-in read-write implementation sub-agent configuration."""
 
 from kohakuterrarium.builtins.subagents._prompt_loader import render_subagent_prompt
 from kohakuterrarium.modules.subagent.config import SubAgentConfig
@@ -23,8 +23,8 @@ WORKER_CONFIG = SubAgentConfig(
         {
             "name": "budget",
             "options": {
-                "turn_budget": [70, 100],
-                "tool_call_budget": [150, 200],
+                "turn_budget": [40, 60],
+                "tool_call_budget": [75, 100],
             },
         },
     ],

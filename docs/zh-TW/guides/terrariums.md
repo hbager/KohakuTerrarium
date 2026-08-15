@@ -54,6 +54,41 @@ terrarium:
 
 欄位參考：[reference/configuration](../reference/configuration.md)。
 
+## recipe 只管圖結構
+
+recipe 描述的是 **結構**：哪些生物存在、哪些頻道存在、接哪些邊。它從不
+攜帶執行期資源設定。特別是，recipe **不攜帶任何
+[Drive](../concepts/multi-agent/drive.md) 欄位**——沒有執行期開關、沒有
+註冊選擇、沒有種子 Drive 記錄。所有既有 recipe 在零 Drive 感知下仍然
+有效。
+
+Drive 執行期設定是一個顯式的 `Terrarium(...)` 建構函式參數，套用在 recipe
+套用*之外*，而不是在它*之內*：
+
+```python
+from kohakuterrarium import Terrarium
+from kohakuterrarium.terrarium.drive.config import (
+    DriveRuntimeConfig,
+    default_registrations,
+)
+
+# 引擎被設定上它的執行期能力；recipe 只添加 creature/頻道/接線。
+# 已經設定好的引擎把它的 Drive 能力注入到 recipe 建立的每隻 creature。
+async with Terrarium(
+    session_dir="runs/",
+    drive_config=DriveRuntimeConfig(enabled=True),
+    drive_registrations=default_registrations(),
+) as engine:
+    await engine.apply_recipe("@kt-biome/terrariums/swe_team")
+    # ... 之後在這裡透過 service 顯式建立 Drive 記錄 ...
+```
+
+`from_recipe`、`resume` 與 `with_creature` 把這同樣的顯式 Drive 參數轉發
+給建構函式；recipe 物件不變。因此把一個 recipe 套用到兩個設定不同的引擎上
+可能得到不同的 Drive 能力。被托管的產品（web、TUI、`kt`）透過 Studio 從
+[`drive-settings.yaml`](../reference/configuration.md)解析這些參數；低層
+引擎從不讀那個檔案。見 [Programmatic Drive](programmatic-drive.md)。
+
 ## 自動建立的頻道
 
 執行期一定會建：
@@ -143,6 +178,8 @@ async with Terrarium() as engine:
 ```
 
 跨圖的 `connect()` 會合併兩個圖：environment 取聯集，掛著的 session store 合併成一份（`parent_session_ids` 記下血脈），新的 listener 會被注入 `ChannelTrigger`。`disconnect()` 可能把圖拆回兩邊、並把 parent session 複製到兩側。參考 [`examples/code/terrarium_hotplug.py`](../../examples/code/terrarium_hotplug.py)。
+
+頻道接線、群組訊息和 output wiring 等路由操作只會在呼叫者目前的邏輯圖內解析目標。請優先使用精確的執行期 Creature ID；顯示名稱或設定名稱只有在圖內唯一時才會被接受，歧義、過期或屬於其他圖的目標都會被拒絕。這些操作不會隱式合併彼此斷開的圖；請先用精確端點呼叫 `connect()`。
 
 同樣的 mutation 也開放給圖中的特權節點透過群組工具呼叫：`group_add_node`、`group_remove_node`、`group_start_node`、`group_stop_node`、`group_channel`、`group_wire`。它們合在一起就是圖內的「圖編輯器」，讓 LLM 驅動的 root 在執行中演化團隊。
 

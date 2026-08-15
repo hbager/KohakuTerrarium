@@ -134,7 +134,7 @@ class TestBuildToolArgs:
         assert out == {"command": "ls -la"}
 
     def test_python_content_becomes_code(self):
-        out = build_tool_args("run_python", {}, "print('hi')")
+        out = build_tool_args("python", {}, "print('hi')")
         assert out == {"code": "print('hi')"}
 
     def test_edit_content_becomes_diff(self):

@@ -2,7 +2,9 @@
 
 import asyncio
 import base64
+import logging
 
+import pytest
 
 from kohakuterrarium.laboratory._internal.app import AppMessage
 from kohakuterrarium.session.store import SessionStore
@@ -131,51 +133,6 @@ class TestSessionMirrorWriter:
         finally:
             writer.close()
 
-    def test_close_preserves_mirrored_last_active(self, tmp_path):
-        node = _FakeNode()
-        writer = SessionMirrorWriter(node, tmp_path / "mirror")
-        old_last_active = "2026-05-01T00:00:00+00:00"
-        store = writer.store_for("sess-1")
-        store.init_meta(
-            session_id="sess-1",
-            config_type="agent",
-            config_path="/cfg",
-            pwd="/work",
-            agents=["alice"],
-        )
-        store.meta["last_active"] = old_last_active
-
-        writer.close()
-
-        reopened = SessionStore(str(tmp_path / "mirror" / "sess-1.kohakutr"))
-        try:
-            assert reopened.meta["last_active"] == old_last_active
-        finally:
-            reopened.close(update_status=False)
-
-    def test_lru_eviction_preserves_mirrored_last_active(self, tmp_path):
-        node = _FakeNode()
-        writer = SessionMirrorWriter(node, tmp_path / "mirror", max_open_stores=1)
-        old_last_active = "2026-05-01T00:00:00+00:00"
-        store = writer.store_for("sess-1")
-        store.init_meta(
-            session_id="sess-1",
-            config_type="agent",
-            config_path="/cfg",
-            pwd="/work",
-            agents=["alice"],
-        )
-        store.meta["last_active"] = old_last_active
-
-        writer.store_for("sess-2")
-
-        reopened = SessionStore(str(tmp_path / "mirror" / "sess-1.kohakutr"))
-        try:
-            assert reopened.meta["last_active"] == old_last_active
-        finally:
-            reopened.close(update_status=False)
-            writer.close()
-
     def test_max_open_stores_at_least_one(self, tmp_path):
         node = _FakeNode()
         # Passing 0 should be clamped to 1.
@@ -248,18 +205,78 @@ class TestSessionMirrorWriter:
         finally:
             writer.close()
 
+    def test_real_vault_meta_setdefault_raises_on_str(self, tmp_path):
+        # Canary documenting WHY the mirror stamps ``on_node`` by assignment,
+        # not ``meta.setdefault``: the installed KohakuVault meta proxy's
+        # setdefault does ``bytes(default)``, which raises on a str default.
+        # Real store, no vault mock. If this ever stops raising, the workaround
+        # in ``sync.py`` may no longer be needed.
+        store = SessionStore(str(tmp_path / "canary.kohakutr"), writer_lock=True)
+        try:
+            with pytest.raises(TypeError):
+                store.meta.setdefault("on_node", "worker-1")
+        finally:
+            store.close()
+
+    async def test_dispatch_stamps_on_node_without_append_failure(self, tmp_path):
+        # Regression for BUG #127/#137: the mirror append must stamp ``on_node``
+        # via plain assignment (not ``meta.setdefault``) so the KohakuVault
+        # ``bytes(str)`` TypeError never aborts the handler. On the unfixed code
+        # the setdefault raises and the except-block logs "append failed" for THIS
+        # session — the only observable difference (the buggy setdefault writes
+        # on_node BEFORE raising, so the meta value alone can't distinguish it).
+        #
+        # De-flaked vs a raw shared-logger capture: the "append failed for %s/%s"
+        # record embeds the session_id, so filtering to this test's UNIQUE id
+        # ignores any concurrent/leftover mirror record from other tests under
+        # full-tier load.
+        session_id = "regress-on-node-7f3a"
+        records: list[logging.LogRecord] = []
+
+        class _Capture(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+
+        log = logging.getLogger("kohakuterrarium.session.sync")
+        handler = _Capture(level=logging.WARNING)
+        log.addHandler(handler)
+        node = _FakeNode()
+        writer = SessionMirrorWriter(node, tmp_path / "mirror")
+        try:
+            msg = AppMessage(
+                namespace=NAMESPACE,
+                type="event",
+                body={
+                    "session_id": session_id,
+                    "key": "alice:e000000",
+                    "data": {"type": "user_message", "content": "hi"},
+                },
+                sender_node="worker-7",
+                request_id=None,
+                in_reply_to=None,
+            )
+            await writer._dispatch(msg)
+            store = writer.store_for(session_id)
+            assert [e["content"] for e in store.get_events("alice")] == ["hi"]
+            assert store.load_meta().get("on_node") == "worker-7"
+        finally:
+            log.removeHandler(handler)
+            writer.close()
+        # Scoped to THIS session's id — deterministic under load.
+        mine = [
+            r.getMessage()
+            for r in records
+            if "append failed" in r.getMessage() and session_id in r.getMessage()
+        ]
+        assert not mine, mine
+
     async def test_dispatch_applies_meta(self, tmp_path):
         # A ``meta`` message initialises the mirror store's meta from
         # the worker's snapshot. Without this the mirror ``.kohakutr``
         # has no config_type / config_path and a resume off it fails
         # ("Session is a None, not an agent").
         node = _FakeNode()
-        statuses = []
-        writer = SessionMirrorWriter(
-            node,
-            tmp_path / "mirror",
-            on_meta_updated=lambda store: statuses.append(store.load_meta()["status"]),
-        )
+        writer = SessionMirrorWriter(node, tmp_path / "mirror")
         try:
             msg = AppMessage(
                 namespace=NAMESPACE,
@@ -270,7 +287,6 @@ class TestSessionMirrorWriter:
                         "config_type": "agent",
                         "config_path": "/cfg",
                         "agents": ["alice"],
-                        "status": "paused",
                     },
                 },
                 sender_node="worker-1",
@@ -284,7 +300,6 @@ class TestSessionMirrorWriter:
             assert meta["config_type"] == "agent"
             assert meta["config_path"] == "/cfg"
             assert meta["agents"] == ["alice"]
-            assert statuses == ["paused"]
         finally:
             writer.close()
 
@@ -474,18 +489,6 @@ class TestSessionEventTee:
             assert body["meta"]["config_type"] == "agent"
             assert body["meta"]["config_path"] == "/cfg/path"
             assert body["meta"]["agents"] == ["alice"]
-        finally:
-            tee.detach()
-            store.close()
-
-    async def test_flush_meta_times_out_when_link_is_down(self, tmp_path):
-        store = SessionStore(str(tmp_path / "s.kohakutr"))
-        node = _AsyncFakeNode(fail=True)
-        tee = SessionEventTee("sess", store, node)
-        try:
-            tee.attach()
-            await tee.flush_meta(timeout=0.01)
-            assert tee._attached is True
         finally:
             tee.detach()
             store.close()

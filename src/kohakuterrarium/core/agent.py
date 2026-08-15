@@ -1,11 +1,5 @@
 """
-Agent - Main orchestrator that wires all components together.
-
-The Agent class is the top-level entry point for running an agent.
-It manages the lifecycle of all modules and the main event loop.
-
-Component initialization is in agent_init.py (AgentInitMixin).
-Event handling and tool execution is in agent_handlers.py (AgentHandlersMixin).
+Top-level agent orchestration for component lifecycle and event processing.
 """
 
 import asyncio
@@ -19,6 +13,7 @@ from kohakuterrarium.core.agent_compact import (
     restore_compact_state_from_session,
 )
 from kohakuterrarium.core.agent_construct import AgentConstructMixin
+from kohakuterrarium.core.agent_event_loop import AgentEventLoopMixin
 from kohakuterrarium.core.agent_extensions import AgentExtensionsMixin
 from kohakuterrarium.core.agent_turn import AgentTurnMixin
 from kohakuterrarium.core.agent_handlers import AgentHandlersMixin
@@ -38,6 +33,7 @@ from kohakuterrarium.core.agent_budget_recovery import (
 )
 from kohakuterrarium.core.compact import CompactConfig, CompactManager
 from kohakuterrarium.core.config import AgentConfig, load_agent_config
+from kohakuterrarium.core.event_inbox import EventInbox, TurnOutcome
 from kohakuterrarium.core.controller_plugins import register_plugin_and_package_commands
 from kohakuterrarium.core.events import TriggerEvent, create_user_input_event
 from kohakuterrarium.modules.output.event import OutputEvent
@@ -49,7 +45,6 @@ from kohakuterrarium.llm.message import ContentPart
 from kohakuterrarium.modules.input.base import InputModule
 from kohakuterrarium.modules.output.base import OutputModule
 from kohakuterrarium.modules.plugin.base import PluginContext
-from kohakuterrarium.modules.trigger.base import BaseTrigger
 from kohakuterrarium.plugins_context import spawn_child_agent
 from kohakuterrarium.session.agent_attach import attach_to_session as _attach_to_session
 from kohakuterrarium.session.agent_attach import (
@@ -70,6 +65,7 @@ class Agent(
     AgentTurnMixin,
     AgentExtensionsMixin,
     AgentInitMixin,
+    AgentEventLoopMixin,
     AgentHandlersMixin,
     AgentMessagesMixin,
     AgentModelMixin,
@@ -133,10 +129,37 @@ class Agent(
         self.config = config
         self._strict = strict
         self._running = False
+        # Warm-pause admission gate (UXI-11): when True, new turns are
+        # buffered instead of run; the runtime stays live.
+        self._paused = False
         self._shutdown_event = asyncio.Event()
+        # Set once the startup trigger's awaited turn has settled inside
+        # ``_drive_input`` (or immediately when no startup trigger is
+        # configured). The Terrarium restoration barrier waits on this so
+        # Drive reconciliation never runs against an un-settled creature.
+        self._startup_settled = asyncio.Event()
+        # Turn mutex — now held ONLY by the single event consumer for the
+        # span of a turn so ``stop()`` can join an in-flight turn.
         self._processing_lock = asyncio.Lock()
-        self._pending_mid_turn_inputs: list[TriggerEvent] = []
+        self._turn_lock_holder: asyncio.Task | None = None
+        # False while a NON-stackable turn (startup / error / Drive) holds
+        # the mutex, so nothing folds into it.
+        self._active_turn_stackable = True
+        # The single infinite event queue + its one consumer (queue-first
+        # event system — see ``core/event_inbox.py`` + ``agent_event_loop.py``).
+        self._event_inbox = EventInbox()
+        self._consumer_task: asyncio.Task | None = None
+        # Warm-pause gate for the consumer: set = draining, cleared = paused.
+        self._consumer_resume = asyncio.Event()
+        self._consumer_resume.set()
+        # A trigger's drained backlog stashed by ``admit_ready_events`` and
+        # flushed onto the inbox right after its primary (UXI-08b).
+        self._trigger_backlog_stash: list[TriggerEvent] = []
+        self._bg_dispatch_acks: list[str] = []
         self.trigger_manager = TriggerManager(self._process_event)
+        # A trigger drains its whole ready backlog on fire and admits the
+        # extras here so the burst is absorbed in ONE turn (UXI-08b).
+        self.trigger_manager.admit_ready = self.admit_ready_events
 
         # Raw llm= argument (instance | selector string | profile | None).
         self._llm_spec = llm
@@ -157,10 +180,14 @@ class Agent(
         # Interrupt: flag + task reference for immediate cancellation
         self._interrupt_requested = False
         self._processing_task: asyncio.Task | None = None
+        self._branch_request_id: str | None = None
 
         self._active_handles: dict[str, Any] = {}
         self._direct_job_meta: dict[str, dict[str, Any]] = {}
         self._bg_controller_notify: dict[str, bool] = {}
+        # Deliverable background jobs (notify=True, non-stateful/-interactive)
+        # this turn spawned; the output-wiring guard defers only on these.
+        self._turn_dispatched_bg: set[str] = set()
 
         self.compact_manager: Any = None
         self.plugins: Any = None  # PluginManager | None
@@ -221,17 +248,9 @@ class Agent(
             ephemeral=config.ephemeral,
         )
 
-    # ``_init_iteration_budget`` + ``_init_termination`` live in
-    # AgentInitMixin (bootstrap/agent_init.py) with the other _init_*
-    # factories — moved to keep this file under the size cap.
-
     def _on_provider_emergency_drop(self, messages: list[dict[str, Any]]) -> None:
         """Synchronize controller conversation after provider emergency drop."""
         sync_emergency_drop_conversation(self, messages)
-
-    # =========================================================================
-    # Lifecycle
-    # =========================================================================
 
     async def start(self) -> None:
         """Start all agent modules."""
@@ -259,7 +278,19 @@ class Agent(
         self._wire_completion_callbacks()
 
         self._running = True
+        self._paused = False
+        self._stopped = False
         self._shutdown_event.clear()
+        # Fresh run: the startup trigger has not settled yet.
+        self._startup_settled.clear()
+
+        # Spawn the single event consumer — the only reader of the inbox.
+        # It must be running before the startup trigger fires (it drives
+        # every turn now, including startup / user input / completions).
+        self._consumer_resume.set()
+        self._consumer_task = asyncio.create_task(
+            self._run_event_consumer(), name=f"event_consumer_{self.config.name}"
+        )
 
         # Initialize MCP client manager if mcp_servers configured
         await self._init_mcp()
@@ -374,9 +405,11 @@ class Agent(
         )
         self.compact_manager = CompactManager(compact_cfg)
         self.compact_manager._controller = self.controller
+        self.compact_manager._agent = self
         self.compact_manager._llm = self._build_compact_llm(compact_cfg)
         self.compact_manager._output_router = self.output_router
         self.compact_manager._agent_name = self.config.name
+        self._wire_overflow_rescue()
         if self.session_store:
             self.compact_manager._session_store = self.session_store
             restore_compact_state_from_session(
@@ -531,9 +564,14 @@ class Agent(
         )
 
     def interrupt(self) -> None:
-        """Cancel the active processing task; background jobs untouched.
-        Buffered mid-turn events get re-fired as fresh turns via
-        ``_flush_buffer_after_interrupt`` (Bug 3)."""
+        """Cancel the active turn; background jobs untouched.
+
+        The consumer's turn body swallows the cancellation, finalizes, and
+        loops — so any events still queued on the inbox process as the next
+        fresh turn (no explicit re-fire needed). Queued Drive deliveries
+        are dropped WITHOUT running and their settlement resolved
+        ``interrupted`` so the dispatcher redelivers, matching the prior
+        drop-drive-on-interrupt behavior."""
         self._interrupt_requested = True
         self.controller._interrupted = True
         processing = getattr(self, "_processing_task", None)
@@ -543,8 +581,18 @@ class Agent(
             self._interrupt_direct_job(job_id)
         if self.plugins:
             asyncio.create_task(self.plugins.notify("on_interrupt"))
-        if self._pending_mid_turn_inputs:
-            asyncio.create_task(self._flush_buffer_after_interrupt())
+        dropped = self._event_inbox.remove_where(
+            lambda ev: ev.type.startswith("drive_")
+        )
+        for env in dropped:
+            fut = env.future
+            if fut is not None and not fut.done():
+                fut.set_result(TurnOutcome(status="interrupted", was_primary=False))
+        if dropped:
+            logger.info(
+                "Dropped queued Drive deliveries after user interrupt",
+                count=len(dropped),
+            )
         logger.info("Agent interrupted", agent_name=self.config.name)
 
     def _cancel_job(self, job_id: str, job_name: str) -> None:
@@ -620,24 +668,8 @@ class Agent(
         logger.info("Task promoted via UI", job_id=job_id)
         return True
 
-    # ``switch_model`` + ``llm_identifier`` live in AgentModelMixin —
-    # see ``core/agent_model.py``. Split out to keep this file under
-    # the per-file size guard.
-
     async def run_forever(self) -> None:
-        """
-        Run the agent main loop until its input module exits.
-
-        Handles:
-        - Startup triggers
-        - Getting input
-        - Running controller
-        - Processing tool calls
-        - Routing output
-
-        (Renamed from ``run()`` — ``Agent.run(content)`` is now the
-        single-turn driver from :class:`AgentTurnMixin`.)
-        """
+        """Run the agent lifecycle and input loop until input exits."""
         await self.start()
         try:
             await self._drive_input()
@@ -672,6 +704,9 @@ class Agent(
 
             # Fire startup trigger if configured
             await self._fire_startup_trigger()
+            # Startup turn (if any) has now settled — release the
+            # restoration barrier so engine-side Drive reconciliation runs.
+            self._startup_settled.set()
 
             idle_logged = False
             while self._running:
@@ -691,6 +726,7 @@ class Agent(
                     ):
                         logger.info("Exit requested")
                         break
+                    await asyncio.sleep(0.01)
                     continue
 
                 idle_logged = False
@@ -732,10 +768,6 @@ class Agent(
                 )
             raise
 
-    # =========================================================================
-    # Programmatic API
-    # =========================================================================
-
     @property
     def is_running(self) -> bool:
         """Check if agent is running."""
@@ -757,13 +789,21 @@ class Agent(
         return self.controller.conversation.to_messages()
 
     async def inject_input(
-        self, content: str | list[ContentPart], source: str = "programmatic"
+        self,
+        content: str | list[ContentPart],
+        source: str = "programmatic",
+        pending_id: str | None = None,
     ) -> bool:
         """Inject user input programmatically.
 
         Returns True when the event ran; False when buffered for
         mid-turn drain — callers (WS attach) skip the post-call
         ``idle`` frame on False so KohakUwUing stays visible.
+
+        ``pending_id`` lets a shell mint the queued-message id up front
+        (UXI-08a) so it can target the message with ``edit_pending`` /
+        ``cancel_pending`` the moment the queued ack lands. Ignored when
+        the input runs immediately (it was never queued).
         """
         content = await self._prepare_injected_input(content, source)
         if content is None:
@@ -771,6 +811,8 @@ class Agent(
             # same as "processed" so the caller still gets its idle.
             return True
         event = create_user_input_event(content, source=source)
+        if pending_id:
+            event.context["pending_id"] = pending_id
         return await self._process_event(event)
 
     async def inject_event(self, event: TriggerEvent) -> bool:
@@ -834,6 +876,17 @@ class Agent(
                     error=str(e),
                     exc_info=True,
                 )
+        tool_options = getattr(self, "tool_options", None)
+        if tool_options is not None:
+            try:
+                tool_options.apply()
+            except Exception as e:
+                logger.warning(
+                    "tool option apply skipped",
+                    agent=self.config.name,
+                    error=str(e),
+                    exc_info=True,
+                )
         plugin_options = getattr(self, "plugin_options", None)
         if plugin_options is not None:
             try:
@@ -850,83 +903,9 @@ class Agent(
         wire_plugin_hook_timing(self)
         logger.debug("Session store attached", agent=self.config.name)
 
-    # Wave F attach / detach — implementation in
-    # ``kohakuterrarium.session.attachment_service``; thin wrappers here
-    # to keep this file under the 1000-line hard cap.
+    # Aliases preserve the Agent API while session attachment remains centralized.
     attach_to_session = _attach_to_session
     detach_from_session = _detach_from_session
-
-    def set_output_handler(self, handler: Any, replace_default: bool = False) -> None:
-        """Set a custom output handler callback for text chunks."""
-
-        # Create a simple callback output module
-        class CallbackOutput(OutputModule):
-            def __init__(self, callback: Any):
-                self._callback = callback
-
-            async def start(self) -> None:
-                pass
-
-            async def stop(self) -> None:
-                pass
-
-            async def write(self, text: str) -> None:
-                self._callback(text)
-
-            async def write_stream(self, chunk: str) -> None:
-                self._callback(chunk)
-
-            async def flush(self) -> None:
-                pass
-
-            async def on_processing_start(self) -> None:
-                pass
-
-            async def on_processing_end(self) -> None:
-                pass
-
-            def on_activity(self, activity_type: str, detail: str) -> None:
-                pass
-
-        callback_output = CallbackOutput(handler)
-
-        if replace_default:
-            self.output_router.default_output = callback_output
-        else:
-            self.output_router.add_secondary(callback_output)
-
-    # =========================================================================
-    # Hot-plug API
-    # =========================================================================
-
-    async def add_trigger(
-        self, trigger: BaseTrigger, trigger_id: str | None = None
-    ) -> str:
-        """Add and start a trigger on a running agent.
-
-        Returns:
-            The trigger_id
-        """
-        return await self.trigger_manager.add(trigger, trigger_id=trigger_id)
-
-    async def remove_trigger(self, trigger_id_or_trigger: str | BaseTrigger) -> bool:
-        """Stop and remove a trigger.
-
-        Args:
-            trigger_id_or_trigger: Trigger ID string, or BaseTrigger instance
-                                   (for backward compat, searches by identity)
-
-        Returns:
-            True if removed
-        """
-        if isinstance(trigger_id_or_trigger, str):
-            return await self.trigger_manager.remove(trigger_id_or_trigger)
-
-        # Backward compat: find by instance identity
-        for tid, t in self.trigger_manager._triggers.items():
-            if t is trigger_id_or_trigger:
-                return await self.trigger_manager.remove(tid)
-        return False
 
     def update_system_prompt(self, content: str, replace: bool = False) -> None:
         """Update the system prompt of a running agent.
@@ -966,7 +945,7 @@ class Agent(
         }
 
     def session_info(self, tokens_view: str = "own") -> dict[str, Any]:
-        """Wave G session snapshot (see ``build_session_info``)."""
+        """Build a session snapshot with the requested token accounting view."""
         return _build_session_info(self, tokens_view)
 
 

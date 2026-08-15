@@ -1,10 +1,4 @@
-"""
-TriggerManager - centralized trigger lifecycle management.
-
-Owns all trigger state (instances, tasks) and provides the event loop
-for each trigger. Tools can add/remove triggers at runtime via the
-agent's trigger_manager.
-"""
+"""Lifecycle, scheduling, and event delivery for an agent's triggers."""
 
 import asyncio
 import time
@@ -18,15 +12,13 @@ from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-# Wave B: drift threshold (seconds). Trigger firings later than this
-# get a ``schedule_drift`` event so session readers can see scheduler
-# backlog. Kept small so real-time triggers flag promptly.
+# Firings later than this threshold record scheduler backlog in the session.
 SCHEDULE_DRIFT_THRESHOLD_S = 1.0
 
 
 @dataclass
 class TriggerInfo:
-    """Info about an active trigger."""
+    """Describe an active trigger and its lifecycle state."""
 
     trigger_id: str
     trigger_type: str
@@ -35,13 +27,7 @@ class TriggerInfo:
 
 
 class TriggerManager:
-    """
-    Manages trigger lifecycle for an agent.
-
-    Provides add/remove/list API and runs the event loop for each
-    trigger. When a trigger fires, it calls _process_event which
-    is bound to the owning agent's _process_event method.
-    """
+    """Own trigger instances, run loops, pause state, and event admission."""
 
     def __init__(
         self,
@@ -49,12 +35,17 @@ class TriggerManager:
     ) -> None:
         self._triggers: dict[str, BaseTrigger] = {}
         self._tasks: dict[str, asyncio.Task] = {}
-        self._dispatching: set[asyncio.Task] = set()
         self._created_at: dict[str, datetime] = {}
         self._process_event = process_event
-        # Optional callback: (trigger_id, event) -> None
+        # Observers receive each firing without participating in delivery.
         self.on_trigger_fired: Callable[[str, Any], None] | None = None
-        # Session store ref for saving resumable triggers (set by agent)
+        # Backlog admission folds an already-ready burst into one turn; hosts
+        # without mid-turn buffering leave this unset.
+        self.admit_ready: Callable[[list[Any]], int] | None = None
+        # Pausing blocks loops before they consume another source event.
+        self._resume_gate = asyncio.Event()
+        self._resume_gate.set()
+        # The agent attaches persistence after session initialization.
         self._session_store: Any = None
         self._agent_name: str = ""
 
@@ -64,17 +55,7 @@ class TriggerManager:
         trigger_id: str | None = None,
         autostart: bool = True,
     ) -> str:
-        """Add a trigger. Starts it immediately if autostart=True.
-
-        Args:
-            trigger: The trigger instance
-            trigger_id: Optional ID (auto-generated if not provided)
-            autostart: If True, start the trigger and its event loop
-                       Set False for triggers added before agent.start()
-
-        Returns:
-            The trigger_id
-        """
+        """Register a trigger and optionally start its run loop immediately."""
         if trigger_id is None:
             trigger_id = f"trigger_{uuid4().hex[:8]}"
 
@@ -97,10 +78,21 @@ class TriggerManager:
                 trigger_type=type(trigger).__name__,
             )
 
-        # Persist resumable triggers to session store
         if getattr(trigger, "resumable", False) and self._session_store:
             try:
-                self._persist_resumable_triggers()
+                self._session_store.save_state(
+                    self._agent_name,
+                    triggers=[
+                        {
+                            "trigger_id": tid,
+                            "type": type(t).__name__,
+                            "module": type(t).__module__,
+                            "data": t.to_resume_dict(),
+                        }
+                        for tid, t in self._triggers.items()
+                        if getattr(t, "resumable", False)
+                    ],
+                )
             except Exception as e:
                 logger.warning(
                     "Failed to save trigger state", error=str(e), exc_info=True
@@ -115,64 +107,27 @@ class TriggerManager:
         return trigger_id
 
     async def remove(self, trigger_id: str) -> bool:
-        """Stop and remove a trigger.
-
-        Returns:
-            True if removed, False if not found
-        """
-        trigger = self._triggers.get(trigger_id)
+        """Stop and remove a trigger, reporting whether it existed."""
+        trigger = self._triggers.pop(trigger_id, None)
         if trigger is None:
             return False
 
-        if getattr(trigger, "resumable", False) and self._session_store:
-            self._persist_resumable_triggers(exclude=trigger_id)
-
         task = self._tasks.pop(trigger_id, None)
-        self._triggers.pop(trigger_id, None)
-        self._created_at.pop(trigger_id, None)
-        stop_error: BaseException | None = None
-        try:
-            await trigger.stop()
-        except BaseException as e:
-            stop_error = e
-
-        if (
-            task
-            and task is not asyncio.current_task()
-            and task not in self._dispatching
-            and not task.done()
-        ):
+        if task and not task.done():
             task.cancel()
             try:
                 await task
-            except asyncio.CancelledError as e:
-                current = asyncio.current_task()
-                if current is not None and current.cancelling():
-                    stop_error = e
+            except asyncio.CancelledError:
+                pass
             except Exception as e:
                 logger.warning(
                     "Trigger task cleanup error", error=str(e), exc_info=True
                 )
 
-        if stop_error is not None:
-            raise stop_error
+        await trigger.stop()
+        self._created_at.pop(trigger_id, None)
         logger.info("Trigger removed", trigger_id=trigger_id)
         return True
-
-    def _persist_resumable_triggers(self, exclude: str | None = None) -> None:
-        self._session_store.save_state(
-            self._agent_name,
-            triggers=[
-                {
-                    "trigger_id": tid,
-                    "type": type(t).__name__,
-                    "module": type(t).__module__,
-                    "data": t.to_resume_dict(),
-                }
-                for tid, t in self._triggers.items()
-                if tid != exclude and getattr(t, "resumable", False)
-            ],
-        )
 
     def get(self, trigger_id: str) -> TriggerInfo | None:
         """Get info about a trigger."""
@@ -203,7 +158,7 @@ class TriggerManager:
         return self._triggers.get(trigger_id)
 
     async def start_all(self) -> None:
-        """Start all registered triggers. Called by agent.start()."""
+        """Start every registered trigger that lacks a run-loop task."""
         for trigger_id, trigger in self._triggers.items():
             if trigger_id not in self._tasks:
                 await trigger.start()
@@ -218,7 +173,7 @@ class TriggerManager:
             logger.info("Triggers started", count=count)
 
     async def stop_all(self) -> None:
-        """Stop all triggers. Called by agent.stop()."""
+        """Cancel all run loops, stop triggers, and clear registrations."""
         for task in self._tasks.values():
             task.cancel()
         if self._tasks:
@@ -226,7 +181,6 @@ class TriggerManager:
         for trigger in self._triggers.values():
             await trigger.stop()
         self._tasks.clear()
-        self._dispatching.clear()
         self._triggers.clear()
         self._created_at.clear()
         logger.debug("All triggers stopped")
@@ -243,10 +197,25 @@ class TriggerManager:
                     error=str(e),
                 )
 
+    def suspend_all(self) -> None:
+        """Pause trigger loops before their next source read.
+
+        Source queues continue accumulating until ``resume_all`` releases the loops.
+        """
+        self._resume_gate.clear()
+
+    def resume_all(self) -> None:
+        """Release trigger run-loops suspended by :meth:`suspend_all`."""
+        self._resume_gate.set()
+
     async def _run_loop(self, trigger_id: str, trigger: BaseTrigger) -> None:
         """Run a single trigger's event loop."""
         while trigger.is_running:
             try:
+                # Gate before source consumption so pausing cannot lose an event.
+                await self._resume_gate.wait()
+                if not trigger.is_running:
+                    break
                 event = await trigger.wait_for_trigger()
                 if event:
                     logger.info(
@@ -254,27 +223,13 @@ class TriggerManager:
                         trigger_id=trigger_id,
                         event_type=event.type,
                     )
-                    # Wave B ``schedule_drift`` — compares the event's
-                    # scheduled timestamp (if set) against now. Only
-                    # emits when drift crosses the threshold.
+                    # Record only material scheduling delays to avoid telemetry noise.
                     self._maybe_emit_schedule_drift(trigger_id, trigger, event)
-                    if self.on_trigger_fired:
-                        try:
-                            self.on_trigger_fired(trigger_id, event)
-                        except Exception as e:
-                            logger.warning(
-                                "on_trigger_fired callback error",
-                                error=str(e),
-                                exc_info=True,
-                            )
-                    task = asyncio.current_task()
-                    if task is not None:
-                        self._dispatching.add(task)
-                    try:
-                        await self._process_event(event)
-                    finally:
-                        if task is not None:
-                            self._dispatching.discard(task)
+                    self._fire_notification(trigger_id, event)
+                    # Claim ready backlog before the primary turn starts so one burst
+                    # is processed as one turn rather than repeated rounds.
+                    self._admit_extra_ready(trigger_id, trigger)
+                    await self._process_event(event)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -285,17 +240,56 @@ class TriggerManager:
                 )
                 await asyncio.sleep(1.0)
 
+    def _fire_notification(self, trigger_id: str, event: Any) -> None:
+        """Fire the ``on_trigger_fired`` callback for one event."""
+        if not self.on_trigger_fired:
+            return
+        try:
+            self.on_trigger_fired(trigger_id, event)
+        except Exception as e:
+            logger.warning(
+                "on_trigger_fired callback error",
+                error=str(e),
+                exc_info=True,
+            )
+
+    def _admit_extra_ready(self, trigger_id: str, trigger: BaseTrigger) -> None:
+        """Admit an already-ready trigger backlog into the current turn.
+
+        Draining occurs only when an admission hook exists, preventing destructive
+        reads on hosts that cannot accept the events. Each event retains normal
+        notification and drift observability.
+        """
+        admit = self.admit_ready
+        drain = getattr(trigger, "drain_ready", None)
+        if admit is None or not callable(drain):
+            return
+        try:
+            extra = drain()
+        except Exception as e:  # pragma: no cover - backlog failure is isolated
+            logger.warning(
+                "trigger drain_ready failed",
+                trigger_id=trigger_id,
+                error=str(e),
+                exc_info=True,
+            )
+            return
+        if not extra:
+            return
+        for ev in extra:
+            self._maybe_emit_schedule_drift(trigger_id, trigger, ev)
+            self._fire_notification(trigger_id, ev)
+        admitted = admit(extra)
+        logger.info(
+            "Admitted channel backlog into one turn",
+            trigger_id=trigger_id,
+            count=admitted,
+        )
+
     def _maybe_emit_schedule_drift(
         self, trigger_id: str, trigger: BaseTrigger, event: Any
     ) -> None:
-        """Record Wave B ``schedule_drift`` when the trigger fired late.
-
-        The event's ``scheduled_at`` timestamp (if set by the trigger)
-        is compared to ``time.time()``. If the delta exceeds
-        :data:`SCHEDULE_DRIFT_THRESHOLD_S`, a store event is written.
-        Pure observability — missing store / missing scheduled_at is
-        fine.
-        """
+        """Record material delay between a scheduled time and actual firing."""
         scheduled = getattr(event, "scheduled_at", None)
         if scheduled is None:
             scheduled = getattr(event, "context", None)
@@ -319,5 +313,5 @@ class TriggerManager:
                     "drift_ms": drift_s * 1000.0,
                 },
             )
-        except Exception as e:  # pragma: no cover — observability
+        except Exception as e:  # pragma: no cover - telemetry must not stop triggers
             logger.warning("schedule_drift emit failed", error=str(e), exc_info=True)

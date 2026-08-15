@@ -11,7 +11,7 @@ Core general-purpose tools:
 | Name                                           | Description                                                                               |
 | ---------------------------------------------- | ----------------------------------------------------------------------------------------- |
 | `bash`                                         | Execute shell commands (auto-detects platform shell)                                      |
-| `run_python`                                   | Execute Python code via subprocess                                                        |
+| `python`                                       | Execute Python code via subprocess                                                        |
 | `read`                                         | Read file contents with optional line range                                               |
 | `write`                                        | Create or overwrite files                                                                 |
 | `edit`                                         | Single-diff edit of a file                                                                |
