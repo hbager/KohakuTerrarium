@@ -140,6 +140,8 @@ def _resolve_profile_key(profile: LLMProfile, *, keep_pool: bool) -> Any:
     resolved = get_api_key(profile.provider) if profile.provider else ""
     if not resolved and profile.api_key_env:
         resolved = get_api_key(profile.api_key_env)
+    if isinstance(resolved, KeyPool):
+        resolved = KeyPool([interpolate_env_vars(key) for key in resolved.keys])
     if keep_pool:
         return resolved
     value = resolved.first if isinstance(resolved, KeyPool) else resolved

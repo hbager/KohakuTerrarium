@@ -305,6 +305,20 @@ class TestCreateFromProfile:
         with pytest.raises(ValueError, match="kt login openai"):
             _create_from_profile(profile)
 
+    def test_key_pool_interpolates_every_key(self, monkeypatch):
+        monkeypatch.setenv("KEY_ONE", "one")
+        monkeypatch.setenv("KEY_TWO", "two")
+        monkeypatch.setattr(
+            llm_mod,
+            "get_api_key",
+            lambda key: llm_mod.KeyPool(["${KEY_ONE}", "${KEY_TWO}"]),
+        )
+        profile = LLMProfile(
+            name="pool", model="gpt", provider="openai", backend_type="openai"
+        )
+        provider = _create_from_profile(profile)
+        assert provider._api_key_pool.keys == ("one", "two")
+
     def test_missing_api_key_worker_mode_raises_identity_hint(self, monkeypatch):
         # When a resolver is installed (worker mode), the error names the
         # host identity store, NOT the generic kt-login hint.
