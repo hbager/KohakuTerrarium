@@ -11,12 +11,14 @@ test-builder's `_FakeAgent` lacks the production agent surface.
 from types import SimpleNamespace
 
 
+from kohakuterrarium.core.config_types import AgentConfig
 from kohakuterrarium.laboratory._internal.app import AppMessage
 from kohakuterrarium.laboratory.adapters.terrarium_runtime import (
     TerrariumRuntimeAdapter,
 )
 from kohakuterrarium.modules.plugin.base import BasePlugin
 from kohakuterrarium.modules.plugin.manager import PluginManager
+from kohakuterrarium.terrarium.wire import pack_creature_build_input
 from kohakuterrarium.testing.terrarium import TestTerrariumBuilder
 
 
@@ -520,8 +522,10 @@ class _RecordingIdentityCache:
     def __init__(self, profile=None):
         self._profile = profile
         self.providers: list[str] = []
+        self.profile_requests: list[tuple[str, str]] = []
 
-    async def get_profile(self, name):
+    async def get_profile(self, name, provider=""):
+        self.profile_requests.append((name, provider))
         return self._profile
 
     async def prefetch_for_provider(self, provider):
@@ -550,6 +554,92 @@ class TestPrewarmIdentity:
             config = SimpleNamespace(llm_profile="", provider="", model="openai/gpt-4o")
             await adapter._prewarm_identity(config)
             assert cache.providers == ["openai"]
+        finally:
+            await engine.shutdown()
+
+    async def test_prewarm_no_auth_profile_skips_provider_key(self):
+        engine = await TestTerrariumBuilder().build()
+        cache = _RecordingIdentityCache(
+            profile={
+                "provider": "local",
+                "backend_type": "openai",
+                "auth_mode": "none",
+            }
+        )
+        adapter = TerrariumRuntimeAdapter(engine, _FakeNode(), identity_cache=cache)
+        try:
+            config = SimpleNamespace(
+                llm_profile="local/model",
+                provider="",
+                model="openai/prefixed-model",
+                auth_mode="api_key",
+            )
+            await adapter._prewarm_identity(config)
+            assert cache.providers == []
+        finally:
+            await engine.shutdown()
+
+    async def test_selector_prewarm_skips_no_auth_provider_key(self):
+        engine = await TestTerrariumBuilder().build()
+        cache = _RecordingIdentityCache(
+            profile={
+                "name": "model",
+                "model": "local-model",
+                "provider": "local",
+                "backend_type": "openai",
+                "auth_mode": "none",
+            }
+        )
+        adapter = TerrariumRuntimeAdapter(engine, _FakeNode(), identity_cache=cache)
+        try:
+            await adapter._prewarm_profile_by_selector(
+                "local/model@reasoning=xhigh"
+            )
+            assert cache.profile_requests == [("model", "local")]
+            assert cache.providers == []
+        finally:
+            await engine.shutdown()
+
+    async def test_add_creature_prefers_explicit_selector_prewarm(self, monkeypatch):
+        engine = await TestTerrariumBuilder().build()
+        adapter = TerrariumRuntimeAdapter(
+            engine, _FakeNode(), identity_cache=_RecordingIdentityCache()
+        )
+        selectors = []
+
+        async def prewarm(selector):
+            selectors.append(selector)
+
+        async def add_creature(config, **kwargs):
+            return SimpleNamespace(
+                creature_id="c",
+                name="c",
+                graph_id="g",
+                is_running=True,
+                is_privileged=False,
+                parent_creature_id=None,
+                listen_channels=[],
+                send_channels=[],
+                config=SimpleNamespace(model="", llm_profile=""),
+                agent=SimpleNamespace(llm=SimpleNamespace(provider_name="")),
+            )
+
+        monkeypatch.setattr(adapter, "_prewarm_profile_by_selector", prewarm)
+        monkeypatch.setattr(engine, "add_creature", add_creature)
+        try:
+            response = await adapter._dispatch(
+                _msg(
+                    "add_creature",
+                    {
+                        "config": pack_creature_build_input(
+                            AgentConfig(name="c", system_prompt="x")
+                        ),
+                        "llm": "local/model",
+                    },
+                )
+            )
+            assert "error" not in response
+            assert selectors == ["local/model"]
         finally:
             await engine.shutdown()
 

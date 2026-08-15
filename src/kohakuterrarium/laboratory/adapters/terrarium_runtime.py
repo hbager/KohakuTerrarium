@@ -15,6 +15,7 @@ from kohakuterrarium.laboratory.protocols import LabRegistrar
 from kohakuterrarium.llm.backends import set_remote_backend
 from kohakuterrarium.llm.preset_store import preset_from_data, set_remote_preset
 from kohakuterrarium.llm.profile_types import LLMBackend
+from kohakuterrarium.llm.variations import parse_variation_selector
 from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.terrarium.creature_ops import (
     agent_command_inventory,
@@ -169,28 +170,32 @@ class TerrariumRuntimeAdapter:
         # Identity lookup accepts bare profile names rather than provider/name selectors.
         profile_name = getattr(config, "llm_profile", "") or ""
         if profile_name:
-            bare_name = (
-                profile_name.split("/", 1)[1] if "/" in profile_name else profile_name
+            base_profile, _ = parse_variation_selector(profile_name)
+            provider, bare_name = (
+                base_profile.split("/", 1)
+                if "/" in base_profile
+                else ("", base_profile)
             )
             try:
-                profile = await cache.get_profile(bare_name)
+                profile = await cache.get_profile(bare_name, provider)
             except Exception:  # pragma: no cover - best-effort
                 profile = None
             if isinstance(profile, dict):
-                self._stash_remote_preset(profile_name, profile)
+                self._stash_remote_preset(base_profile, profile)
                 prov = profile.get("provider") or ""
-                if prov:
+                if prov and (profile.get("auth_mode") or "api_key") != "none":
                     await cache.prefetch_for_provider(prov)
                 # Codex providers resolve OAuth tokens outside the API-key cache.
                 if (profile.get("backend_type") or "") == "codex":
                     await cache.prefetch_for_codex_if_needed()
+                return
         # Model prefixes supply the provider when inline configs omit it.
         prov = getattr(config, "provider", "") or ""
         if not prov:
             model = getattr(config, "model", "") or ""
             if "/" in model:
                 prov = model.split("/", 1)[0]
-        if prov:
+        if prov and getattr(config, "auth_mode", "api_key") != "none":
             await cache.prefetch_for_provider(prov)
 
     async def _prewarm_profile_by_selector(self, selector: str) -> None:
@@ -198,16 +203,21 @@ class TerrariumRuntimeAdapter:
         cache = self._identity_cache
         if cache is None or not selector:
             return
-        bare = selector.split("/", 1)[1] if "/" in selector else selector
+        base_selector, _ = parse_variation_selector(selector)
+        provider, bare = (
+            base_selector.split("/", 1)
+            if "/" in base_selector
+            else ("", base_selector)
+        )
         try:
-            profile = await cache.get_profile(bare)
+            profile = await cache.get_profile(bare, provider)
         except Exception:  # pragma: no cover - best-effort
             return
         if not isinstance(profile, dict):
             return
-        self._stash_remote_preset(selector, profile)
+        self._stash_remote_preset(base_selector, profile)
         prov = profile.get("provider") or ""
-        if prov:
+        if prov and (profile.get("auth_mode") or "api_key") != "none":
             await cache.prefetch_for_provider(prov)
         if (profile.get("backend_type") or "") == "codex":
             await cache.prefetch_for_codex_if_needed()
@@ -230,6 +240,7 @@ class TerrariumRuntimeAdapter:
                 backend_type=backend_type,
                 base_url=profile.get("base_url", "") or "",
                 api_key_env=profile.get("api_key_env", "") or "",
+                auth_mode=profile.get("auth_mode", "api_key") or "api_key",
             )
         )
         try:
@@ -360,7 +371,11 @@ class TerrariumRuntimeAdapter:
                 config = unpack_creature_build_input(msg.body["config"])
                 # LLM construction needs remote profiles and credentials already cached.
                 if self._identity_cache is not None:
-                    await self._prewarm_identity(config)
+                    selector = msg.body.get("llm")
+                    if isinstance(selector, str) and selector:
+                        await self._prewarm_profile_by_selector(selector)
+                    else:
+                        await self._prewarm_identity(config)
                 creature = await self._engine.add_creature(
                     config,
                     graph=msg.body.get("graph_id"),
