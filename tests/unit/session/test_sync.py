@@ -133,6 +133,31 @@ class TestSessionMirrorWriter:
         finally:
             writer.close()
 
+    def test_lru_eviction_does_not_change_last_active(self, tmp_path):
+        node = _FakeNode()
+        writer = SessionMirrorWriter(node, tmp_path / "mirror", max_open_stores=1)
+        store = writer.store_for("a")
+        store.meta["last_active"] = "source-time"
+        writer.store_for("b")
+        reopened = SessionStore.open_readonly(tmp_path / "mirror" / "a.kohakutr")
+        try:
+            assert reopened.meta["last_active"] == "source-time"
+        finally:
+            reopened.close()
+            writer.close()
+
+    def test_close_does_not_change_last_active(self, tmp_path):
+        node = _FakeNode()
+        writer = SessionMirrorWriter(node, tmp_path / "mirror")
+        store = writer.store_for("a")
+        store.meta["last_active"] = "source-time"
+        writer.close()
+        reopened = SessionStore.open_readonly(tmp_path / "mirror" / "a.kohakutr")
+        try:
+            assert reopened.meta["last_active"] == "source-time"
+        finally:
+            reopened.close()
+
     def test_max_open_stores_at_least_one(self, tmp_path):
         node = _FakeNode()
         # Passing 0 should be clamped to 1.
