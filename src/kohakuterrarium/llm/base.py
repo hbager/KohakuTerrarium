@@ -2,12 +2,19 @@
 Define the provider protocol, shared response types, and base implementation.
 """
 
+import asyncio
 import json
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Protocol, runtime_checkable
 
+from kohakuterrarium.errors import EmptyLLMResponseError
 from kohakuterrarium.llm.message import Message
-from kohakuterrarium.llm.recovery import RetryPolicy, drop_last_tool_round
+from kohakuterrarium.llm.recovery import (
+    ErrorClass,
+    RetryPolicy,
+    backoff_delay,
+    drop_last_tool_round,
+)
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -283,12 +290,11 @@ class BaseLLMProvider:
         provider_native_tools: list[Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        """Normalize messages and delegate streaming or completion to the provider."""
-        self._last_tool_calls = []
+        """Delegate to the provider and retry successful-but-empty responses."""
         normalized = self._normalize_messages(messages)
 
         if stream:
-            async for chunk in self._stream_chat(
+            async for chunk in self._stream_chat_with_empty_retry(
                 normalized,
                 tools=tools,
                 provider_native_tools=provider_native_tools,
@@ -296,7 +302,7 @@ class BaseLLMProvider:
             ):
                 yield chunk
         else:
-            response = await self._complete_chat(normalized, **kwargs)
+            response = await self._complete_chat_with_empty_retry(normalized, **kwargs)
             yield response.content
 
     async def chat_complete(
@@ -304,9 +310,109 @@ class BaseLLMProvider:
         messages: list[Message] | list[dict[str, Any]],
         **kwargs: Any,
     ) -> ChatResponse:
-        """Default complete implementation."""
+        """Return a complete response, retrying successful-but-empty attempts."""
         normalized = self._normalize_messages(messages)
-        return await self._complete_chat(normalized, **kwargs)
+        return await self._complete_chat_with_empty_retry(normalized, **kwargs)
+
+    def _effective_retry_policy(self) -> RetryPolicy:
+        policy = getattr(self, "_retry_policy", None)
+        if isinstance(policy, RetryPolicy):
+            return policy
+        return RetryPolicy.from_value(self.config.retry_policy)
+
+    def _reset_attempt_state(self) -> None:
+        self._last_tool_calls = []
+        self._last_usage = {}
+        self._last_assistant_parts = []
+        self._last_assistant_extra_fields = {}
+
+    def _has_presentable_parts(self) -> bool:
+        for part in self.last_assistant_content_parts or []:
+            if getattr(part, "type", "") != "text":
+                return True
+            if str(getattr(part, "text", "")).strip():
+                return True
+        return False
+
+    def _is_empty_response(self, content: str) -> bool:
+        return not (
+            (content or "").strip()
+            or self._last_tool_calls
+            or self._has_presentable_parts()
+            or self.last_assistant_extra_fields
+        )
+
+    async def _stream_chat_with_empty_retry(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[ToolSchema] | None = None,
+        provider_native_tools: list[Any] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[str]:
+        policy = self._effective_retry_policy()
+        attempt = 0
+        while True:
+            self._reset_attempt_state()
+            pending: list[str] = []
+            saw_text = False
+            async for chunk in self._stream_chat(
+                messages,
+                tools=tools,
+                provider_native_tools=provider_native_tools,
+                **kwargs,
+            ):
+                if saw_text:
+                    yield chunk
+                    continue
+                pending.append(chunk)
+                if chunk and str(chunk).strip():
+                    saw_text = True
+                    for item in pending:
+                        yield item
+            if saw_text or not self._is_empty_response(""):
+                return
+            if ErrorClass.TRANSIENT not in policy.retry_classes or attempt >= policy.max_retries:
+                raise EmptyLLMResponseError(
+                    f"{type(self).__name__} returned an empty response after "
+                    f"{attempt + 1} attempt(s)"
+                )
+            attempt += 1
+            delay = backoff_delay(attempt, policy)
+            logger.warning(
+                "provider_empty_response_retry",
+                attempt=attempt,
+                max_retries=policy.max_retries,
+                delay=delay,
+            )
+            await asyncio.sleep(delay)
+
+    async def _complete_chat_with_empty_retry(
+        self,
+        messages: list[dict[str, Any]],
+        **kwargs: Any,
+    ) -> ChatResponse:
+        policy = self._effective_retry_policy()
+        attempt = 0
+        while True:
+            self._reset_attempt_state()
+            response = await self._complete_chat(messages, **kwargs)
+            if not self._is_empty_response(response.content):
+                return response
+            if ErrorClass.TRANSIENT not in policy.retry_classes or attempt >= policy.max_retries:
+                raise EmptyLLMResponseError(
+                    f"{type(self).__name__} returned an empty response after "
+                    f"{attempt + 1} attempt(s)"
+                )
+            attempt += 1
+            delay = backoff_delay(attempt, policy)
+            logger.warning(
+                "provider_empty_response_retry",
+                attempt=attempt,
+                max_retries=policy.max_retries,
+                delay=delay,
+            )
+            await asyncio.sleep(delay)
 
     async def _stream_chat(
         self,

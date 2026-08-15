@@ -8,6 +8,7 @@ fan-out, and ``with_model`` reuse/refusal semantics.
 
 import pytest
 
+from kohakuterrarium.errors import EmptyLLMResponseError
 from kohakuterrarium.llm.base import (
     BaseLLMProvider,
     ChatResponse,
@@ -188,3 +189,115 @@ class TestBaseProviderAbstractMethods:
         base = BaseLLMProvider()
         with pytest.raises(NotImplementedError):
             await base._complete_chat([])
+
+
+class _EmptyProvider(BaseLLMProvider):
+    def __init__(self, streams=None, completions=None):
+        super().__init__(
+            LLMConfig(
+                model="m",
+                retry_policy={"max_retries": 1, "base_delay": 0, "jitter": 0},
+            )
+        )
+        self.streams = list(streams or [])
+        self.completions = list(completions or [])
+        self.stream_calls = 0
+        self.complete_calls = 0
+
+    async def _stream_chat(self, messages, **kwargs):
+        chunks = self.streams[self.stream_calls]
+        self.stream_calls += 1
+        if callable(chunks):
+            chunks = chunks(self)
+        for chunk in chunks:
+            yield chunk
+
+    async def _complete_chat(self, messages, **kwargs):
+        content = self.completions[self.complete_calls]
+        self.complete_calls += 1
+        if callable(content):
+            content = content(self)
+        return ChatResponse(content=content, finish_reason="stop", usage={}, model="m")
+
+
+class TestEmptyResponseRetry:
+    async def test_stream_empty_then_text_retries(self):
+        provider = _EmptyProvider(streams=[[], ["ok"]])
+        chunks = [c async for c in provider.chat([{"role": "user", "content": "x"}])]
+        assert chunks == ["ok"]
+        assert provider.stream_calls == 2
+
+    async def test_complete_empty_then_text_retries(self):
+        provider = _EmptyProvider(completions=["", "ok"])
+        response = await provider.chat_complete([{"role": "user", "content": "x"}])
+        assert response.content == "ok"
+        assert provider.complete_calls == 2
+
+    async def test_tool_only_stream_is_not_empty(self):
+        def tool_only(provider):
+            provider._last_tool_calls = [NativeToolCall("c", "bash", "{}")]
+            return []
+
+        provider = _EmptyProvider(streams=[tool_only])
+        assert [c async for c in provider.chat([])] == []
+        assert provider.stream_calls == 1
+
+    async def test_complete_tool_only_is_not_empty(self):
+        def tool_only(provider):
+            provider._last_tool_calls = [NativeToolCall("c", "bash", "{}")]
+            return ""
+
+        provider = _EmptyProvider(completions=[tool_only])
+        response = await provider.chat_complete([])
+        assert response.content == ""
+        assert provider.complete_calls == 1
+
+    async def test_complete_structured_part_only_is_not_empty(self):
+        def structured_only(provider):
+            provider._last_assistant_parts = [object()]
+            return ""
+
+        provider = _EmptyProvider(completions=[structured_only])
+        response = await provider.chat_complete([])
+        assert response.content == ""
+        assert provider.complete_calls == 1
+
+    async def test_complete_reasoning_only_is_not_empty(self):
+        def reasoning_only(provider):
+            provider._last_assistant_extra_fields = {"reasoning": "private"}
+            return ""
+
+        provider = _EmptyProvider(completions=[reasoning_only])
+        response = await provider.chat_complete([])
+        assert response.content == ""
+        assert provider.complete_calls == 1
+
+    async def test_non_streaming_chat_uses_empty_retry(self):
+        provider = _EmptyProvider(completions=["", "ok"])
+        chunks = [chunk async for chunk in provider.chat([], stream=False)]
+        assert chunks == ["ok"]
+        assert provider.complete_calls == 2
+
+    async def test_stale_tool_calls_do_not_mask_empty_attempt(self):
+        provider = _EmptyProvider(completions=["", "ok"])
+        provider._last_tool_calls = [NativeToolCall("stale", "bash", "{}")]
+        response = await provider.chat_complete([])
+        assert response.content == "ok"
+        assert provider.complete_calls == 2
+
+    async def test_policy_without_transient_does_not_retry(self):
+        provider = _EmptyProvider(streams=[[]])
+        provider.config.retry_policy = {
+            "max_retries": 3,
+            "retry_classes": ["server"],
+        }
+        with pytest.raises(EmptyLLMResponseError, match="after 1 attempt"):
+            async for _ in provider.chat([]):
+                pass
+        assert provider.stream_calls == 1
+
+    async def test_empty_response_exhausts_retry_budget(self):
+        provider = _EmptyProvider(streams=[[], []])
+        with pytest.raises(EmptyLLMResponseError, match="after 2 attempt"):
+            async for _ in provider.chat([]):
+                pass
