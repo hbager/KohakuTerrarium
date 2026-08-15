@@ -1713,6 +1713,18 @@ const _chatStoreOptions = {
       }
       return view[target.turnIndex] === target.branchId
     },
+    activeTokenUsage: (state) => {
+      const tab = state.activeTab
+      return (
+        (tab && state.tokenUsage[tab]) || {
+          prompt: 0,
+          completion: 0,
+          total: 0,
+          cached: 0,
+          lastPrompt: 0,
+        }
+      )
+    },
     /**
      * Model info for the ACTIVE tab's creature, falling back to the
      * session-level (primary creature) values when the per-tab entry

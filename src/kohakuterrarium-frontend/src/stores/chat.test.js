@@ -2484,6 +2484,20 @@ describe("chat store — per-creature model info", () => {
     }
   })
 
+  it("returns token usage for the active creature only", () => {
+    const chat = useChatStore()
+    chat.tokenUsage = {
+      alice: { prompt: 10, completion: 2, total: 12, cached: 1, lastPrompt: 100 },
+      bob: { prompt: 20, completion: 4, total: 24, cached: 2, lastPrompt: 900 },
+    }
+
+    chat.activeTab = "alice"
+    expect(chat.activeTokenUsage).toEqual(chat.tokenUsage.alice)
+
+    chat.activeTab = "bob"
+    expect(chat.activeTokenUsage).toEqual(chat.tokenUsage.bob)
+  })
+
   it("resetForRouteSwitch clears the per-tab model map", () => {
     const chat = useChatStore()
     chat.modelByTab = { alice: { llmName: "x", model: "x" } }
