@@ -20,7 +20,7 @@ from kohakuterrarium.core.events import (
     create_user_input_event,
 )
 from kohakuterrarium.core.job import JobResult
-from kohakuterrarium.llm.message import ImagePart
+from kohakuterrarium.llm.message import FilePart, ImagePart
 from kohakuterrarium.parsing.events import (
     TextEvent,
 )
@@ -801,6 +801,41 @@ class TestIsNativeMode:
         env = TestAgentBuilder().with_llm_script(["x"]).build()
         env.controller.config.tool_format = "native"
         assert env.controller._is_native_mode is True
+
+    async def test_pure_image_input_is_appended_in_native_mode(self):
+        env = TestAgentBuilder().with_llm_script(["described"]).build()
+        env.controller.config.tool_format = "native"
+        await env.controller.push_event(create_user_input_event([ImagePart(url="x")]))
+        async for _ in env.controller.run_once():
+            pass
+        users = [
+            message
+            for message in env.controller.conversation.get_messages()
+            if message.role == "user"
+        ]
+        assert users
+        assert any(
+            isinstance(part, ImagePart) and part.url == "x"
+            for part in users[-1].content
+        )
+    async def test_pure_file_input_is_appended_in_native_mode(self):
+        env = TestAgentBuilder().with_llm_script(["read"]).build()
+        env.controller.config.tool_format = "native"
+        await env.controller.push_event(
+            create_user_input_event([FilePart(name="x.txt", content="hello")])
+        )
+        async for _ in env.controller.run_once():
+            pass
+        users = [
+            message
+            for message in env.controller.conversation.get_messages()
+            if message.role == "user"
+        ]
+        assert users
+        assert any(
+            isinstance(part, FilePart) and part.name == "x.txt"
+            for part in users[-1].content
+        )
 
 
 # ── inline command dispatch ──────────────────────────────────────

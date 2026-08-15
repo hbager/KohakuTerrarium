@@ -729,8 +729,12 @@ class Controller:
         user_content, combined_text = self._build_turn_context(events)
         # Tool continuations and unedited regeneration reuse existing context;
         # appending an empty user message would corrupt provider turn ordering.
+        has_multimodal = isinstance(user_content, list) and any(
+            isinstance(part, (ImagePart, FilePart)) for part in user_content
+        )
         skip_empty = (
             not combined_text.strip()
+            and not has_multimodal
             and (self._is_native_mode or all(e.type == "tool_complete" for e in events))
         ) or any(
             e.type == "user_input"
