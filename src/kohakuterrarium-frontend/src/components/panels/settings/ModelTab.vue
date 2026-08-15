@@ -34,11 +34,12 @@
 </template>
 
 <script setup>
-import { computed, onMounted, ref } from "vue"
+import { computed, onMounted, onUnmounted, ref, watch } from "vue"
 
 import ModelSwitcher from "@/components/chrome/ModelSwitcher.vue"
 import { useChatStore } from "@/stores/chat"
 import { configAPI } from "@/utils/api"
+import { LAYOUT_EVENTS, onLayoutEvent } from "@/utils/layoutEvents"
 
 const props = defineProps({
   instance: { type: Object, default: null },
@@ -49,27 +50,39 @@ const chat = useChatStore()
 const current = computed(() => chat.modelDisplay || props.instance?.llm_name || props.instance?.model || "")
 
 const profile = ref(null)
+let profileLoadGeneration = 0
 
 async function loadProfile() {
+  const generation = ++profileLoadGeneration
+  const raw = current.value
   try {
     const models = await configAPI.getModels()
     // ``current`` may be ``provider/name[@variations]`` — strip the
     // ``@...`` suffix and split the ``provider/name`` prefix so we can
     // match the preset catalog entry exactly (duplicate bare names
     // across providers would otherwise bind to the wrong row).
-    const raw = current.value
     const base = raw.split("@", 1)[0]
     const slash = base.indexOf("/")
     const wantProvider = slash >= 0 ? base.slice(0, slash) : ""
     const wantName = slash >= 0 ? base.slice(slash + 1) : base
     const entries = Array.isArray(models) ? models : []
-    profile.value = entries.find((m) => m.name === wantName && (!wantProvider || (m.provider || m.login_provider) === wantProvider)) || entries.find((m) => m.name === wantName) || null
+    if (generation !== profileLoadGeneration) return
+    profile.value = wantProvider ? entries.find((m) => m.name === wantName && (m.provider || m.login_provider) === wantProvider) || null : entries.find((m) => m.name === wantName) || null
   } catch {
-    profile.value = null
+    if (generation === profileLoadGeneration) profile.value = null
   }
 }
 
-onMounted(loadProfile)
+watch(current, loadProfile)
+
+let cleanupModelCatalog = null
+onMounted(() => {
+  loadProfile()
+  cleanupModelCatalog = onLayoutEvent(LAYOUT_EVENTS.MODEL_CATALOG_CHANGED, loadProfile)
+})
+onUnmounted(() => {
+  if (cleanupModelCatalog) cleanupModelCatalog()
+})
 
 function formatTokens(n) {
   if (!n) return "—"
