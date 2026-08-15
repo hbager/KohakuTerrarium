@@ -115,10 +115,16 @@ class StudioIdentityAdapter:
         name = body.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError("name is required")
+        provider = body.get("provider", "")
+        if not isinstance(provider, str):
+            raise ValueError("provider must be a string")
         for profile in list_profiles_payload():
-            if profile.get("name") == name:
+            if profile.get("name") == name and (
+                not provider or profile.get("provider") == provider
+            ):
                 return {"profile": profile}
-        raise KeyError(f"no LLM profile named {name!r}")
+        qualified = f"{provider}/{name}" if provider else name
+        raise KeyError(f"no LLM profile named {qualified!r}")
 
     def _op_save_key(self, body: dict[str, Any]) -> dict[str, Any]:
         provider = body.get("provider")

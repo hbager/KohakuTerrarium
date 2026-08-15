@@ -75,6 +75,23 @@ class TestGetProfile:
         out = await adapter._dispatch(_msg("get_profile", {"name": "p1"}))
         assert out == {"profile": {"name": "p1", "model": "x"}}
 
+    async def test_provider_qualified_profile_avoids_same_name_collision(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(
+            mod,
+            "list_profiles_payload",
+            lambda: [
+                {"name": "same", "provider": "openai", "model": "wrong"},
+                {"name": "same", "provider": "openrouter", "model": "right"},
+            ],
+        )
+        adapter = StudioIdentityAdapter(_FakeNode())
+        out = await adapter._dispatch(
+            _msg("get_profile", {"name": "same", "provider": "openrouter"})
+        )
+        assert out["profile"]["model"] == "right"
+
     async def test_missing(self, monkeypatch):
         monkeypatch.setattr(mod, "list_profiles_payload", lambda: [])
         adapter = StudioIdentityAdapter(_FakeNode())

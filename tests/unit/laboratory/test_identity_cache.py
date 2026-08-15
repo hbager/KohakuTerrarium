@@ -116,6 +116,21 @@ class TestGetProfileAndMCP:
         out = await c.get_profile("p")
         assert out == {"name": "p", "model": "x"}
 
+    async def test_get_profile_qualifies_provider_in_rpc_and_cache(self, monkeypatch):
+        sender = _FakeSender(
+            responses={"get_profile": {"profile": {"name": "p", "model": "x"}}}
+        )
+        monkeypatch.setattr(
+            "kohakuterrarium.laboratory.identity_cache._read_local_profile",
+            lambda name, provider="": None,
+        )
+        cache = IdentityCache(sender)
+
+        assert await cache.get_profile("p", "openai") == {"name": "p", "model": "x"}
+        assert sender.calls[-1][3] == {"name": "p", "provider": "openai"}
+        await cache.get_profile("p", "openrouter")
+        assert len(sender.calls) == 2
+
     async def test_get_mcp_server(self):
         sender = _FakeSender(
             responses={"get_mcp_server": {"server": {"name": "s", "url": "u"}}}

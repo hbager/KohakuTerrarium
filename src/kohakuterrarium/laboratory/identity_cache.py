@@ -85,10 +85,13 @@ class IdentityCache:
             "key", provider, self._keys, self._key_ttl, self._fetch_api_key
         )
 
-    async def get_profile(self, name: str) -> dict[str, Any]:
+    async def get_profile(
+        self, name: str, provider: str = ""
+    ) -> dict[str, Any]:
+        key = f"{provider}/{name}" if provider else name
         return await self._fetch(
             "profile",
-            name,
+            key,
             self._profiles,
             self._profile_ttl,
             self._fetch_profile,
@@ -232,12 +235,15 @@ class IdentityCache:
         body = await self._request("get_api_key", {"provider": provider})
         return body["key"]
 
-    async def _fetch_profile(self, name: str) -> dict[str, Any]:
+    async def _fetch_profile(self, key: str) -> dict[str, Any]:
+        provider, name = key.split("/", 1) if "/" in key else ("", key)
         # Worker-local profiles intentionally override host profiles.
-        local = _read_local_profile(name)
+        local = _read_local_profile(name, provider)
         if local is not None:
             return local
-        body = await self._request("get_profile", {"name": name})
+        body = await self._request(
+            "get_profile", {"name": name, "provider": provider}
+        )
         return body["profile"]
 
     async def _fetch_mcp(self, name: str) -> dict[str, Any]:
@@ -297,9 +303,9 @@ def _read_local_codex_tokens():
     return None
 
 
-def _read_local_profile(name: str) -> dict[str, Any] | None:
+def _read_local_profile(name: str, provider: str = "") -> dict[str, Any] | None:
     """Return a worker-local profile as a wire dictionary, if present."""
-    profile = _local_get_profile(name)
+    profile = _local_get_profile(name, provider)
     if profile is None:
         return None
     try:
