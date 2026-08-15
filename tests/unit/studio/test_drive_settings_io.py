@@ -12,6 +12,7 @@ rather than inferred. Uses ``tmp_path`` only — no config dir, no real settings
 """
 
 import errno
+import logging
 import os
 import sys
 
@@ -214,8 +215,13 @@ class TestAtomicWriteDirBarrier:
             monkeypatch, fsync_error=OSError(errno.EINVAL, "dir fsync unsupported")
         )
 
-        with caplog.at_level("WARNING", logger="kohakuterrarium"):
-            dir_barrier = ds_io._atomic_write(path, b"new")
+        framework_logger = logging.getLogger("kohakuterrarium")
+        framework_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level("WARNING", logger="kohakuterrarium"):
+                dir_barrier = ds_io._atomic_write(path, b"new")
+        finally:
+            framework_logger.removeHandler(caplog.handler)
 
         assert dir_barrier is False
         assert path.read_bytes() == b"new"

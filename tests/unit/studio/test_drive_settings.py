@@ -7,6 +7,7 @@ apply operation. Real files + real registration catalog; no mocks.
 """
 
 import errno
+import logging
 import os
 import subprocess
 import sys
@@ -616,8 +617,13 @@ class TestSaveDurability:
         self._force_dir_barrier(
             monkeypatch, fsync_error=OSError(errno.EINVAL, "dir fsync unsupported")
         )
-        with caplog.at_level("WARNING", logger="kohakuterrarium"):
-            result = ds.save_settings(_enabled_settings())
+        framework_logger = logging.getLogger("kohakuterrarium")
+        framework_logger.addHandler(caplog.handler)
+        try:
+            with caplog.at_level("WARNING", logger="kohakuterrarium"):
+                result = ds.save_settings(_enabled_settings())
+        finally:
+            framework_logger.removeHandler(caplog.handler)
         assert result.durability is ds.SaveDurability.FILE_ONLY
         # File contents are crash-durable + persisted despite the missing barrier.
         assert result.revision == ds.current_revision()
