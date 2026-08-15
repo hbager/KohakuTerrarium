@@ -107,6 +107,7 @@ class GroupAddNodeTool(BaseTool):
                 name=name or None,
                 is_privileged=False,
                 parent_creature_id=gctx.caller.creature_id,
+                io="none",
             )
         except Exception as exc:
             return err(f"failed to spawn creature from {config_path!r}: {exc}")
@@ -407,6 +408,7 @@ class GroupSpawnChildTool(BaseTool):
                 name=name or None,
                 is_privileged=False,
                 parent_creature_id=gctx.caller.creature_id,
+                io="none",
             )
         except Exception as exc:
             return err(f"failed to spawn creature from {config_ref!r}: {exc}")

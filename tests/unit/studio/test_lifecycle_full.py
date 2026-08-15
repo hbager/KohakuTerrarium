@@ -48,7 +48,10 @@ class TestStartCreatureLocal:
             is_privileged=True,
         )
 
+        add_kwargs = {}
+
         async def _fake_add(cfg, *args, **kw):
+            add_kwargs.update(kw)
             return fake_creature
 
         engine.add_creature = _fake_add
@@ -77,6 +80,7 @@ class TestStartCreatureLocal:
             assert sess.session_id == "g1"
             assert sess.name == "alice"
             assert sess.home_node == "_host"
+            assert add_kwargs["io"] == "none"
         finally:
             await engine.shutdown()
 

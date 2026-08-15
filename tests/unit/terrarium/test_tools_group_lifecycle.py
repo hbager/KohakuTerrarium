@@ -150,6 +150,7 @@ class TestGroupAddNode:
         body = _parse(r)
         assert body["creature_id"] == "cid-new"
         assert body["parent_creature_id"] == "caller"
+        assert gctx.engine.add_creature.call_args.kwargs["io"] == "none"
         assert gctx.engine.emitted  # emit fired
 
 
@@ -323,6 +324,7 @@ class TestGroupSpawnChild:
         assert body["creature_id"] == "cid-child"
         assert body["channel"] == "link-caller-cid-child"
         assert body["task_delivered"] is True
+        assert gctx.engine.add_creature.call_args.kwargs["io"] == "none"
         # The default channel is wired BOTH ways: two connects on the same
         # channel (caller<->child).
         assert gctx.engine.connect.await_count == 2

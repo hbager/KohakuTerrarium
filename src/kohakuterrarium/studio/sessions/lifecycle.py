@@ -129,6 +129,7 @@ async def start_creature(
                 is_privileged=True,
                 strict=False,
                 name=name,
+                io="none",
             )
         elif config is not None:
             creature = await engine.add_creature(
@@ -138,6 +139,7 @@ async def start_creature(
                 is_privileged=True,
                 strict=False,
                 name=name,
+                io="none",
             )
         else:
             raise ValueError("Must provide config_path or config")
