@@ -32,7 +32,7 @@ _BUILTIN_SCHEMAS: dict[str, dict] = {
         },
         "required": ["command"],
     },
-    "python": {
+    "run_python": {
         "type": "object",
         "properties": {
             "code": {"type": "string", "description": "Python code to execute"},

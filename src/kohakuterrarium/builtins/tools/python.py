@@ -29,7 +29,7 @@ from kohakuterrarium.utils.mobile_sandbox import is_mobile_profile
 logger = get_logger(__name__)
 
 
-@register_builtin("python")
+@register_builtin("run_python")
 class PythonTool(BaseTool):
     """Execute Python code and capture its combined output and exit status."""
 
@@ -37,7 +37,7 @@ class PythonTool(BaseTool):
 
     @property
     def tool_name(self) -> str:
-        return "python"
+        return "run_python"
 
     @property
     def description(self) -> str:

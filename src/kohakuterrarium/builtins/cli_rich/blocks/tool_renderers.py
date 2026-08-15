@@ -132,7 +132,7 @@ _TOOL_RENDERERS: dict[str, ToolRenderer] = {
     "bash": render_bash,
     "shell": render_bash,
     "sh": render_bash,
-    "python": render_python,
+    "run_python": render_python,
     "py": render_python,
     "read": render_read,
     "view": render_read,

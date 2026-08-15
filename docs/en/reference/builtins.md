@@ -33,7 +33,7 @@ stderr, truncated to a cap. Direct execution.
 - Args: `command` (str), `working_dir` (str, optional),
   `timeout` (float, optional).
 
-**`python`**: Run a Python subprocess. Respects `working_dir` and
+**`run_python`**: Run a Python subprocess. Respects `working_dir` and
 `timeout`. Direct.
 
 - Args: `code` (str), `working_dir`, `timeout`.

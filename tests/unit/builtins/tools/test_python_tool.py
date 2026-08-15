@@ -16,6 +16,9 @@ def _make_tool() -> PythonTool:
 
 
 class TestPythonToolSubprocess:
+    def test_canonical_name(self):
+        assert _make_tool().tool_name == "run_python"
+
     @pytest.mark.asyncio
     async def test_runs_code_and_captures_output(self):
         tool = _make_tool()

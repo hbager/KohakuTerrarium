@@ -50,7 +50,15 @@ class TestBuiltinSchemas:
     def test_known_core_tools_present(self):
         # build_tool_schemas relies on these being accurate, not the
         # generic {content: string} fallback
-        for tool in ("bash", "read", "write", "edit", "grep", "glob"):
+        for tool in (
+            "bash",
+            "run_python",
+            "read",
+            "write",
+            "edit",
+            "grep",
+            "glob",
+        ):
             assert tool in _BUILTIN_SCHEMAS
 
     def test_bash_command_is_required_string(self):

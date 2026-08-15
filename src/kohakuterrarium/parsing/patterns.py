@@ -8,7 +8,7 @@ from kohakuterrarium.parsing.format import BRACKET_FORMAT, ToolCallFormat
 # Tools with non-generic body parameters need an explicit content target.
 DEFAULT_CONTENT_ARG_MAP: dict[str, str] = {
     "bash": "command",
-    "python": "code",
+    "run_python": "code",
     "edit": "diff",
     "write": "content",
     "read": "path",
