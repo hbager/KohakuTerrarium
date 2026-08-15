@@ -7,7 +7,10 @@ rather than being discarded during a rewrite.
 
 from pathlib import Path
 
-import tomllib
+try:
+    import tomllib
+except ImportError:  # pragma: no cover - Python <3.11 fallback
+    import tomli as tomllib  # type: ignore
 
 from kohakuterrarium.utils.config_dir import config_dir
 from kohakuterrarium.utils.logging import get_logger

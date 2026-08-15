@@ -46,6 +46,7 @@ dependencies = [
     "libcst>=0.3.23,<2",
     "aiofiles>=25.1.0",
     "python-dotenv>=1.0.0",
+    "tomli>=1.1.0; python_version < '3.11'",
     # >=0.8.6 for PEP 738 Android wheel tags + the relaxed numpy>=1.26 floor
     # (Chaquopy compat). The floor here drives the Android wheel URL ref.
     "kohakuvault>=0.8.6",
