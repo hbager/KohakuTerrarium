@@ -23,8 +23,8 @@ EXPLORE_CONFIG = SubAgentConfig(
         {
             "name": "budget",
             "options": {
-                "turn_budget": [40, 60],
-                "tool_call_budget": [75, 100],
+                "turn_budget": [70, 100],
+                "tool_call_budget": [150, 200],
             },
         },
     ],

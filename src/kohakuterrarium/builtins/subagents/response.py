@@ -12,8 +12,8 @@ RESPONSE_SYSTEM_PROMPT = render_subagent_prompt(
 )
 
 _BUDGET_PLUGIN_OPTS = {
-    "turn_budget": [40, 60],
-    "tool_call_budget": [75, 100],
+    "turn_budget": [70, 100],
+    "tool_call_budget": [150, 200],
 }
 
 RESPONSE_CONFIG = SubAgentConfig(
