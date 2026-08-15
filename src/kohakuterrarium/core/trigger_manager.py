@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Coroutine
@@ -35,6 +36,9 @@ class TriggerManager:
     ) -> None:
         self._triggers: dict[str, BaseTrigger] = {}
         self._tasks: dict[str, asyncio.Task] = {}
+        self._dispatch_task: ContextVar[asyncio.Task | None] = ContextVar(
+            f"trigger_dispatch_{id(self)}", default=None
+        )
         self._created_at: dict[str, datetime] = {}
         self._process_event = process_event
         # Observers receive each firing without participating in delivery.
@@ -80,19 +84,7 @@ class TriggerManager:
 
         if getattr(trigger, "resumable", False) and self._session_store:
             try:
-                self._session_store.save_state(
-                    self._agent_name,
-                    triggers=[
-                        {
-                            "trigger_id": tid,
-                            "type": type(t).__name__,
-                            "module": type(t).__module__,
-                            "data": t.to_resume_dict(),
-                        }
-                        for tid, t in self._triggers.items()
-                        if getattr(t, "resumable", False)
-                    ],
-                )
+                self._persist_resumable_triggers()
             except Exception as e:
                 logger.warning(
                     "Failed to save trigger state", error=str(e), exc_info=True
@@ -108,26 +100,59 @@ class TriggerManager:
 
     async def remove(self, trigger_id: str) -> bool:
         """Stop and remove a trigger, reporting whether it existed."""
-        trigger = self._triggers.pop(trigger_id, None)
+        trigger = self._triggers.get(trigger_id)
         if trigger is None:
             return False
 
+        if getattr(trigger, "resumable", False) and self._session_store:
+            self._persist_resumable_triggers(exclude=trigger_id)
+
         task = self._tasks.pop(trigger_id, None)
-        if task and not task.done():
+        self._triggers.pop(trigger_id, None)
+        self._created_at.pop(trigger_id, None)
+        stop_error: BaseException | None = None
+        try:
+            await trigger.stop()
+        except BaseException as e:
+            stop_error = e
+
+        if (
+            task
+            and task is not asyncio.current_task()
+            and task is not self._dispatch_task.get()
+            and not task.done()
+        ):
             task.cancel()
             try:
                 await task
-            except asyncio.CancelledError:
-                pass
+            except asyncio.CancelledError as e:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    stop_error = e
             except Exception as e:
                 logger.warning(
                     "Trigger task cleanup error", error=str(e), exc_info=True
                 )
 
-        await trigger.stop()
-        self._created_at.pop(trigger_id, None)
+        if stop_error is not None:
+            raise stop_error
         logger.info("Trigger removed", trigger_id=trigger_id)
         return True
+
+    def _persist_resumable_triggers(self, exclude: str | None = None) -> None:
+        self._session_store.save_state(
+            self._agent_name,
+            triggers=[
+                {
+                    "trigger_id": tid,
+                    "type": type(trigger).__name__,
+                    "module": type(trigger).__module__,
+                    "data": trigger.to_resume_dict(),
+                }
+                for tid, trigger in self._triggers.items()
+                if tid != exclude and getattr(trigger, "resumable", False)
+            ],
+        )
 
     def get(self, trigger_id: str) -> TriggerInfo | None:
         """Get info about a trigger."""
@@ -229,7 +254,12 @@ class TriggerManager:
                     # Claim ready backlog before the primary turn starts so one burst
                     # is processed as one turn rather than repeated rounds.
                     self._admit_extra_ready(trigger_id, trigger)
-                    await self._process_event(event)
+                    current = asyncio.current_task()
+                    token = self._dispatch_task.set(current)
+                    try:
+                        await self._process_event(event)
+                    finally:
+                        self._dispatch_task.reset(token)
             except asyncio.CancelledError:
                 break
             except Exception as e:

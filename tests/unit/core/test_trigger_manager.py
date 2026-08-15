@@ -197,6 +197,129 @@ class TestAddRemoveList:
     async def test_remove_unknown_returns_false(self, mgr):
         assert await mgr.remove("nope") is False
 
+    async def test_trigger_can_remove_itself_during_dispatch(self):
+        removed = asyncio.Event()
+        manager = None
+
+        async def process(_event):
+            assert manager is not None
+            assert await asyncio.wait_for(manager.remove("self"), timeout=1) is True
+            removed.set()
+
+        manager = TriggerManager(process)
+        trigger = _StubTrigger()
+        await manager.add(trigger, trigger_id="self")
+        await trigger.queue.put(TriggerEvent(type="timer", content="x"))
+        await asyncio.wait_for(removed.wait(), timeout=1)
+        assert manager.get("self") is None
+        assert trigger.stop_count == 1
+
+    async def test_trigger_can_remove_itself_from_child_task(self):
+        removed = asyncio.Event()
+        manager = None
+
+        async def process(_event):
+            assert manager is not None
+            assert await asyncio.wait_for(
+                asyncio.create_task(manager.remove("child-self")), timeout=1
+            )
+            removed.set()
+
+        manager = TriggerManager(process)
+        trigger = _StubTrigger()
+        await manager.add(trigger, trigger_id="child-self")
+        await trigger.queue.put(TriggerEvent(type="timer", content="x"))
+        await asyncio.wait_for(removed.wait(), timeout=1)
+        assert manager.get("child-self") is None
+
+    async def test_reused_id_tracks_the_new_dispatch_task(self):
+        manager = None
+        new_started = asyncio.Event()
+        old_released = asyncio.Event()
+        new_removed = asyncio.Event()
+        new_trigger = _StubTrigger()
+
+        async def process(event):
+            assert manager is not None
+            if event.content == "old":
+                assert await asyncio.create_task(manager.remove("same-id"))
+                await manager.add(new_trigger, trigger_id="same-id")
+                await new_trigger.queue.put(TriggerEvent(type="timer", content="new"))
+                await new_started.wait()
+                old_released.set()
+                return
+            new_started.set()
+            await old_released.wait()
+            assert await asyncio.wait_for(
+                asyncio.create_task(manager.remove("same-id")), timeout=1
+            )
+            new_removed.set()
+
+        manager = TriggerManager(process)
+        old_trigger = _StubTrigger()
+        await manager.add(old_trigger, trigger_id="same-id")
+        await old_trigger.queue.put(TriggerEvent(type="timer", content="old"))
+        await asyncio.wait_for(new_removed.wait(), timeout=1)
+        assert manager.get("same-id") is None
+
+    async def test_external_remove_cancels_in_flight_dispatch(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def process(_event):
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        manager = TriggerManager(process)
+        trigger = _StubTrigger()
+        await manager.add(trigger, trigger_id="external")
+        await trigger.queue.put(TriggerEvent(type="timer", content="x"))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert await manager.remove("external") is True
+        assert cancelled.is_set()
+        assert manager.get("external") is None
+
+    async def test_remove_propagates_caller_cancellation_during_cleanup(self, mgr):
+        trigger = _StubTrigger()
+        tid = await mgr.add(trigger)
+        original_task = mgr._tasks[tid]
+        original_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await original_task
+
+        cleanup_started = asyncio.Event()
+
+        async def slow_cancel():
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cleanup_started.set()
+                await asyncio.sleep(60)
+
+        mgr._tasks[tid] = asyncio.create_task(slow_cancel())
+        remove_task = asyncio.create_task(mgr.remove(tid))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+        remove_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await remove_task
+
+    async def test_stop_failure_still_removes_trigger_and_task(self):
+        class _StopFailureTrigger(_StubTrigger):
+            async def _on_stop(self):
+                raise RuntimeError("stop failed")
+
+        manager = TriggerManager(lambda _event: None)
+        trigger = _StopFailureTrigger()
+        await manager.add(trigger, trigger_id="broken-stop")
+        with pytest.raises(RuntimeError, match="stop failed"):
+            await manager.remove("broken-stop")
+        assert manager.get("broken-stop") is None
+        assert "broken-stop" not in manager._tasks
+
     async def test_get_info_shape(self, mgr):
         tid = await mgr.add(_StubTrigger(), trigger_id="x")
         info = mgr.get(tid)
@@ -360,6 +483,7 @@ class TestResumablePersistence:
         assert trig_entries[0]["type"] == "_ResumableTrigger"
         assert trig_entries[0]["data"] == {"saved": True}
         await mgr.remove("r1")
+        assert store.state_calls[-1]["triggers"] == []
 
     async def test_non_resumable_not_persisted(self, mgr):
         store = _StubStore()
@@ -467,8 +591,12 @@ class TestResumablePersistFailure:
         mgr._session_store = store
         mgr._agent_name = "a1"
         await mgr.add(_ResumableTrigger(), trigger_id="r1")
-        # Trigger still registered.
+        # Add failure is non-fatal, but remove must not diverge memory from disk.
         assert "r1" in mgr._triggers
+        with pytest.raises(RuntimeError, match="disk"):
+            await mgr.remove("r1")
+        assert "r1" in mgr._triggers
+        store.save_state = lambda *a, **kw: None
         await mgr.remove("r1")
 
 
