@@ -106,7 +106,12 @@ def snapshot_all(engine: "Terrarium") -> None:
         snapshot(engine, gid)  # per-graph suppression applies inside
 
 
-async def replay(engine: "Terrarium", graph_id: str) -> None:
+async def replay(
+    engine: "Terrarium",
+    graph_id: str,
+    *,
+    saved_snapshot: dict[str, Any] | None = None,
+) -> bool:
     """Replay the saved runtime additions on top of the loaded recipe.
 
     Called from ``_resume_terrarium_into_engine`` AFTER the recipe
@@ -122,19 +127,22 @@ async def replay(engine: "Terrarium", graph_id: str) -> None:
     the graph are silently skipped — they were either removed by a
     later mutation or live on a different graph after a split.
     """
-    store = engine._session_stores.get(graph_id)
-    if store is None:
-        return
-    try:
-        meta = store.load_meta()
-    except Exception:  # pragma: no cover - defensive
-        return
-    snap = meta.get(META_KEY)
+    if saved_snapshot is None:
+        store = engine._session_stores.get(graph_id)
+        if store is None:
+            return True
+        try:
+            meta = store.load_meta()
+        except Exception:  # pragma: no cover - defensive
+            return True
+        snap = meta.get(META_KEY)
+    else:
+        snap = saved_snapshot
     if not isinstance(snap, dict):
-        return
+        return True
     g = engine._topology.graphs.get(graph_id)
     if g is None:
-        return
+        return True
     restoring = getattr(engine, "_restoring_topology_graphs", None)
     if restoring is None:
         restoring = engine._restoring_topology_graphs = set()
@@ -150,15 +158,16 @@ async def replay(engine: "Terrarium", graph_id: str) -> None:
         leftover_map.pop(graph_id, None)
         # One authoritative snapshot AFTER the complete topology is live.
         snapshot(engine, graph_id)
-    else:
-        # Keep the saved snapshot AND remember the unresolved remnant —
-        # every later mutation-snapshot unions it back in, so a
-        # transient failure or post-split edge is never erased.
-        leftover_map[graph_id] = leftovers
-        logger.warning(
-            "runtime-topology replay incomplete — keeping saved snapshot",
-            graph_id=graph_id,
-        )
+        return True
+    # Keep the saved snapshot AND remember the unresolved remnant —
+    # every later mutation-snapshot unions it back in, so a
+    # transient failure or post-split edge is never erased.
+    leftover_map[graph_id] = leftovers
+    logger.warning(
+        "runtime-topology replay incomplete — keeping saved snapshot",
+        graph_id=graph_id,
+    )
+    return False
 
 
 async def _replay_into(

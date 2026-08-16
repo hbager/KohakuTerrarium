@@ -27,6 +27,21 @@ async def _engine_with_creature(tmp_path):
 
 
 class TestReplayFailureAtomicity:
+    async def test_detached_snapshot_replay_needs_no_attached_store(self, tmp_path):
+        t, gid, store = await _engine_with_creature(tmp_path)
+        t._session_stores.pop(gid)
+        try:
+            assert await topo_snap.replay(
+                t, gid, saved_snapshot=_payload()
+            ) is True
+            graph = t.get_graph(gid)
+            assert "runtime" in graph.channels
+            assert graph.listen_edges["alice"] == {"runtime"}
+            assert graph.send_edges["alice"] == {"runtime"}
+        finally:
+            await t.shutdown()
+            store.close()
+
     async def test_transient_channel_failure_keeps_saved_snapshot(self, tmp_path):
         # A transient add_channel error during replay must not become
         # permanent by overwriting the saved snapshot with the partial

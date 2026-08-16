@@ -250,6 +250,373 @@ class TestResumeIntoEngine:
         finally:
             await t.shutdown()
 
+    async def test_dynamic_group_resume_uses_runtime_creatures(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(resume_mod, "detect_session_type", lambda p: "terrarium")
+        descriptors = [
+            {
+                "name": "alice",
+                "creature_id": "alice-id",
+                "config_path": "@kt-biome/creatures/general",
+            },
+            {
+                "name": "worker",
+                "creature_id": "worker-id",
+                "config_path": "@kt-biome/creatures/general",
+            },
+        ]
+        meta = {
+            "config_path": "@kt-biome/creatures/general",
+            "pwd": ".",
+            "agents": ["alice", "worker"],
+            "runtime_creatures": descriptors,
+        }
+        monkeypatch.setattr(resume_mod, "read_session_meta", lambda path: meta)
+        fake_store = SimpleNamespace(
+            load_meta=lambda: meta,
+            update_status=lambda s: None,
+        )
+        monkeypatch.setattr(
+            resume_mod, "_open_store_with_migration", lambda p, **_kw: fake_store
+        )
+        dynamic_resume = AsyncMock(return_value="graph")
+        monkeypatch.setattr(resume_mod, "_resume_runtime_group_body", dynamic_resume)
+        monkeypatch.setattr(
+            resume_mod,
+            "load_terrarium_config",
+            lambda p: pytest.fail("dynamic group must not load a terrarium recipe"),
+        )
+
+        t = await TestTerrariumBuilder().build()
+        try:
+            assert (
+                await resume_mod.resume_into_engine(t, tmp_path / "saved.kohakutr")
+                == "graph"
+            )
+            dynamic_resume.assert_awaited_once_with(
+                t,
+                tmp_path / "saved.kohakutr",
+                fake_store,
+                [],
+                meta,
+                pwd=None,
+                llm=None,
+            )
+        finally:
+            await t.shutdown()
+
+    async def test_dynamic_group_resume_restores_identity_before_start(
+        self, monkeypatch, tmp_path
+    ):
+        descriptors = [
+            {
+                "name": "worker",
+                "creature_id": "worker-id",
+                "config_path": "@kt-biome/creatures/general",
+                "pwd": str(tmp_path),
+                "parent_creature_id": "root-id",
+            },
+            {
+                "name": "root",
+                "creature_id": "root-id",
+                "config_snapshot": {"name": "root"},
+                "pwd": str(tmp_path),
+                "is_privileged": True,
+            },
+        ]
+        meta = {
+            "agents": ["root", "worker"],
+            "runtime_creatures": descriptors,
+            "pwd": str(tmp_path),
+        }
+        closed = False
+
+        def close_store(**_kwargs):
+            nonlocal closed
+            closed = True
+
+        store = SimpleNamespace(
+            path=tmp_path / "saved.kohakutr",
+            meta=meta,
+            load_meta=lambda: meta,
+            set_conversation_open=lambda value: meta.update(conversation_open=value),
+            update_status=lambda value: meta.update(status=value),
+            checkpoint=lambda: None,
+            close=close_store,
+        )
+        monkeypatch.setattr(
+            resume_mod, "_open_store_with_migration", lambda p, **_kw: store
+        )
+        monkeypatch.setattr(
+            resume_mod,
+            "_rebuild_agent",
+            lambda **kwargs: _FakeAgent(
+                name=kwargs["config_snapshot"].get("name") or "worker"
+            ),
+        )
+        monkeypatch.setattr(
+            resume_mod,
+            "pack_agent_config",
+            lambda config: {"name": config.name},
+        )
+        injected = []
+        monkeypatch.setattr(
+            resume_mod,
+            "inject_saved_state",
+            lambda agent, _store, name: injected.append(name),
+        )
+        replayed = []
+
+        async def replay(engine, graph_id, *, saved_snapshot=None):
+            replayed.append(graph_id)
+            assert saved_snapshot == {}
+            assert all(
+                not engine.get_creature(cid).agent.is_running
+                for cid in engine.get_graph(graph_id).creature_ids
+            )
+            assert graph_id not in engine._session_stores
+            return True
+
+        monkeypatch.setattr(resume_mod._topo_snap, "replay", replay)
+        monkeypatch.setattr(
+            resume_mod._checkpoint, "checkpoint", AsyncMock(return_value=True)
+        )
+
+        t = await TestTerrariumBuilder().build()
+        await t._drive_runtime.stop()
+        t._drive_runtime = None
+        try:
+            graph_id = await resume_mod._resume_runtime_group_body(
+                t,
+                tmp_path / "saved.kohakutr",
+                store,
+                [],
+                meta,
+                pwd=None,
+                llm=None,
+            )
+            worker = t.get_creature("worker-id")
+            root = t.get_creature("root-id")
+            assert worker.graph_id == root.graph_id == graph_id
+            assert worker.parent_creature_id == "root-id"
+            assert worker.config_snapshot == {"name": "worker"}
+            assert root.is_privileged is True
+            assert worker.agent.is_running and root.agent.is_running
+            assert injected == ["worker", "root"]
+            assert replayed == [graph_id]
+            assert meta["conversation_open"] is True
+            assert meta["status"] == "running"
+        finally:
+            await t.shutdown()
+        assert closed is True
+
+    async def test_dynamic_group_late_failure_restores_lifecycle_metadata(
+        self, monkeypatch, tmp_path
+    ):
+        descriptors = [
+            {
+                "name": "worker",
+                "creature_id": "worker-id",
+                "config_snapshot": {"name": "worker"},
+                "pwd": str(tmp_path),
+            },
+            {
+                "name": "root",
+                "creature_id": "root-id",
+                "config_snapshot": {"name": "root"},
+                "pwd": str(tmp_path),
+                "is_privileged": True,
+            },
+        ]
+        original_topology = {
+            "channels": [],
+            "listen_edges": {},
+            "send_edges": {},
+        }
+        meta = {
+            "agents": ["worker", "root"],
+            "runtime_creatures": descriptors,
+            "pwd": str(tmp_path),
+            "status": "paused",
+            "conversation_open": False,
+            "last_active": "before",
+            resume_mod._topo_snap.META_KEY: original_topology,
+        }
+
+        def set_conversation_open(value):
+            meta["conversation_open"] = value
+            if value:
+                meta["conversation_id"] = "new-conversation"
+
+        def update_status(value):
+            meta["status"] = value
+            meta["last_active"] = "after"
+
+        store = SimpleNamespace(
+            path=tmp_path / "saved.kohakutr",
+            meta=meta,
+            load_meta=lambda: meta,
+            set_conversation_open=set_conversation_open,
+            update_status=update_status,
+            checkpoint=lambda: (_ for _ in ()).throw(RuntimeError("late failure")),
+            close=lambda **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            resume_mod,
+            "_rebuild_agent",
+            lambda **kwargs: _FakeAgent(name=kwargs["config_snapshot"]["name"]),
+        )
+        monkeypatch.setattr(resume_mod, "inject_saved_state", lambda *args: None)
+        monkeypatch.setattr(
+            resume_mod._topo_snap,
+            "replay",
+            AsyncMock(return_value=True),
+        )
+
+        async def checkpoint(engine, graph_id):
+            if graph_id in engine._session_stores:
+                meta[resume_mod._manifest.MANIFEST_KEY] = {"new": True}
+            return True
+
+        monkeypatch.setattr(resume_mod._checkpoint, "checkpoint", checkpoint)
+
+        engine = await TestTerrariumBuilder().build()
+        await engine._drive_runtime.stop()
+        engine._drive_runtime = None
+        try:
+            with pytest.raises(RuntimeError, match="late failure"):
+                await resume_mod._resume_runtime_group_body(
+                    engine,
+                    tmp_path / "saved.kohakutr",
+                    store,
+                    [],
+                    meta,
+                    pwd=None,
+                    llm=None,
+                )
+            assert resume_mod._manifest.MANIFEST_KEY not in meta
+            assert meta[resume_mod._topo_snap.META_KEY] == original_topology
+            assert meta["pwd"] == str(tmp_path)
+            assert meta["conversation_open"] is False
+            assert "conversation_id" not in meta
+            assert meta["status"] == "paused"
+            assert meta["last_active"] == "before"
+        finally:
+            await engine.shutdown()
+
+    def test_runtime_group_requires_complete_stable_identities(self):
+        assert (
+            resume_mod._runtime_group_descriptors(
+                {
+                    "agents": ["alice", "worker"],
+                    "runtime_creatures": [
+                        {"name": "alice"},
+                        {"name": "worker"},
+                    ],
+                }
+            )
+            is None
+        )
+    def test_runtime_group_marker_ignores_discovered_agent_noise(self):
+        descriptors = [
+            {"name": "alice", "creature_id": "alice-id"},
+        ]
+        assert (
+            resume_mod._runtime_group_descriptors(
+                {
+                    "agents": ["alice", "removed-worker"],
+                    "runtime_creatures": descriptors,
+                }
+            )
+            == descriptors
+        )
+        assert (
+            resume_mod._runtime_group_descriptors(
+                {"agents": ["alice", "worker"]}
+            )
+            is None
+        )
+
+    async def test_dynamic_group_replay_failure_restores_metadata_and_lock(
+        self, monkeypatch, tmp_path
+    ):
+        path = tmp_path / "dynamic-group.kohakutr"
+        original_topology = {
+            "channels": [{"name": "team", "description": "saved"}],
+            "listen_edges": {},
+            "send_edges": {},
+        }
+        store = SessionStore(path)
+        store.init_meta(
+            "dynamic-group",
+            "terrarium",
+            "@kt-biome/creatures/general",
+            str(tmp_path),
+            ["worker", "root"],
+        )
+        store.meta["runtime_creatures"] = [
+            {
+                "name": "worker",
+                "creature_id": "worker-id",
+                "config_snapshot": {"name": "worker"},
+                "pwd": str(tmp_path),
+                "parent_creature_id": "root-id",
+            },
+            {
+                "name": "root",
+                "creature_id": "root-id",
+                "config_snapshot": {"name": "root"},
+                "pwd": str(tmp_path),
+                "is_privileged": True,
+            },
+        ]
+        store.meta[resume_mod._topo_snap.META_KEY] = original_topology
+        store.set_conversation_open(False)
+        store.update_status("paused")
+        store.flush()
+        store.close(update_status=False)
+
+        monkeypatch.setattr(
+            resume_mod,
+            "_rebuild_agent",
+            lambda **kwargs: _FakeAgent(name=kwargs["config_snapshot"]["name"]),
+        )
+        monkeypatch.setattr(resume_mod, "inject_saved_state", lambda *args: None)
+
+        async def fail_replay(engine, graph_id, *, saved_snapshot=None):
+            assert graph_id not in engine._session_stores
+            assert saved_snapshot == original_topology
+            return False
+
+        monkeypatch.setattr(resume_mod._topo_snap, "replay", fail_replay)
+
+        engine = await TestTerrariumBuilder().build()
+        await engine._drive_runtime.stop()
+        engine._drive_runtime = None
+        try:
+            with pytest.raises(
+                ValueError, match="topology could not be restored completely"
+            ):
+                await resume_mod._resume_terrarium_into_engine(
+                    engine, path, pwd=None, llm=None
+                )
+            assert "worker-id" not in engine._creatures
+            assert "root-id" not in engine._creatures
+
+            reopened = SessionStore(path, writer_lock=True)
+            try:
+                meta = reopened.load_meta()
+                assert resume_mod._manifest.MANIFEST_KEY not in meta
+                assert meta[resume_mod._topo_snap.META_KEY] == original_topology
+                assert meta["pwd"] == str(tmp_path)
+                assert bool(meta["conversation_open"]) is False
+                assert meta["status"] == "paused"
+            finally:
+                reopened.close(update_status=False)
+        finally:
+            await engine.shutdown()
+
     async def test_terrarium_resume_with_saved_agents_alignment(
         self, monkeypatch, tmp_path
     ):

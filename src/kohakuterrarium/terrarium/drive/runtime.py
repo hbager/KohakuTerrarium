@@ -389,7 +389,15 @@ class DriveRuntime:
             if assignment is None or assignment.assignee_creature_id is None:
                 continue
             old_id = assignment.assignee_creature_id
+            if (
+                old_id in live_ids
+                and assignment.assignee_graph_id == graph_id
+            ):
+                continue
             if old_id in live_ids:
+                await manager.remap_assignee(
+                    record.drive_id, old_id, graph_id=graph_id
+                )
                 continue
             candidates = by_name.get(_decode_creature_name(old_id), [])
             if len(candidates) == 1:

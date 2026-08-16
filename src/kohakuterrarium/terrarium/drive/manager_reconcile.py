@@ -464,6 +464,8 @@ class DriveManagerReconcileMixin:
             }
             if current.scope_type == "creature" and current.scope_id == old_id:
                 fields["scope_id"] = new_creature_id
+            elif current.scope_type == "graph" and graph_id is not None:
+                fields["scope_id"] = graph_id
             updated = replace(current, **fields)
             assignment = replace(
                 prev,

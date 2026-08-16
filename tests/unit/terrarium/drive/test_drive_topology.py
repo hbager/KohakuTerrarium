@@ -1005,6 +1005,27 @@ class TestResumeAssigneeRemap:
         finally:
             await rt.stop()
 
+    async def test_current_assignee_with_stale_graph_is_rebound(self):
+        engine, rt = _make()
+        engine.add_graph("new-graph", {"wa_9f9f9f9f"})
+        mgr = rt.manager_for("new-graph")
+        rec = await _mk_graph(
+            mgr,
+            "old-graph",
+            gid="old-graph",
+            assignee="wa_9f9f9f9f",
+        )
+        try:
+            await rt._remap_resumed_assignees("new-graph")
+            assignment = await mgr.get_assignment(rec.drive_id)
+            assert assignment.assignee_creature_id == "wa_9f9f9f9f"
+            assert assignment.assignee_graph_id == "new-graph"
+            drive = await mgr.get_drive(rec.drive_id)
+            assert drive.scope_id == "new-graph"
+            assert drive.status is DriveStatus.ACTIVE
+        finally:
+            await rt.stop()
+
     async def test_current_assignee_is_left_alone(self):
         engine, rt = _make()
         engine.add_graph("g1", {"wa_9f9f9f9f"})

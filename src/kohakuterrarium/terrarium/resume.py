@@ -9,6 +9,7 @@ top of this and only adds metadata bookkeeping (``_meta`` /
 HTTP / CLI orchestration.
 """
 
+import asyncio
 import os
 from copy import deepcopy
 from pathlib import Path
@@ -26,6 +27,7 @@ from kohakuterrarium.session.migrations import latest_readable_version
 from kohakuterrarium.session.readonly import read_session_meta
 from kohakuterrarium.session.resume import (
     _open_store_with_migration,
+    _rebuild_agent,
     detect_session_type,
     inject_saved_state,
     preflight_legacy_workspace,
@@ -206,12 +208,23 @@ def _resolve_store_path(store: SessionStore | str | Path) -> Path:
     return Path(str(store))
 
 
+_LEGACY_ROLLBACK_META_KEYS = (
+    _manifest.MANIFEST_KEY,
+    _topo_snap.META_KEY,
+    "pwd",
+    "conversation_open",
+    "conversation_id",
+    "status",
+    "last_active",
+)
+
+
 def _legacy_workspace_snapshot(store: SessionStore) -> dict[str, object] | None:
     meta = getattr(store, "meta", None)
     if not hasattr(meta, "get"):
         return None
     snapshot: dict[str, object] = {}
-    for key in (_manifest.MANIFEST_KEY, _topo_snap.META_KEY, "pwd"):
+    for key in _LEGACY_ROLLBACK_META_KEYS:
         value = meta.get(key, _MISSING)
         snapshot[key] = value if value is _MISSING else deepcopy(value)
     return snapshot
@@ -224,7 +237,7 @@ def _restore_legacy_workspace(
 ) -> None:
     """Restore legacy workspace metadata or mark the store fail-closed."""
     rollback_errors: list[str] = []
-    for key in (_manifest.MANIFEST_KEY, _topo_snap.META_KEY, "pwd"):
+    for key in _LEGACY_ROLLBACK_META_KEYS:
         try:
             value = original[key]
             if value is _MISSING:
@@ -357,7 +370,162 @@ async def _resume_agent_into_engine(
     except BaseException as exc:
         if workspace_publish_started and original_workspace is not None:
             _restore_legacy_workspace(store, original_workspace, exc)
-        await _rollback_failed_adoption(engine, store, created)
+        await _finish_failed_adoption(engine, store, created)
+        raise
+
+
+def _runtime_group_descriptors(
+    meta: Mapping[str, Any],
+) -> list[Mapping[str, Any]] | None:
+    raw = meta.get("runtime_creatures")
+    if not isinstance(raw, list) or not raw:
+        return None
+    if not all(isinstance(item, Mapping) and item.get("name") for item in raw):
+        return None
+    descriptor_names = [str(item["name"]) for item in raw]
+    ids = [item.get("creature_id") for item in raw]
+    if (
+        len(set(descriptor_names)) != len(descriptor_names)
+        or not all(isinstance(cid, str) and cid for cid in ids)
+        or len(set(ids)) != len(ids)
+        or not all(isinstance(item.get("is_privileged", False), bool) for item in raw)
+    ):
+        return None
+    id_set = set(ids)
+    parents: dict[str, str | None] = {}
+    for item in raw:
+        creature_id = str(item["creature_id"])
+        parent = item.get("parent_creature_id")
+        if parent is not None and (
+            not isinstance(parent, str)
+            or parent not in id_set
+            or parent == creature_id
+        ):
+            return None
+        parents[creature_id] = parent
+    for creature_id in parents:
+        seen: set[str] = set()
+        current: str | None = creature_id
+        while current is not None:
+            if current in seen:
+                return None
+            seen.add(current)
+            current = parents[current]
+    return list(raw)
+
+
+async def _resume_runtime_group_body(
+    engine: "Terrarium",
+    path: Path,
+    store: SessionStore,
+    created: list[str],
+    meta: Mapping[str, Any],
+    *,
+    pwd: str | None,
+    llm: Any,
+) -> str:
+    descriptors = _runtime_group_descriptors(meta)
+    if descriptors is None:
+        raise SessionNotResumableError(
+            "Saved runtime group has incomplete creature metadata"
+        )
+    original_workspace = _legacy_workspace_snapshot(store)
+    workspace_publish_started = False
+    try:
+        sid: str | None = None
+        for descriptor in descriptors:
+            agent_name = str(descriptor["name"])
+            config_path = str(descriptor.get("config_path") or "")
+            config_snapshot = descriptor.get("config_snapshot") or {}
+            if not config_path and not config_snapshot:
+                raise SessionNotResumableError(
+                    f"Runtime creature {agent_name!r} has no saved config"
+                )
+            effective_pwd = pwd or descriptor.get("pwd") or meta.get("pwd")
+            if not (effective_pwd and os.path.isdir(effective_pwd)):
+                raise SessionNotResumableError(
+                    f"The saved working directory is missing or invalid: "
+                    f"{effective_pwd!r}. Choose a replacement directory or open "
+                    "the session history."
+                )
+            if pwd is not None:
+                effective_pwd = str(Path(effective_pwd).expanduser().resolve())
+
+            agent = _rebuild_agent(
+                config_path="" if config_snapshot else config_path,
+                config_snapshot=config_snapshot,
+                llm=llm,
+                io_kwargs={"input_module": NoneInput()},
+                pwd=str(effective_pwd),
+            )
+            inject_saved_state(agent, store, agent_name)
+            if not config_snapshot:
+                try:
+                    config_snapshot = pack_agent_config(agent.config)
+                except (AttributeError, TypeError) as exc:
+                    raise SessionNotResumableError(
+                        f"Runtime creature {agent_name!r} has no declarative "
+                        "config snapshot"
+                    ) from exc
+            creature_obj = Creature(
+                creature_id=str(descriptor["creature_id"]),
+                name=agent_name,
+                agent=agent,
+                config=agent.config,
+                config_snapshot=config_snapshot,
+                source_ref=config_path or None,
+                build_pwd=str(effective_pwd),
+                is_privileged=descriptor.get("is_privileged", False),
+                parent_creature_id=descriptor.get("parent_creature_id"),
+            )
+            creature = await engine.add_creature(
+                creature_obj,
+                graph=sid,
+                start=False,
+                session=False,
+            )
+            created.append(creature.creature_id)
+            sid = creature.graph_id
+
+        if sid is None:
+            raise SessionNotResumableError("Saved runtime group has no creatures")
+
+        saved_topology = meta.get(_topo_snap.META_KEY)
+        replay_complete = await _topo_snap.replay(
+            engine,
+            sid,
+            saved_snapshot=(saved_topology if isinstance(saved_topology, dict) else {}),
+        )
+        if not replay_complete:
+            raise SessionNotResumableError(
+                "Saved runtime topology could not be restored completely"
+            )
+        for creature_id in created:
+            await engine.get_creature(creature_id).start()
+
+        workspace_publish_started = True
+        await engine.attach_session(sid, store)
+        engine._owned_sessions.add(sid)
+
+        if pwd is not None:
+            store.meta["pwd"] = str(Path(pwd).expanduser().resolve())
+        if not await _checkpoint.checkpoint(engine, sid):
+            raise SessionNotResumableError(
+                "Workspace resume checkpoint did not persist a valid graph manifest"
+            )
+        for creature_id in created:
+            _schedule_drive_reconcile(engine, engine.get_creature(creature_id))
+        _finish_conversation_resume(store)
+        logger.info(
+            "Runtime group session resumed into engine",
+            session_id=sid,
+            path=str(path),
+            creatures=len(created),
+        )
+        return sid
+    except BaseException as exc:
+        if workspace_publish_started and original_workspace is not None:
+            _restore_legacy_workspace(store, original_workspace, exc)
         raise
 
 
@@ -375,11 +543,28 @@ async def _resume_terrarium_into_engine(
     # concurrent task added meanwhile.
     created: list[str] = []
     try:
+        meta = store.load_meta()
+        runtime_marker = meta.get("runtime_creatures")
+        if runtime_marker is not None:
+            descriptors = _runtime_group_descriptors(meta)
+            if descriptors is None:
+                raise SessionNotResumableError(
+                    "Saved runtime group has incomplete creature metadata"
+                )
+            return await _resume_runtime_group_body(
+                engine,
+                path,
+                store,
+                created,
+                meta,
+                pwd=pwd,
+                llm=llm,
+            )
         return await _resume_terrarium_body(
             engine, path, store, created, pwd=pwd, llm=llm
         )
     except BaseException:
-        await _rollback_failed_adoption(engine, store, created)
+        await _finish_failed_adoption(engine, store, created)
         raise
 
 
@@ -538,6 +723,19 @@ async def _resume_terrarium_body(
     return sid
 
 
+async def _finish_failed_adoption(
+    engine: "Terrarium", store: SessionStore, created_ids: list[str]
+) -> None:
+    cleanup = asyncio.create_task(
+        _rollback_failed_adoption(engine, store, created_ids)
+    )
+    try:
+        await asyncio.shield(cleanup)
+    except asyncio.CancelledError:
+        await cleanup
+        raise
+
+
 async def _rollback_failed_adoption(
     engine: "Terrarium",
     store: SessionStore,
@@ -552,10 +750,29 @@ async def _rollback_failed_adoption(
     store to release its writer lock.  Pre-existing graphs are left
     untouched.
     """
+    graph_ids = {
+        engine._creatures[cid].graph_id
+        for cid in created_ids
+        if cid in engine._creatures
+    }
     for gid, s in list(engine._session_stores.items()):
         if s is store:
+            drive_runtime = getattr(engine, "_drive_runtime", None)
+            if drive_runtime is not None:
+                try:
+                    await drive_runtime.detach_graph(gid)
+                except Exception:
+                    logger.warning(
+                        "resume rollback: Drive graph detach failed",
+                        graph_id=gid,
+                        exc_info=True,
+                    )
             engine._session_stores.pop(gid, None)
             engine._owned_sessions.discard(gid)
+    leftovers = getattr(engine, "_topology_replay_leftovers", None)
+    if isinstance(leftovers, dict):
+        for gid in graph_ids:
+            leftovers.pop(gid, None)
     for cid in created_ids:
         if cid not in engine._creatures:
             continue
