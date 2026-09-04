@@ -724,7 +724,8 @@ class SettingsOverlay:
         return render_overlay(self, width)
 
 
-def _mask_key(key: str) -> str:
-    if len(key) <= 8:
+def _mask_key(key) -> str:
+    text = str(key) if key else ""
+    if len(text) <= 8:
         return "••••"
-    return f"{key[:4]}…{key[-4:]}"
+    return f"{text[:4]}…{text[-4:]}"

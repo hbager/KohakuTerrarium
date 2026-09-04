@@ -108,3 +108,7 @@ dep/
 # inside the agent loop but never committed (binary screenshots +
 # rapidly-iterated notes).
 /audit/
+
+# Local-only notes. Keep them in the working tree, never on the branch.
+rule.md
+branch-change-report.md

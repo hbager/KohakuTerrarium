@@ -6,6 +6,7 @@ from typing import Any, AsyncIterator
 
 import litellm
 
+from kohakuterrarium.llm.api_keys import KeyPool
 from kohakuterrarium.llm.base import (
     BaseLLMProvider,
     ChatResponse,
@@ -34,7 +35,7 @@ class LiteLLMProvider(BaseLLMProvider):
     def __init__(
         self,
         model: str = "openai/gpt-4o",
-        api_key: str | None = None,
+        api_key: str | KeyPool | None = None,
         config: LLMConfig | None = None,
         **kwargs: Any,
     ) -> None:
@@ -272,7 +273,11 @@ class LiteLLMProvider(BaseLLMProvider):
         }
 
         if self._api_key:
-            params["api_key"] = self._api_key
+            params["api_key"] = (
+                self._api_key.next()
+                if isinstance(self._api_key, KeyPool)
+                else self._api_key
+            )
 
         max_tokens = kwargs.get("max_tokens", self.config.max_tokens)
         if max_tokens is not None:

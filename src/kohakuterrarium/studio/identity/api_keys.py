@@ -80,7 +80,14 @@ def set_key(provider: str, key: str) -> None:
         raise ValueError("Provider and key are required")
     if provider not in _provider_credentials():
         raise LookupError(f"Provider not found: {provider}")
-    save_api_key(provider, key)
+    save_api_key(provider, _normalize_key_value(key))
+
+
+def _normalize_key_value(key: str) -> str | list[str]:
+    parts = [part.strip() for part in key.split(",") if part.strip()]
+    if len(parts) > 1:
+        return parts
+    return parts[0] if parts else key
 
 
 def remove_key(provider: str) -> None:
@@ -92,4 +99,5 @@ def remove_key(provider: str) -> None:
 
 def get_existing_key(provider: str) -> str:
     """Return the resolved provider key for masked display workflows."""
-    return get_api_key(provider)
+    key = get_api_key(provider)
+    return key.first if hasattr(key, "first") else str(key or "")

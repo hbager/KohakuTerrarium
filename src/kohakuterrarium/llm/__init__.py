@@ -18,6 +18,7 @@ _EXPORTS = {
     "OPENAI_BASE_URL": "kohakuterrarium.llm.openai",
     "OPENROUTER_BASE_URL": "kohakuterrarium.llm.openai",
     "OpenAIProvider": "kohakuterrarium.llm.openai",
+    "OpenAIResponsesProvider": "kohakuterrarium.llm.openai_responses",
     "SystemMessage": "kohakuterrarium.llm.message",
     "ToolMessage": "kohakuterrarium.llm.message",
     "ToolSchema": "kohakuterrarium.llm.base",

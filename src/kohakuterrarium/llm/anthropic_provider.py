@@ -33,7 +33,7 @@ from kohakuterrarium.llm.anthropic_format import (
     merge_usage,
     usage_to_dict,
 )
-from kohakuterrarium.llm.api_keys import get_api_key
+from kohakuterrarium.llm.api_keys import KeyPool, get_api_key
 from kohakuterrarium.llm.base import (
     BaseLLMProvider,
     ChatResponse,
@@ -62,7 +62,7 @@ class AnthropicProvider(BaseLLMProvider):
 
     def __init__(
         self,
-        api_key: str | None = None,
+        api_key: str | KeyPool | None = None,
         model: str = "",
         base_url: str | None = ANTHROPIC_BASE_URL,
         *,
@@ -88,7 +88,9 @@ class AnthropicProvider(BaseLLMProvider):
             raise ImportError(
                 "anthropic not installed. Install with: pip install anthropic"
             )
-        if not api_key:
+        self._api_key_pool = api_key if isinstance(api_key, KeyPool) else None
+        api_key_for_client = api_key.first if isinstance(api_key, KeyPool) else api_key
+        if not api_key_for_client:
             raise ValueError(
                 "API key is required. Set ANTHROPIC_API_KEY or configure a "
                 "provider key with 'kt login <provider>'."
@@ -96,7 +98,7 @@ class AnthropicProvider(BaseLLMProvider):
 
         self.extra_body = dict(extra_body or {})
         self._retry_policy = RetryPolicy.from_value(retry_policy)
-        self._api_key = api_key
+        self._api_key = api_key_for_client
         self.base_url = base_url or ANTHROPIC_BASE_URL
         self._timeout = timeout
         self._extra_headers = dict(extra_headers or {})
@@ -118,8 +120,8 @@ class AnthropicProvider(BaseLLMProvider):
         if self.auth_as_bearer:
             default_headers.setdefault("X-Api-Key", Omit())
         self._client = AsyncAnthropic(
-            api_key=None if self.auth_as_bearer else api_key,
-            auth_token=api_key if self.auth_as_bearer else None,
+            api_key=None if self.auth_as_bearer else api_key_for_client,
+            auth_token=api_key_for_client if self.auth_as_bearer else None,
             base_url=self.base_url,
             timeout=timeout,
             max_retries=max_retries,
@@ -151,6 +153,7 @@ class AnthropicProvider(BaseLLMProvider):
         )
         clone.extra_body = dict(self.extra_body)
         clone._retry_policy = self._retry_policy
+        clone._api_key_pool = self._api_key_pool
         clone._api_key = self._api_key
         clone.base_url = self.base_url
         clone._timeout = self._timeout
@@ -180,10 +183,22 @@ class AnthropicProvider(BaseLLMProvider):
         lookup_key = getattr(self, "_credential_provider", "") or self.provider_name
         if not lookup_key:
             return False
-        new_key = get_api_key(lookup_key)
-        if not new_key or new_key == self._api_key:
+        resolved = get_api_key(lookup_key)
+        new_key_pool = (
+            resolved
+            if isinstance(resolved, KeyPool)
+            else KeyPool([str(resolved)]) if resolved else KeyPool([])
+        )
+        if not new_key_pool:
+            return False
+        new_key = new_key_pool.first
+        old_key = self._api_key_pool.first if self._api_key_pool else self._api_key
+        if new_key == old_key and new_key_pool == (
+            self._api_key_pool or KeyPool([self._api_key or ""])
+        ):
             return False
         old = self._client
+        self._api_key_pool = new_key_pool if new_key_pool.is_pool else None
         self._api_key = new_key
         default_headers = dict(self._extra_headers)
         if self.auth_as_bearer:
@@ -207,6 +222,39 @@ class AnthropicProvider(BaseLLMProvider):
         )
         return True
 
+    def _apply_request_api_key(self, create_kwargs: dict[str, Any]) -> None:
+        if not self._api_key_pool:
+            return
+        key = self._api_key_pool.next()
+        if not key:
+            return
+        headers = dict(create_kwargs.get("extra_headers") or {})
+        if self.auth_as_bearer:
+            headers["Authorization"] = f"Bearer {key}"
+        else:
+            headers["X-Api-Key"] = key
+        create_kwargs["extra_headers"] = headers
+
+    def _api_key_failover_limit(self) -> int:
+        return min(5, len(self._api_key_pool.keys)) if self._api_key_pool else 0
+
+    def _should_failover_api_key(self, error_class: ErrorClass, failures: int) -> bool:
+        return (
+            bool(self._api_key_pool)
+            and error_class in {ErrorClass.USER_ERROR, ErrorClass.RATE_LIMIT}
+            and failures < self._api_key_failover_limit()
+        )
+
+    def _log_api_key_failover(
+        self, error_class: ErrorClass, failure_number: int, exc: Exception
+    ) -> None:
+        logger.warning(
+            "provider_api_key_failover",
+            attempt=failure_number,
+            error_class=error_class.value,
+            error=str(exc),
+        )
+
     async def _stream_chat(
         self,
         messages: list[dict[str, Any]],
@@ -218,6 +266,7 @@ class AnthropicProvider(BaseLLMProvider):
         """Stream Anthropic output with classified retries and overflow recovery."""
         current = messages
         attempt = 0
+        api_key_failures = 0
         overflow_state = OverflowRecoveryState()
         while True:
             try:
@@ -235,6 +284,13 @@ class AnthropicProvider(BaseLLMProvider):
                     if replacement is not None:
                         current = replacement
                         continue
+                if cls in {ErrorClass.USER_ERROR, ErrorClass.RATE_LIMIT}:
+                    api_key_failures += 1
+                    if self._should_failover_api_key(cls, api_key_failures):
+                        self._log_api_key_failover(cls, api_key_failures, exc)
+                        continue
+                    if self._api_key_failover_limit() > 1:
+                        raise
                 if (
                     cls in self._retry_policy.retry_classes
                     and attempt < self._retry_policy.max_retries
@@ -335,6 +391,7 @@ class AnthropicProvider(BaseLLMProvider):
     ) -> ChatResponse:
         current = messages
         attempt = 0
+        api_key_failures = 0
         overflow_state = OverflowRecoveryState()
         while True:
             try:
@@ -348,6 +405,13 @@ class AnthropicProvider(BaseLLMProvider):
                     if replacement is not None:
                         current = replacement
                         continue
+                if cls in {ErrorClass.USER_ERROR, ErrorClass.RATE_LIMIT}:
+                    api_key_failures += 1
+                    if self._should_failover_api_key(cls, api_key_failures):
+                        self._log_api_key_failover(cls, api_key_failures, exc)
+                        continue
+                    if self._api_key_failover_limit() > 1:
+                        raise
                 if (
                     cls in self._retry_policy.retry_classes
                     and attempt < self._retry_policy.max_retries
@@ -464,6 +528,7 @@ class AnthropicProvider(BaseLLMProvider):
         extra_headers = merged_extra.pop("extra_headers", None)
         if extra_headers:
             create_kwargs["extra_headers"] = dict(extra_headers)
+        self._apply_request_api_key(create_kwargs)
         if self._service_tier and "service_tier" not in create_kwargs:
             create_kwargs["service_tier"] = self._service_tier
         if not disable_cache and is_anthropic_api_endpoint(self.base_url):

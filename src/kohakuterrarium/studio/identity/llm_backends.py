@@ -28,7 +28,13 @@ _BUILT_IN_BACKEND_NAMES = {
     "kimi-code",
     "glm-coding",
 }
-_SUPPORTED_BACKEND_TYPES = {"openai", "codex", "anthropic", "grok-subscription"}
+_SUPPORTED_BACKEND_TYPES = {
+    "openai",
+    "openai_responses",
+    "codex",
+    "anthropic",
+    "grok-subscription",
+}
 
 
 def list_backends() -> list[dict[str, Any]]:
@@ -39,6 +45,7 @@ def list_backends() -> list[dict[str, Any]]:
             "backend_type": backend.backend_type,
             "base_url": backend.base_url or "",
             "api_key_env": backend.api_key_env or "",
+            "auth_mode": backend.auth_mode,
             "provider_name": backend.provider_name or "",
             "provider_native_tools": list(backend.provider_native_tools),
             "built_in": name in _BUILT_IN_BACKEND_NAMES,
@@ -58,6 +65,7 @@ def save_backend_record(
     backend_type: str,
     base_url: str = "",
     api_key_env: str = "",
+    auth_mode: str = "api_key",
     provider_name: str = "",
     provider_native_tools: list[str] | None = None,
 ) -> LLMBackend:
@@ -66,11 +74,16 @@ def save_backend_record(
         raise ValueError("Name and backend type are required")
     if backend_type not in _SUPPORTED_BACKEND_TYPES:
         raise ValueError(f"Unsupported backend type: {backend_type}")
+    if auth_mode not in {"api_key", "none"}:
+        raise ValueError(f"Unsupported auth mode: {auth_mode}")
+    if auth_mode == "none" and backend_type != "openai":
+        raise ValueError("auth_mode 'none' is only supported by openai backends")
     backend = LLMBackend(
         name=name,
         backend_type=backend_type,
         base_url=base_url or "",
         api_key_env=api_key_env or "",
+        auth_mode=auth_mode,
         provider_name=provider_name or "",
         provider_native_tools=list(provider_native_tools or []),
     )

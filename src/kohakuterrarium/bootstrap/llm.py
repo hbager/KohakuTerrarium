@@ -9,9 +9,9 @@ from kohakuterrarium.errors import LLMNotConfiguredError
 from kohakuterrarium.core.config import AgentConfig
 from kohakuterrarium.llm.base import LLMConfig, LLMProvider
 from kohakuterrarium.llm import api_keys as _api_keys
+from kohakuterrarium.llm.api_keys import KeyPool, get_api_key
 from kohakuterrarium.llm.profiles import (
     LLMProfile,
-    get_api_key,
     profile_to_identifier,
     resolve_controller_llm,
 )
@@ -135,6 +135,18 @@ def _extract_controller_data(config: AgentConfig) -> dict[str, Any]:
     return data
 
 
+def _resolve_profile_key(profile: LLMProfile, *, keep_pool: bool) -> Any:
+    resolved = get_api_key(profile.provider) if profile.provider else ""
+    if not resolved and profile.api_key_env:
+        resolved = get_api_key(profile.api_key_env)
+    if isinstance(resolved, KeyPool):
+        resolved = KeyPool([interpolate_env_vars(key) for key in resolved.keys])
+    if keep_pool:
+        return resolved
+    value = resolved.first if isinstance(resolved, KeyPool) else resolved
+    return interpolate_env_vars(value or "")
+
+
 def _create_from_profile(profile: LLMProfile) -> LLMProvider:
     """Instantiate the provider described by a resolved profile."""
     logger.info(
@@ -145,11 +157,13 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
         backend_type=profile.backend_type,
     )
 
+    auth_mode = getattr(profile, "auth_mode", "api_key")
+    if auth_mode == "none" and profile.backend_type != "openai":
+        raise ValueError("auth_mode 'none' is only supported by openai backends")
+
     if profile.backend_type == "fake_test":
         # This backend validates the full credential path without network access.
-        api_key = get_api_key(profile.provider) if profile.provider else ""
-        if not api_key and profile.api_key_env:
-            api_key = get_api_key(profile.api_key_env)
+        api_key = _resolve_profile_key(profile, keep_pool=False)
         if not api_key:
             raise ValueError(
                 f"API key not found for fake_test profile '{profile.name}' "
@@ -175,9 +189,7 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
         codex_base_url = _resolved_base_url(profile)
         codex_key: str | None = None
         if codex_base_url:
-            resolved = get_api_key(profile.provider) if profile.provider else ""
-            if not resolved and profile.api_key_env:
-                resolved = get_api_key(profile.api_key_env)
+            resolved = _resolve_profile_key(profile, keep_pool=False)
             codex_key = interpolate_env_vars(resolved or "") or None
             if not codex_key:
                 raise LLMNotConfiguredError(
@@ -213,12 +225,9 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
         _apply_backend_native_identity(provider, profile)
         return provider
 
-    api_key = get_api_key(profile.provider) if profile.provider else ""
-    if not api_key and profile.api_key_env:
-        api_key = get_api_key(profile.api_key_env)
-    # Stored credentials may themselves reference environment variables.
-    api_key = interpolate_env_vars(api_key or "")
-    if not api_key:
+    no_auth = auth_mode == "none"
+    api_key = "" if no_auth else _resolve_profile_key(profile, keep_pool=True)
+    if not api_key and not no_auth:
         # Workers use the controller's identity store as the canonical key source.
         if _api_keys._resolver is not None:
             raise ValueError(
@@ -270,18 +279,36 @@ def _create_from_profile(profile: LLMProfile) -> LLMProvider:
     else:
         from kohakuterrarium.llm.openai import OpenAIProvider
 
-        provider = OpenAIProvider(
-            api_key=api_key,
-            base_url=base_url,
-            model=profile.model,
-            temperature=profile.temperature,
-            max_tokens=profile.max_output or None,
-            extra_body=profile.extra_body or None,
-            retry_policy=retry_policy,
-        )
+        from kohakuterrarium.llm.openai_responses import OpenAIResponsesProvider
+
+        if profile.backend_type == "openai_responses":
+            provider = OpenAIResponsesProvider(
+                api_key=api_key,
+                base_url=base_url or None,
+                model=profile.model,
+                temperature=profile.temperature,
+                max_tokens=profile.max_output or None,
+                reasoning_effort=profile.reasoning_effort or "",
+                service_tier=profile.service_tier or None,
+                extra_body=profile.extra_body or None,
+                retry_policy=retry_policy,
+            )
+        else:
+            provider = OpenAIProvider(
+                api_key=api_key,
+                base_url=base_url,
+                model=profile.model,
+                auth_mode=auth_mode,
+                temperature=profile.temperature,
+                max_tokens=profile.max_output or None,
+                reasoning_effort=profile.reasoning_effort,
+                service_tier=profile.service_tier or None,
+                extra_body=profile.extra_body or None,
+                retry_policy=retry_policy,
+            )
     provider._profile_max_context = profile.max_context
     # Retain the credential lookup key independently of native-tool identity.
-    if profile.provider:
+    if profile.provider and not no_auth:
         provider._credential_provider = profile.provider
     _apply_backend_native_identity(provider, profile)
     return provider
@@ -339,8 +366,9 @@ def _create_from_inline(config: AgentConfig) -> LLMProvider:
         return provider
 
     # Only explicit Anthropic auth selects its native transport for legacy configs.
-    api_key = config.get_api_key()
-    if not api_key:
+    no_auth = config.auth_mode == "none"
+    api_key = "" if no_auth else config.get_api_key()
+    if not api_key and not no_auth:
         env_hint = (
             f"Set the {config.api_key_env} environment variable."
             if config.api_key_env
@@ -365,12 +393,28 @@ def _create_from_inline(config: AgentConfig) -> LLMProvider:
             retry_policy=config.retry_policy,
         )
 
+    if config.auth_mode in {"openai-responses", "openai_responses"}:
+        from kohakuterrarium.llm.openai_responses import OpenAIResponsesProvider
+
+        return OpenAIResponsesProvider(
+            api_key=api_key,
+            base_url=config.base_url or None,
+            model=config.model,
+            temperature=config.temperature,
+            max_tokens=config.max_tokens,
+            reasoning_effort=config.reasoning_effort,
+            service_tier=config.service_tier or None,
+            extra_body=config.extra_body or None,
+            retry_policy=config.retry_policy,
+        )
+
     from kohakuterrarium.llm.openai import OpenAIProvider
 
     return OpenAIProvider(
         api_key=api_key,
         base_url=config.base_url,
         model=config.model,
+        auth_mode=config.auth_mode or "api_key",
         temperature=config.temperature,
         max_tokens=config.max_tokens,
         extra_body=config.extra_body or None,

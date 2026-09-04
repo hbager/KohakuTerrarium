@@ -125,7 +125,10 @@ class DeepSeekSearchBackend:
             "tools": [{"type": "web_search"}],
             "tool_choice": {"type": "web_search"},
         }
-        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        headers = {
+            "Authorization": f"Bearer {str(key)}",
+            "Content-Type": "application/json",
+        }
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 response = await client.post(

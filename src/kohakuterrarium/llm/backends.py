@@ -41,7 +41,13 @@ _BUILTIN_PROVIDER_NAMES: set[str] = {
 }
 
 # Legacy presets sometimes placed transport types in the provider field.
-_LEGACY_BACKEND_TYPE_VALUES: set[str] = {"openai", "codex", "codex-oauth", "anthropic"}
+_LEGACY_BACKEND_TYPE_VALUES: set[str] = {
+    "openai",
+    "openai_responses",
+    "codex",
+    "codex-oauth",
+    "anthropic",
+}
 
 
 def _normalize_backend_type(value: str) -> str:
@@ -230,6 +236,12 @@ def load_backends() -> dict[str, LLMBackend]:
 def validate_backend_type(backend_type: str) -> str:
     """Validate and return a canonical provider transport type."""
     normalized = _normalize_backend_type(backend_type)
-    if normalized not in {"openai", "anthropic", "codex", "grok-subscription"}:
+    if normalized not in {
+        "openai",
+        "openai_responses",
+        "anthropic",
+        "codex",
+        "grok-subscription",
+    }:
         raise ValueError(f"Unsupported backend_type: {backend_type}")
     return normalized

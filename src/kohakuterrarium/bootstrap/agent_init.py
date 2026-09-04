@@ -383,6 +383,8 @@ class AgentInitMixin:
             "agent_name": self.config.name,
             "creature_name": self.config.name,
             "pwd": str(self.executor._working_dir) if self.executor else "",
+            "working_dir": str(self.executor._working_dir) if self.executor else "",
+            "agent_path": str(getattr(self.config, "path", "") or ""),
             "model": getattr(self.llm, "model", ""),
         }
         return aggregate_system_prompt(

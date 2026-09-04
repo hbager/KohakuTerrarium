@@ -34,7 +34,7 @@
                   <div class="text-[11px] text-warm-400 font-mono truncate">
                     {{ backend.base_url || "(built-in endpoint)" }}
                   </div>
-                  <div class="text-[11px] text-warm-400 font-mono truncate mt-1">
+                  <div v-if="backend.auth_mode !== 'none'" class="text-[11px] text-warm-400 font-mono truncate mt-1">
                     <span v-if="backend.env_var">{{ backend.env_var }}</span>
                     <span v-if="backend.masked_key && !isOAuthCodex(backend) && !isGrokSubscription(backend)"> · {{ backend.masked_key }}</span>
                     <span v-if="isOAuthCodex(backend)">{{ t("settings.keys.oauthHint") }}</span>
@@ -44,7 +44,7 @@
                 </div>
                 <div class="flex flex-wrap items-center justify-end gap-2 shrink-0">
                   <template v-if="isGrokSubscription(backend)" />
-                  <template v-else-if="!isOAuthCodex(backend)">
+                  <template v-else-if="!isOAuthCodex(backend) && backend.auth_mode !== 'none'">
                     <el-input v-if="editingKey === backend.name" v-model="keyInput" size="small" type="password" show-password :placeholder="t('settings.keys.enterKey')" class="!w-60" @keyup.enter="saveKey(backend.name)" />
                     <el-button v-if="editingKey === backend.name" size="small" type="primary" @click="saveKey(backend.name)">
                       {{ t("common.save") }}
@@ -99,7 +99,7 @@
                   <div class="text-[11px] text-warm-400 font-mono truncate">
                     {{ backend.base_url || "(no base_url)" }}
                   </div>
-                  <div class="text-[11px] text-warm-400 font-mono truncate mt-1">
+                  <div v-if="backend.auth_mode !== 'none'" class="text-[11px] text-warm-400 font-mono truncate mt-1">
                     <span v-if="backend.env_var">{{ backend.env_var }}</span>
                     <span v-if="backend.masked_key && !isOAuthCodex(backend) && !isGrokSubscription(backend)"> · {{ backend.masked_key }}</span>
                     <span v-if="isOAuthCodex(backend)">{{ t("settings.keys.oauthHint") }}</span>
@@ -113,7 +113,7 @@
                 </div>
                 <div class="flex flex-wrap items-center justify-end gap-2 shrink-0">
                   <template v-if="isGrokSubscription(backend)" />
-                  <template v-else-if="!isOAuthCodex(backend)">
+                  <template v-else-if="!isOAuthCodex(backend) && backend.auth_mode !== 'none'">
                     <el-input v-if="editingKey === backend.name" v-model="keyInput" size="small" type="password" show-password :placeholder="t('settings.keys.enterKey')" class="!w-60" @keyup.enter="saveKey(backend.name)" />
                     <el-button v-if="editingKey === backend.name" size="small" type="primary" @click="saveKey(backend.name)">
                       {{ t("common.save") }}
@@ -811,6 +811,7 @@ const backendForm = reactive({
   name: "",
   backend_type: "openai",
   base_url: "",
+  auth_mode: "api_key",
   provider_name: "",
   provider_native_tools: [],
 })
@@ -870,6 +871,7 @@ function resetBackendForm() {
   backendForm.name = ""
   backendForm.backend_type = "openai"
   backendForm.base_url = ""
+  backendForm.auth_mode = "api_key"
   backendForm.provider_name = ""
   backendForm.provider_native_tools = []
 }
@@ -893,6 +895,7 @@ function startEditBackend(backend) {
   backendForm.name = backend.name
   backendForm.backend_type = backend.backend_type || "openai"
   backendForm.base_url = backend.base_url || ""
+  backendForm.auth_mode = backend.auth_mode || "api_key"
   backendForm.provider_name = backend.provider_name || ""
   backendForm.provider_native_tools = Array.from(backend.provider_native_tools || [])
   showBackendForm.value = true
@@ -900,6 +903,7 @@ function startEditBackend(backend) {
 
 function onBackendFormUpdate({ key, value }) {
   backendForm[key] = key === "provider_native_tools" ? Array.from(value || []) : value
+  if (key === "backend_type" && value !== "openai" && backendForm.auth_mode === "none") backendForm.auth_mode = "api_key"
 }
 
 async function saveBackend() {
@@ -910,6 +914,7 @@ async function saveBackend() {
       name: backendName,
       backend_type: backendForm.backend_type,
       base_url: backendForm.base_url,
+      auth_mode: backendForm.auth_mode,
       provider_name: backendForm.provider_name || backendName,
       provider_native_tools: Array.from(backendForm.provider_native_tools || []),
     })

@@ -125,6 +125,7 @@ def _resolve_preset(
         max_output=resolved_preset.max_output,
         base_url=provider.base_url if provider else "",
         api_key_env=provider.api_key_env if provider else "",
+        auth_mode=provider.auth_mode if provider else "api_key",
         temperature=resolved_preset.temperature,
         reasoning_effort=resolved_preset.reasoning_effort,
         service_tier=resolved_preset.service_tier,
