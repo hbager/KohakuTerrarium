@@ -192,6 +192,10 @@ ALLOWLIST_600 = {
     # / extra_body handling across files that all touch the same
     # ``create_kwargs`` dict.
     "llm/openai.py",
+    # Provider base: overflow/content recovery plus the empty-response retry
+    # loops (stream + non-stream). One retry policy shared by every
+    # transport; splitting would scatter the attempt-state reset.
+    "llm/base.py",
     # Resumable-events normalization pipeline — cohesive replay/branch
     # logic: nested-branch parent-path resolution, branch-view selection,
     # OpenAI-shape conversation replay, interrupted-job synthesis, plus

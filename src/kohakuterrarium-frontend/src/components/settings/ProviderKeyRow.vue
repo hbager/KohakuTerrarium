@@ -1,5 +1,5 @@
 <template>
-  <ProviderRow :name="displayName" :identifier="backend.name" :status="t(backend.has_key ? 'settings.oauth.configured' : 'settings.providers.unconfigured')" :tone="backend.has_key ? 'success' : 'info'" :subtitle="backend.base_url">
+  <ProviderRow :name="displayName" :identifier="backend.name" :status="t(backend.has_key || backend.auth_mode === 'none' ? 'settings.oauth.configured' : 'settings.providers.unconfigured')" :tone="backend.has_key || backend.auth_mode === 'none' ? 'success' : 'info'" :subtitle="backend.base_url">
     <details v-if="backend.env_var || backend.backend_type || backend.masked_key" class="provider-connection-details">
       <summary>{{ t("settings.providers.connectionDetails") }}</summary>
       <div class="mt-2 space-y-1 font-mono break-all">
@@ -11,13 +11,14 @@
       </div>
     </details>
     <template #actions>
-      <template v-if="editing">
+      <template v-if="backend.auth_mode === 'none'" />
+      <template v-else-if="editing">
         <el-input :model-value="modelValue" size="small" type="password" show-password :placeholder="t('settings.keys.enterKey')" :aria-label="t('settings.keys.enterKey')" class="provider-key-input" @update:model-value="$emit('update:modelValue', $event)" @keyup.enter="$emit('save')" />
         <el-button size="small" type="primary" @click="$emit('save')">{{ t("common.save") }}</el-button>
         <el-button size="small" @click="$emit('cancel')">{{ t("common.cancel") }}</el-button>
       </template>
       <el-button v-else size="small" :type="backend.has_key ? 'default' : 'primary'" @click="$emit('edit')">{{ t(backend.has_key ? "settings.providers.changeKey" : "settings.keys.setKey") }}</el-button>
-      <el-dropdown v-if="!editing && backend.has_key" trigger="click" @command="confirmRemove">
+      <el-dropdown v-if="!editing && backend.has_key && backend.auth_mode !== 'none'" trigger="click" @command="confirmRemove">
         <el-button size="small" :aria-label="t('settings.providers.more')">···</el-button>
         <template #dropdown
           ><el-dropdown-menu

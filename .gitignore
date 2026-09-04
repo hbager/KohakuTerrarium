@@ -116,3 +116,7 @@ dep/
 /extensions/vscode/node_modules/
 /extensions/vscode/dist/
 /extensions/vscode/*.vsix
+
+# Local-only notes. Keep them in the working tree, never on the branch.
+rule.md
+branch-change-report.md

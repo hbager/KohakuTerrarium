@@ -14,7 +14,7 @@ from kohakuterrarium.llm.anthropic_cache import (
     apply_anthropic_cache_markers,
     is_anthropic_endpoint,
 )
-from kohakuterrarium.llm.api_keys import get_api_key
+from kohakuterrarium.llm.api_keys import KeyPool, get_api_key
 from kohakuterrarium.llm.base import (
     BaseLLMProvider,
     ChatResponse,
@@ -24,6 +24,7 @@ from kohakuterrarium.llm.base import (
 )
 from kohakuterrarium.llm.artifact_resolve import resolve_message_image_urls
 from kohakuterrarium.llm.openai_helpers import (
+    apply_request_controls,
     delta_field,
     delta_field_present,
     extract_usage,
@@ -44,6 +45,7 @@ from kohakuterrarium.llm.stream_replay import ReplayFilter
 from kohakuterrarium.llm.turn_segments import TurnSegmentsBuilder
 from kohakuterrarium.llm.openai_ws import stream_ws_turn
 from kohakuterrarium.llm.recovery import (
+    ErrorClass,
     RetryPolicy,
     classify_openai_error,
     retry_delay,
@@ -65,6 +67,10 @@ _pack_reasoning_fields = pack_reasoning_fields
 # Canonical endpoints used by built-in profiles.
 OPENAI_BASE_URL = "https://api.openai.com/v1"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+ROOCODE_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+)
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -72,12 +78,15 @@ class OpenAIProvider(BaseLLMProvider):
 
     def __init__(
         self,
-        api_key: str | None = None,
+        api_key: str | KeyPool | None = None,
         model: str = "",
         base_url: str = OPENAI_BASE_URL,
         *,
+        auth_mode: str = "api_key",
         temperature: float = 0.7,
         max_tokens: int | None = None,
+        reasoning_effort: str = "",
+        service_tier: str | None = None,
         timeout: float = 120.0,
         extra_headers: dict[str, str] | None = None,
         extra_body: dict[str, Any] | None = None,
@@ -100,6 +109,8 @@ class OpenAIProvider(BaseLLMProvider):
         self._ws_connection_options = ws_options.build_websocket_connection_options(
             self.extra_body.get("websocket_connection_options"), timeout=timeout
         )
+        self.reasoning_effort = reasoning_effort or ""
+        self.service_tier = service_tier
         self._websocket_mode = bool(
             websocket_mode or self.extra_body.get("websocket_mode")
         )
@@ -110,10 +121,24 @@ class OpenAIProvider(BaseLLMProvider):
         self._retry_policy = RetryPolicy.from_value(
             {"max_retries": max_retries} if retry_policy is None else retry_policy
         )
-        self._api_key = api_key
+        if auth_mode not in {"api_key", "none"}:
+            raise ValueError(f"Unsupported auth mode: {auth_mode}")
+        self._api_key_pool = (
+            api_key if isinstance(api_key, KeyPool) and auth_mode != "none" else None
+        )
+        api_key_for_client = api_key.first if isinstance(api_key, KeyPool) else api_key
+        if auth_mode == "none":
+            api_key_for_client = None
+        self._api_key = api_key_for_client
+        self.auth_mode = auth_mode
         self._base_url_input = base_url
         self._timeout = timeout
-        self._extra_headers = extra_headers or {}
+        clean_extra_headers = {
+            key: value
+            for key, value in (extra_headers or {}).items()
+            if auth_mode != "none" or key.lower() != "authorization"
+        }
+        self._extra_headers = clean_extra_headers
         self._max_retries = 0
         self._last_usage: dict[str, int] = {}
         self._last_assistant_extra_fields: dict[str, Any] = {}
@@ -121,18 +146,21 @@ class OpenAIProvider(BaseLLMProvider):
         # Retain the endpoint string because cache detection cannot rely on SDK internals.
         self.base_url: str = base_url or ""
 
-        if not api_key:
+        if not api_key_for_client and auth_mode != "none":
             raise ValueError(
                 "API key is required. "
                 "Set OPENROUTER_API_KEY or OPENAI_API_KEY environment variable."
             )
 
+        default_headers = {"User-Agent": ROOCODE_USER_AGENT, **clean_extra_headers}
+        if auth_mode == "none":
+            default_headers["Authorization"] = ""
         self._client = AsyncOpenAI(
-            api_key=api_key,
+            api_key=api_key_for_client or "not-used",
             base_url=base_url,
             timeout=timeout,
             max_retries=self._max_retries,
-            default_headers=extra_headers or {},
+            default_headers=default_headers,
         )
 
         # Report caching once at construction rather than on every request.
@@ -178,6 +206,8 @@ class OpenAIProvider(BaseLLMProvider):
             ),
         )
         clone.extra_body = dict(self.extra_body)
+        clone.reasoning_effort = self.reasoning_effort
+        clone.service_tier = self.service_tier
         clone._websocket_mode = self._websocket_mode
         clone._ws_connection_options = dict(self._ws_connection_options)
         clone._ws_session_options = dict(self._ws_session_options)
@@ -186,7 +216,9 @@ class OpenAIProvider(BaseLLMProvider):
         clone._ws_session = None
         clone.echo_reasoning = self.echo_reasoning
         clone._retry_policy = self._retry_policy
+        clone._api_key_pool = self._api_key_pool
         clone._api_key = self._api_key
+        clone.auth_mode = self.auth_mode
         clone._base_url_input = self._base_url_input
         clone._timeout = self._timeout
         clone._extra_headers = dict(self._extra_headers)
@@ -211,23 +243,37 @@ class OpenAIProvider(BaseLLMProvider):
 
     def reload_credentials(self) -> bool:
         """Rotate profile-backed credentials and rebuild the SDK client in place."""
+        if self.auth_mode == "none":
+            return False
         # Profile identity is authoritative; inline providers have no reload source.
         lookup_key = getattr(self, "_credential_provider", "") or self.provider_name
         if not lookup_key:
             return False
-        new_key = get_api_key(lookup_key)
-        if not new_key or new_key == self._api_key:
+        resolved = get_api_key(lookup_key)
+        new_key_pool = (
+            resolved
+            if isinstance(resolved, KeyPool)
+            else KeyPool([str(resolved)]) if resolved else KeyPool([])
+        )
+        if not new_key_pool:
+            return False
+        new_key = new_key_pool.first
+        old_key = self._api_key_pool.first if self._api_key_pool else self._api_key
+        if new_key == old_key and new_key_pool == (
+            self._api_key_pool or KeyPool([self._api_key or ""])
+        ):
             return False
         old = self._client
         old_session = self._ws_session
         self._ws_session = None
+        self._api_key_pool = new_key_pool if new_key_pool.is_pool else None
         self._api_key = new_key
         self._client = AsyncOpenAI(
             api_key=new_key,
             base_url=self._base_url_input,
             timeout=self._timeout,
             max_retries=self._max_retries,
-            default_headers=self._extra_headers,
+            default_headers={"User-Agent": ROOCODE_USER_AGENT, **self._extra_headers},
         )
         borrowed, self._borrowed_client = self._borrowed_client, False
         try:
@@ -244,6 +290,36 @@ class OpenAIProvider(BaseLLMProvider):
             provider=lookup_key,
         )
         return True
+
+    def _apply_request_api_key(self, create_kwargs: dict[str, Any]) -> None:
+        """Attach the next pool key as a per-request authorization header."""
+        if self.auth_mode == "none" or not self._api_key_pool:
+            return
+        key = self._api_key_pool.next()
+        if key:
+            headers = dict(create_kwargs.get("extra_headers") or {})
+            headers["Authorization"] = f"Bearer {key}"
+            create_kwargs["extra_headers"] = headers
+
+    def _api_key_failover_limit(self) -> int:
+        return min(5, len(self._api_key_pool.keys)) if self._api_key_pool else 0
+
+    def _should_failover_api_key(self, error_class: ErrorClass, failures: int) -> bool:
+        return (
+            bool(self._api_key_pool)
+            and error_class in {ErrorClass.USER_ERROR, ErrorClass.RATE_LIMIT}
+            and failures < self._api_key_failover_limit()
+        )
+
+    def _log_api_key_failover(
+        self, error_class: ErrorClass, failure_number: int, exc: Exception
+    ) -> None:
+        logger.warning(
+            "provider_api_key_failover",
+            attempt=failure_number,
+            error_class=error_class.value,
+            error=str(exc),
+        )
 
     def _ws_session_for_turn(self) -> ResponsesWSSession | None:
         """Return the WS session, or ``None`` when a turn is already in flight."""
@@ -304,6 +380,7 @@ class OpenAIProvider(BaseLLMProvider):
             kwargs["_ws_recovery"] = WSRecovery(self._retry_policy)
         recovery = kwargs.get("_ws_recovery")
         attempt = 0
+        api_key_failures = 0
         overflow_state = OverflowRecoveryState()
         replay = ReplayFilter()
         try:
@@ -341,6 +418,13 @@ class OpenAIProvider(BaseLLMProvider):
                         exc.submitted or exc.mid_stream
                     ):
                         raise
+                    if cls in {ErrorClass.USER_ERROR, ErrorClass.RATE_LIMIT}:
+                        api_key_failures += 1
+                        if self._should_failover_api_key(cls, api_key_failures):
+                            self._log_api_key_failover(cls, api_key_failures, exc)
+                            continue
+                        if self._api_key_failover_limit() > 1:
+                            raise
                     if (
                         cls in self._retry_policy.retry_classes
                         and attempt < self._retry_policy.max_retries
@@ -431,11 +515,19 @@ class OpenAIProvider(BaseLLMProvider):
         if "extra_body" in kwargs:
             merged_extra.update(kwargs["extra_body"])
         merged_extra = self._sanitize_extra_body(merged_extra)
+        merged_extra = apply_request_controls(
+            create_kwargs,
+            merged_extra,
+            base_url=self.base_url,
+            reasoning_effort=kwargs.get("reasoning_effort", self.reasoning_effort),
+            service_tier=kwargs.get("service_tier", self.service_tier),
+        )
         if merged_extra:
             create_kwargs["extra_body"] = merged_extra
 
         # Stable routing allows compatible backends to reuse cached prompt prefixes.
         create_kwargs.update(self._prompt_cache_request_kwargs())
+        self._apply_request_api_key(create_kwargs)
 
         log_request_shape(
             "Starting streaming request",
@@ -564,6 +656,7 @@ class OpenAIProvider(BaseLLMProvider):
         """Non-streaming chat completion with retry plus overflow and content recovery."""
         current = messages
         attempt = 0
+        api_key_failures = 0
         overflow_state = OverflowRecoveryState()
         while True:
             try:
@@ -576,6 +669,13 @@ class OpenAIProvider(BaseLLMProvider):
                 if replacement is not None:
                     current = replacement
                     continue
+                if cls in {ErrorClass.USER_ERROR, ErrorClass.RATE_LIMIT}:
+                    api_key_failures += 1
+                    if self._should_failover_api_key(cls, api_key_failures):
+                        self._log_api_key_failover(cls, api_key_failures, exc)
+                        continue
+                    if self._api_key_failover_limit() > 1:
+                        raise
                 if (
                     cls in self._retry_policy.retry_classes
                     and attempt < self._retry_policy.max_retries
@@ -622,10 +722,18 @@ class OpenAIProvider(BaseLLMProvider):
         if "extra_body" in kwargs:
             merged_extra.update(kwargs["extra_body"])
         merged_extra = self._sanitize_extra_body(merged_extra)
+        merged_extra = apply_request_controls(
+            create_kwargs,
+            merged_extra,
+            base_url=self.base_url,
+            reasoning_effort=kwargs.get("reasoning_effort", self.reasoning_effort),
+            service_tier=kwargs.get("service_tier", self.service_tier),
+        )
         if merged_extra:
             create_kwargs["extra_body"] = merged_extra
 
         create_kwargs.update(self._prompt_cache_request_kwargs())
+        self._apply_request_api_key(create_kwargs)
 
         log_request_shape(
             "Starting non-streaming request",

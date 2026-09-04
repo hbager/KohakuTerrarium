@@ -662,6 +662,7 @@ const backendForm = reactive({
   name: "",
   backend_type: "openai",
   base_url: "",
+  auth_mode: "api_key",
   provider_name: "",
   provider_native_tools: [],
 })
@@ -723,6 +724,7 @@ function resetBackendForm() {
   backendForm.name = ""
   backendForm.backend_type = "openai"
   backendForm.base_url = ""
+  backendForm.auth_mode = "api_key"
   backendForm.provider_name = ""
   backendForm.provider_native_tools = []
 }
@@ -746,6 +748,7 @@ function startEditBackend(backend) {
   backendForm.name = backend.name
   backendForm.backend_type = backend.backend_type || "openai"
   backendForm.base_url = backend.base_url || ""
+  backendForm.auth_mode = backend.auth_mode || "api_key"
   backendForm.provider_name = backend.provider_name || ""
   backendForm.provider_native_tools = Array.from(backend.provider_native_tools || [])
   showBackendForm.value = true
@@ -753,6 +756,7 @@ function startEditBackend(backend) {
 
 function onBackendFormUpdate({ key, value }) {
   backendForm[key] = key === "provider_native_tools" ? Array.from(value || []) : value
+  if (key === "backend_type" && value !== "openai" && backendForm.auth_mode === "none") backendForm.auth_mode = "api_key"
 }
 
 async function saveBackend() {
@@ -763,6 +767,7 @@ async function saveBackend() {
       name: backendName,
       backend_type: backendForm.backend_type,
       base_url: backendForm.base_url,
+      auth_mode: backendForm.auth_mode,
       provider_name: backendForm.provider_name || backendName,
       provider_native_tools: Array.from(backendForm.provider_native_tools || []),
     })

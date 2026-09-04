@@ -3,6 +3,7 @@ Store provider API keys and resolve them from worker or standalone sources.
 """
 
 import os
+import threading
 from collections.abc import Callable
 from pathlib import Path
 
@@ -51,7 +52,57 @@ def clear_api_key_resolver() -> None:
     _resolver = None
 
 
-def save_api_key(provider: str, key: str) -> None:
+class KeyPool:
+    """Thread-safe round-robin API key pool."""
+
+    def __init__(self, keys: list[str] | tuple[str, ...]):
+        self._keys = [str(key) for key in keys if str(key)]
+        self._index = 0
+        self._lock = threading.Lock()
+
+    def next(self) -> str:
+        if not self._keys:
+            return ""
+        with self._lock:
+            key = self._keys[self._index % len(self._keys)]
+            self._index += 1
+            return key
+
+    @property
+    def first(self) -> str:
+        return self._keys[0] if self._keys else ""
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        return tuple(self._keys)
+
+    @property
+    def is_pool(self) -> bool:
+        return len(self._keys) > 1
+
+    def __bool__(self) -> bool:
+        return bool(self._keys)
+
+    def __str__(self) -> str:
+        return self.first
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, KeyPool):
+            return self.keys == other.keys
+        if isinstance(other, str):
+            return self.first == other
+        return False
+
+
+def _pool_from_value(value: object) -> KeyPool:
+    if isinstance(value, KeyPool):
+        return value
+    if isinstance(value, (list, tuple)):
+        return KeyPool([str(key) for key in value])
+    return KeyPool([str(value)]) if value else KeyPool([])
+
+
+def save_api_key(provider: str, key: str | list[str]) -> None:
     """Save an API key for a provider."""
     path = _keys_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -62,7 +113,7 @@ def save_api_key(provider: str, key: str) -> None:
     logger.info("API key saved", provider=provider)
 
 
-def get_api_key(provider_or_env: str) -> str:
+def get_api_key(provider_or_env: str) -> KeyPool:
     """Resolve a provider key from the worker resolver or standalone file and env."""
 
     provider = provider_or_env
@@ -79,7 +130,7 @@ def get_api_key(provider_or_env: str) -> str:
             logger.exception("api-key resolver raised; treating as miss")
             key = ""
         if key:
-            return key
+            return _pool_from_value(key)
         # Resolver misses are terminal so credentials never leak from another source.
         logger.warning(
             "api-key resolver returned empty; set the key on this "
@@ -87,19 +138,24 @@ def get_api_key(provider_or_env: str) -> str:
             "identity store (POST /api/settings/keys)",
             provider=provider,
         )
-        return ""
+        return KeyPool([])
 
     # Standalone resolution prefers the persisted key over environment fallbacks.
     keys = _load_api_keys()
     if provider in keys and keys[provider]:
-        return keys[provider]
+        return _pool_from_value(keys[provider])
     env_var = PROVIDER_KEY_MAP.get(provider, provider_or_env)
     key = os.environ.get(env_var, "")
     if key:
-        return key
+        return KeyPool([key])
     if provider_or_env != env_var:
         key = os.environ.get(provider_or_env, "")
-    return key
+    return KeyPool([key]) if key else KeyPool([])
+
+
+def get_api_key_str(provider_or_env: str) -> str:
+    """Return the first key for legacy string consumers."""
+    return get_api_key(provider_or_env).first
 
 
 def has_api_key(provider_or_env: str) -> bool:
@@ -126,14 +182,22 @@ def list_api_keys() -> dict[str, str]:
     keys = _load_api_keys()
     masked = {}
     for provider, key in keys.items():
-        if key and len(key) > 8:
+        if isinstance(key, list):
+            masked_parts = [
+                f"{item[:4]}...{item[-4:]}" if len(item) > 8 else "****"
+                for item in key
+                if item
+            ]
+            if masked_parts:
+                masked[provider] = ", ".join(masked_parts)
+        elif key and len(key) > 8:
             masked[provider] = f"{key[:4]}...{key[-4:]}"
         elif key:
             masked[provider] = "****"
     return masked
 
 
-def _load_api_keys() -> dict[str, str]:
+def _load_api_keys() -> dict[str, str | list[str]]:
     """Load API keys from file."""
     path = _keys_path()
     if not path.exists():

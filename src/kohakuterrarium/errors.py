@@ -89,6 +89,10 @@ class LLMNotConfiguredError(LLMError, ValueError):
     """No usable LLM could be resolved from the available configuration."""
 
 
+class EmptyLLMResponseError(LLMError):
+    """The provider completed without text, a tool call, or structured output."""
+
+
 # ---------------------------------------------------------------------------
 # Sessions
 # ---------------------------------------------------------------------------

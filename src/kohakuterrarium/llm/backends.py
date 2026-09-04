@@ -42,7 +42,13 @@ _BUILTIN_PROVIDER_NAMES: set[str] = {
 }
 
 # Legacy presets sometimes placed transport types in the provider field.
-_LEGACY_BACKEND_TYPE_VALUES: set[str] = {"openai", "codex", "codex-oauth", "anthropic"}
+_LEGACY_BACKEND_TYPE_VALUES: set[str] = {
+    "openai",
+    "openai_responses",
+    "codex",
+    "codex-oauth",
+    "anthropic",
+}
 
 
 def _normalize_backend_type(value: str) -> str:
@@ -239,6 +245,7 @@ def validate_backend_type(backend_type: str) -> str:
     if normalized not in {
         "openai",
         "anthropic",
+        "openai_responses",
         "codex",
         "grok-subscription",
         "google-antigravity",
