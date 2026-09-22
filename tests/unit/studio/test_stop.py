@@ -76,6 +76,39 @@ async def test_end_persists_closed_completed_before_index_flush(tmp_path):
     assert result["meta"]["status"] == "completed"
 
 
+async def test_stop_preserves_graph_manifest_for_resume(tmp_path):
+    engine = (
+        await TestTerrariumBuilder().with_creature("alice").with_creature("bob").build()
+    )
+    service = LocalTerrariumService(engine)
+    session_id = engine.get_creature("alice").graph_id
+    path = tmp_path / "team.kohakutr"
+    store = SessionStore(path)
+    store.init_meta(session_id, "terrarium", "/cfg", str(tmp_path), ["alice", "bob"])
+    engine._session_stores[session_id] = store
+    lifecycle.stores_for(service)[session_id] = store
+    lifecycle.meta_for(service)[session_id] = {"name": "team"}
+
+    try:
+        await stop.stop_session(
+            service,
+            session_id,
+            meta=lifecycle.meta_for(service),
+            session_stores=lifecycle.stores_for(service),
+            mirror_dir=tmp_path / "mirror",
+        )
+        reopened = SessionStore.open_readonly(path)
+        try:
+            manifest = reopened.load_meta().get("live_graph_manifest")
+        finally:
+            reopened.close(update_status=False)
+    finally:
+        await engine.shutdown()
+
+    assert isinstance(manifest, dict)
+    assert {c["name"] for c in manifest["creatures"]} == {"alice", "bob"}
+
+
 @pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
 async def test_teardown_failure_rolls_back_local_marker(tmp_path, error_type):
     engine = await TestTerrariumBuilder().with_creature("alice").build()
