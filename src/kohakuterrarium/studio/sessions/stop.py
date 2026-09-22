@@ -7,6 +7,7 @@ from typing import Any
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.studio.sessions import cluster_fold
 from kohakuterrarium.studio._runtime import host_engine_or_none
+from kohakuterrarium.terrarium import graph_checkpoint as _checkpoint
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -344,11 +345,24 @@ async def stop_session(
 
     try:
         if graph is not None:
-            for creature_id in list(graph.creature_ids):
+            # Persist the final full-graph manifest, then teardown with
+            # checkpoints suppressed so no empty-graph tombstone erases it.
+            checkpoint_graph = getattr(engine, "checkpoint_graph", None)
+            if checkpoint_graph is not None:
                 try:
-                    await engine.remove_creature(creature_id)
-                except KeyError:
-                    pass
+                    await checkpoint_graph(graph)
+                except Exception as exc:
+                    logger.warning(
+                        "Final session manifest checkpoint failed",
+                        session_id=session_id,
+                        error=str(exc),
+                    )
+            with _checkpoint.suppress(engine):
+                for creature_id in list(graph.creature_ids):
+                    try:
+                        await engine.remove_creature(creature_id)
+                    except KeyError:
+                        pass
         else:
             if entry is None or not entry.get("on_node"):
                 raise KeyError(f"session {session_id!r} not found")
