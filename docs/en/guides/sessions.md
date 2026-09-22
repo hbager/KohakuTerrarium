@@ -37,6 +37,18 @@ The format is append-only for event data and versioned through KohakuVault's aut
 
 Compaction changes the live prompt and writes a fast-resume snapshot, but it does not erase the append-only event log. Studio identifies editable user messages with the persisted `event_id`, `turn_index`, and `branch_id`. Save & Rerun and Regenerate rebuild the new branch from the selected message's original event prefix, ignoring compact summaries and snapshots. The previous branch and every later event remain available for branch navigation and resume. If the locator is missing, ambiguous, points to injected mid-turn input, or conflicts with the selected branch, the operation fails without changing history.
 
+### Older session formats
+
+Some older writers recorded canonical messages with event, turn, and branch IDs
+without updating the session format marker. Migration preserves those event logs,
+snapshots, and compaction references rather than translating them again.
+
+If a session mixes canonical history with legacy history, snapshot-only agents,
+or agents with only observability events, migration refuses before creating a
+destination. Duplicate or invalid event IDs also require explicit repair. The
+original session remains intact; migration does not guess new identities or
+automatically repair a previously migrated file.
+
 ## Where sessions live
 
 ```
@@ -335,7 +347,12 @@ How the index stays in sync without manual refresh:
   every file (the *bootstrap* step) and remembers it succeeded.
 - **`?refresh=true`.** Trigger the same incremental reconcile on
   demand; useful right after copying a backup `.kohakutr` into the
-  session directory.
+  session directory. Refreshes are single-flighted: a request that
+  arrives while a scan is already running queues behind it and skips
+  its own pass only once a scan started *after* the request arrived,
+  so a burst of refreshes costs at most two scans and every refresh
+  still reflects the changes that made the client ask.
+  `?full_rescan=true` keeps its force-reread intent and never skips.
 
 The sidecar is safe to delete: the next listing rebuilds it from
 the `.kohakutr` files. Nothing inside the index is unique state.

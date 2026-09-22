@@ -5,10 +5,9 @@ does NOT need a live network service: the profile / preset / backend
 config system, ``api_keys`` storage, the native tool-schema builder, and
 the multimodal ``Message`` / ``ContentPart`` types.
 
-The live provider clients (``openai.py``, ``anthropic_provider.py``,
-``codex_*.py``, ``litellm_provider.py``) are CARVED OUT — they require
-real endpoints. What is exercised here is the abstraction surface that
-``bootstrap/llm.py`` drives before it ever constructs a provider:
+Live endpoint checks are excluded. The multimodal workflow also exercises
+the real OpenAI SDK with in-memory HTTP and loopback WebSocket transports;
+the remaining workflows exercise the abstraction surface that ``bootstrap/llm.py`` drives:
 
     resolve_controller_llm()  -> LLMProfile
     get_api_key()             -> str
@@ -29,12 +28,25 @@ Why these collaborators are real:
     reset so resolution is deterministic with no installed packages.
 """
 
+import base64
+import io
+import json
 from typing import Any
 
+import httpx
 import pytest
+from openai import APIStatusError
+from PIL import Image
+from websockets import serve
 
+from kohakuterrarium.bootstrap.llm import _create_from_profile
+from kohakuterrarium.builtins.tools.grok_image_gen import GrokImageGenTool
+from kohakuterrarium.builtins.tools.read import ReadTool
+from kohakuterrarium.core.conversation import Conversation
 from kohakuterrarium.core.registry import Registry
+from kohakuterrarium.core.tool_output import normalize_tool_result
 from kohakuterrarium.llm import api_keys as ak
+from kohakuterrarium.llm import artifact_resolve
 from kohakuterrarium.llm import backends as backends_mod
 from kohakuterrarium.llm import presets as presets_mod
 from kohakuterrarium.llm.backends import (
@@ -50,6 +62,10 @@ from kohakuterrarium.llm.base import (
     ToolSchema,
 )
 from kohakuterrarium.llm.codex_auth import CodexTokens
+from kohakuterrarium.llm.codex_provider import CodexOAuthProvider
+from kohakuterrarium.llm.grok_auth import GrokToken, GrokTokens
+from kohakuterrarium.llm.grok_image_gen import GrokImageClient
+from kohakuterrarium.llm.grok_media import GrokMediaClient
 from kohakuterrarium.llm.message import (
     AssistantMessage,
     FilePart,
@@ -64,6 +80,7 @@ from kohakuterrarium.llm.message import (
     make_multimodal_content,
     messages_to_dicts,
 )
+from kohakuterrarium.llm.openai import OpenAIProvider
 from kohakuterrarium.llm.presets import iter_all_presets, resolve_alias
 from kohakuterrarium.llm.profile_types import LLMBackend, LLMPreset, LLMProfile
 from kohakuterrarium.llm.profiles import (
@@ -80,6 +97,7 @@ from kohakuterrarium.llm.profiles import (
     save_profile,
     set_default_model,
 )
+from kohakuterrarium.llm.recovery import RetryPolicy
 from kohakuterrarium.llm.tools import build_provider_native_tools, build_tool_schemas
 from kohakuterrarium.llm.variations import (
     apply_patch_map,
@@ -88,7 +106,13 @@ from kohakuterrarium.llm.variations import (
     normalize_variation_selections,
     parse_variation_selector,
 )
-from kohakuterrarium.modules.tool.base import BaseTool, ExecutionMode, ToolResult
+from kohakuterrarium.modules.tool.base import (
+    BaseTool,
+    ExecutionMode,
+    ToolContext,
+    ToolResult,
+)
+from kohakuterrarium.session.store import SessionStore
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -655,6 +679,21 @@ class TestLlmIntegration:
         assert codex_profile.backend_type == "codex"
         # bootstrap/llm.py branches on backend_type == "codex" -> CodexOAuthProvider.
 
+        daybreak_profile = resolve_controller_llm({}, llm="gpt-daybreak-blue-latest")
+        assert daybreak_profile is not None
+        assert daybreak_profile.name == "gpt-daybreak-blue-latest"
+        assert daybreak_profile.model == "gpt-daybreak-blue-latest"
+        assert daybreak_profile.provider == "codex"
+        assert daybreak_profile.backend_type == "codex"
+        assert daybreak_profile.max_context == 1_000_000
+        assert daybreak_profile.max_output == 128_000
+        assert daybreak_profile.reasoning_effort == "medium"
+        daybreak_provider = _create_from_profile(daybreak_profile)
+        assert isinstance(daybreak_provider, CodexOAuthProvider)
+        assert daybreak_provider.model == "gpt-daybreak-blue-latest"
+        assert daybreak_provider.reasoning_effort == "medium"
+        assert daybreak_provider._websocket_mode is False
+
         # 5. A built-in anthropic preset resolves to the anthropic backend.
         claude_profile = resolve_controller_llm({}, llm="anthropic/claude-opus-4.7")
         assert claude_profile is not None
@@ -963,7 +1002,7 @@ class TestLlmIntegration:
         bad_call = NativeToolCall(id="c2", name="read", arguments="{not json")
         assert bad_call.parsed_arguments() == {"_raw": "{not json"}
 
-    async def test_multimodal_message_round_trip_workflow(self):
+    async def test_multimodal_message_round_trip_workflow(self, tmp_path, monkeypatch):
         """Build a full multimodal conversation and assert exact wire shape.
 
         The controller assembles ``Message`` objects (system + multimodal
@@ -1226,6 +1265,431 @@ class TestLlmIntegration:
         # The provider-native metadata the agent-start validator reads.
         assert provider.provider_name == "minimal"
         assert provider.provider_native_tools == frozenset({"image_gen"})
+
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (2, 2), "red").save(image_buffer, format="PNG")
+        image_bytes = image_buffer.getvalue()
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        source = tmp_path / "image%20name.png"
+        source.write_bytes(image_bytes)
+        (tmp_path / "image name.png").write_bytes(b"wrong file")
+        context = ToolContext(agent_name="vision", session=None, working_dir=tmp_path)
+        read_result = await ReadTool().execute({"path": source.name}, context=context)
+        assert read_result.success
+        file_reference = read_result.output[1].url
+        assert file_reference == source.resolve().as_uri()
+
+        requests = []
+
+        def respond(request):
+            requests.append((request.url.path, json.loads(request.content)))
+            return httpx.Response(
+                200, json={"data": [{"b64_json": encoded, "mime_type": "image/png"}]}
+            )
+
+        async def no_refresh(**kwargs):
+            return None
+
+        monkeypatch.setattr(GrokTokens, "ensure_fresh_cli", no_refresh)
+        monkeypatch.setattr(
+            GrokTokens,
+            "load_candidates",
+            lambda: [GrokToken(access_token="test", source="test")],
+        )
+        monkeypatch.setattr(artifact_resolve, "_session_dir", lambda: tmp_path)
+        media = GrokMediaClient(transport=httpx.MockTransport(respond))
+        tool = GrokImageGenTool(client=GrokImageClient(media=media))
+        generated = await tool.execute({"prompt": "a red square"})
+        assert generated.success
+        store = SessionStore(tmp_path / "media.kohakutr")
+        try:
+            normalized, _ = normalize_tool_result(
+                tool, generated, max_output=0, artifact_store=store
+            )
+            artifact_reference = normalized.output[0].url
+            assert artifact_reference.startswith("/api/sessions/media/artifacts/")
+            for reference in (file_reference, artifact_reference):
+                edited = await tool.execute(
+                    {"prompt": "add a border", "action": "edit", "image_url": reference}
+                )
+                assert edited.success
+                assert edited.output[0].url == f"data:image/png;base64,{encoded}"
+                assert requests[-1][0] == "/v1/images/edits"
+                assert requests[-1][1]["image"] == {
+                    "url": f"data:image/png;base64,{encoded}",
+                    "type": "image_url",
+                }
+
+            missing_reference = (tmp_path / "missing.png").as_uri()
+            chat_messages = [
+                UserMessage(
+                    [
+                        TextPart("Compare these images"),
+                        ImagePart(url=file_reference),
+                        ImagePart(url=artifact_reference),
+                        ImagePart(url=missing_reference),
+                    ]
+                )
+            ]
+            original_wire = messages_to_dicts(chat_messages)
+            chat_requests = []
+
+            def chat_response(request):
+                chat_requests.append(json.loads(request.content))
+                if len(chat_requests) <= 2:
+                    message = (
+                        "Cannot load local files without --allowed-local-media-path"
+                        if len(chat_requests) == 1
+                        else "temporary outage"
+                    )
+                    return httpx.Response(
+                        500 if len(chat_requests) == 1 else 503,
+                        json={"error": {"message": message}},
+                        headers={"retry-after-ms": "1"},
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "comparison",
+                        "model": "test",
+                        "created": 0,
+                        "object": "chat.completion",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": "same red square",
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    },
+                )
+
+            async with OpenAIProvider(
+                api_key="test-key",
+                model="test",
+                retry_policy=RetryPolicy(max_retries=1, base_delay=0, jitter=0),
+            ) as chat_provider:
+                initial_client = chat_provider._client
+                chat_provider._client = initial_client.with_options(
+                    http_client=httpx.AsyncClient(
+                        transport=httpx.MockTransport(chat_response)
+                    )
+                )
+                await initial_client.close()
+                with pytest.raises(APIStatusError, match="allowed-local-media-path"):
+                    await chat_provider.chat_complete(chat_messages)
+                assert len(chat_requests) == 1
+                response = await chat_provider.chat_complete(chat_messages)
+                assert response.content == "same red square"
+                assert len(chat_requests) == 3
+                assert chat_requests[0] == chat_requests[1] == chat_requests[2]
+                sent_parts = chat_requests[0]["messages"][0]["content"]
+                assert len(sent_parts) == 3
+                assert [part["image_url"]["url"] for part in sent_parts[1:]] == [
+                    f"data:image/png;base64,{encoded}",
+                    f"data:image/png;base64,{encoded}",
+                ]
+                assert messages_to_dicts(chat_messages) == original_wire
+        finally:
+            store.close()
+        assert len(requests) == 3
+
+        responses_requests = []
+        reasoning_item = {
+            "type": "reasoning",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "Inspect the file first."}],
+        }
+        call_item = {
+            "type": "function_call",
+            "call_id": "read1",
+            "name": "read",
+            "arguments": json.dumps({"path": source.name}),
+        }
+        call_items = [call_item, {**call_item, "call_id": "read2"}]
+
+        def responses_response(request):
+            body = json.loads(request.content)
+            assert request.url.path == "/v1/responses"
+            assert body["model"] in {
+                "slurm/ds",
+                "kimi-k2",
+                "glm-5",
+                "deepseek-flash",
+                "gpt-6-astra",
+            }
+            assert "responses_reasoning_replay" not in body
+            assert body["tools"][0]["name"] == "read"
+            responses_requests.append(body)
+            if len(responses_requests) == 1:
+                events = [
+                    {
+                        "type": "response.reasoning_text.delta",
+                        "item_id": "think1",
+                        "delta": "Inspect ",
+                    },
+                    {
+                        "type": "response.reasoning_text.done",
+                        "item_id": "think1",
+                        "text": "Inspect the file first.",
+                    },
+                    {
+                        "type": "response.output_item.done",
+                        "item": {"id": "think1", **reasoning_item},
+                    },
+                    *[
+                        {"type": "response.output_item.done", "item": item}
+                        for item in call_items
+                    ],
+                ]
+            else:
+                expected = (
+                    [reasoning_item, *call_items]
+                    if body["model"] != "gpt-6-astra"
+                    else call_items
+                )
+                output_offset = 1 + len(expected)
+                assert body["input"][1:output_offset] == expected
+                for item, call_id in zip(
+                    body["input"][output_offset : output_offset + 2], ("read1", "read2")
+                ):
+                    assert item["type"] == "function_call_output"
+                    assert item["call_id"] == call_id
+                    assert (
+                        item["output"][1]["image_url"]
+                        == f"data:image/png;base64,{encoded}"
+                    )
+                events = [
+                    {"type": "response.output_text.delta", "delta": "A red square."}
+                ]
+            events.append(
+                {
+                    "type": "response.completed",
+                    "response": {"id": "response1", "output": []},
+                }
+            )
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                content="".join(
+                    f"event: {event['type']}\ndata: {json.dumps(event)}\n\n"
+                    for event in events
+                ),
+            )
+
+        responses_provider = CodexOAuthProvider(
+            model="slurm/ds",
+            api_key="test-key",
+            base_url="https://responses.test/v1",
+            extra_body={"responses_reasoning_replay": True},
+        )
+        await responses_provider.ensure_authenticated()
+        initial_client = responses_provider._client
+        responses_provider._client = initial_client.with_options(
+            http_client=httpx.AsyncClient(
+                transport=httpx.MockTransport(responses_response)
+            )
+        )
+        await initial_client.close()
+        try:
+            read_tool = ReadTool()
+            read_registry = Registry()
+            read_registry.register_tool(read_tool)
+            response_tools = build_tool_schemas(read_registry)
+            conversation = Conversation()
+            conversation.append("user", "Inspect the file")
+            first = await responses_provider.chat_complete(
+                conversation.to_messages(), tools=response_tools
+            )
+            assert first.content == ""
+            calls = responses_provider.last_tool_calls
+            assert [(call.id, call.name) for call in calls] == [
+                ("read1", "read"),
+                ("read2", "read"),
+            ]
+            conversation.append(
+                "assistant",
+                first.content,
+                extra_fields=responses_provider.last_assistant_extra_fields,
+                tool_calls=[
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": call.arguments,
+                        },
+                    }
+                    for call in calls
+                ],
+            )
+            for call in calls:
+                result = await read_tool.execute(
+                    call.parsed_arguments(), context=context
+                )
+                assert result.success
+                conversation.append("tool", result.output, tool_call_id=call.id)
+            second = await responses_provider.chat_complete(
+                conversation.to_messages(), tools=response_tools
+            )
+            assert second.content == "A red square."
+            conversation.append("assistant", second.content)
+            session_path = tmp_path / "reasoning.kohakutr"
+            reasoning_store = SessionStore(session_path)
+            try:
+                reasoning_store.save_conversation("reader", conversation.to_messages())
+            finally:
+                reasoning_store.close()
+            reasoning_store = SessionStore(session_path)
+            try:
+                restored = Conversation()
+                for message in dicts_to_messages(
+                    reasoning_store.load_conversation("reader")
+                ):
+                    restored.append_message(message)
+            finally:
+                reasoning_store.close()
+            restored.append("user", "Continue")
+            third = await responses_provider.chat_complete(
+                restored.to_messages(), tools=response_tools
+            )
+            assert third.content == "A red square."
+            assert len(responses_requests) == 3
+            assert responses_requests[2]["input"][-1]["content"] == [
+                {"type": "input_text", "text": "Continue"}
+            ]
+            saved_history = restored.to_messages()
+            codex = responses_provider.with_model("gpt-6-astra")
+            codex.extra_body["responses_reasoning_replay"] = False
+            switched = await codex.chat_complete(
+                restored.to_messages(), tools=response_tools
+            )
+            assert switched.content == "A red square."
+            assert restored.to_messages() == saved_history
+            switched_back = await responses_provider.chat_complete(
+                restored.to_messages(), tools=response_tools
+            )
+            assert switched_back.content == "A red square."
+            assert [request["model"] for request in responses_requests[-2:]] == [
+                "gpt-6-astra",
+                "slurm/ds",
+            ]
+            edited = restored.to_messages()
+            edited[1]["reasoning_content"] = "Recheck the saved image."
+            reasoning_item["content"][0]["text"] = "Recheck the saved image."
+            for target in ("slurm/ds", "kimi-k2", "glm-5", "deepseek-flash"):
+                alias = responses_provider.with_model(target)
+                if target == "deepseek-flash":
+                    alias.extra_body.pop("responses_reasoning_replay")
+                reply = await alias.chat_complete(edited, tools=response_tools)
+                assert reply.content == "A red square."
+                assert responses_requests[-1]["input"][1] == reasoning_item
+            assert restored.to_messages() == saved_history
+        finally:
+            await responses_provider.close()
+
+        large_text = "x" * (1024 * 1024 + 1)
+        ws_submissions = []
+
+        async def ws_response(socket):
+            for turn in range(2):
+                ws_submissions.append(json.loads(await socket.recv()))
+                text = large_text if turn == 0 else "continued"
+                response_id = f"ws-response-{turn}"
+                for offset in range(0, len(text), 512 * 1024):
+                    await socket.send(
+                        json.dumps(
+                            {
+                                "type": "response.output_text.delta",
+                                "delta": text[offset : offset + 512 * 1024],
+                            }
+                        )
+                    )
+                await socket.send(
+                    json.dumps(
+                        {
+                            "type": "response.completed",
+                            "response": {
+                                "id": response_id,
+                                "output": [
+                                    {
+                                        "type": "message",
+                                        "role": "assistant",
+                                        "content": [
+                                            {"type": "output_text", "text": text}
+                                        ],
+                                    }
+                                ],
+                            },
+                        }
+                    )
+                )
+            await socket.wait_closed()
+
+        async with serve(ws_response, "127.0.0.1", 0) as server:
+            port = server.sockets[0].getsockname()[1]
+            for provider_type in (OpenAIProvider, CodexOAuthProvider):
+                ws_submissions.clear()
+                ws_provider = provider_type(
+                    api_key="test",
+                    model="vision",
+                    base_url=f"http://127.0.0.1:{port}/v1",
+                    extra_body={
+                        "websocket_mode": True,
+                        "websocket_connection_options": {
+                            "max_queue": 1,
+                            "ping_timeout": None,
+                            "compression": None,
+                        },
+                    },
+                )
+                ws_history = messages_to_dicts(
+                    [UserMessage([TextPart("Inspect"), ImagePart(url=file_reference)])]
+                )
+                try:
+                    if isinstance(ws_provider, CodexOAuthProvider):
+                        await ws_provider.ensure_authenticated()
+                    if not hasattr(ws_provider._client.responses, "connect"):
+                        continue
+                    chunks = [
+                        chunk
+                        async for chunk in ws_provider.chat(
+                            ws_history,
+                            extra_body={
+                                "websocket_connection_options": {"max_size": 1}
+                            },
+                        )
+                    ]
+                    assert "".join(chunks) == large_text
+                    assert "websocket_connection_options" not in ws_submissions[0]
+                    assert ws_submissions[0]["input"][0]["content"] == [
+                        {"type": "input_text", "text": "Inspect"},
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:image/png;base64,{encoded}",
+                        },
+                    ]
+                    ws_history.extend(
+                        [
+                            {"role": "assistant", "content": large_text},
+                            {"role": "user", "content": "Continue"},
+                        ]
+                    )
+                    chunks = [chunk async for chunk in ws_provider.chat(ws_history)]
+                    assert chunks == ["continued"]
+                    assert len(ws_submissions) == 2
+                    assert ws_submissions[1]["previous_response_id"] == "ws-response-0"
+                    assert ws_submissions[1]["input"] == [
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Continue"}],
+                        }
+                    ]
+                finally:
+                    await ws_provider.close()
 
     def test_api_key_storage_and_resolution_workflow(self):
         """Store + retrieve an API key, then assert the resolver override.

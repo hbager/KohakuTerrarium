@@ -29,7 +29,6 @@ from kohakuterrarium.llm.recovery import (
     RetryPolicy,
     backoff_delay,
     classify_openai_error,
-    drop_last_tool_round,
 )
 from kohakuterrarium.utils.logging import get_logger
 

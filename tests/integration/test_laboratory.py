@@ -44,6 +44,7 @@ from kohakuterrarium.llm.api_keys import (
     register_api_key_resolver,
 )
 from kohakuterrarium.studio.nodes import NodeMap
+from kohakuterrarium.studio.catalog.packages import install_package_op
 from kohakuterrarium.terrarium import Terrarium
 from kohakuterrarium.terrarium.drive.config import (
     DriveRuntimeConfig,
@@ -165,7 +166,13 @@ class TestLaboratoryMultiNodeService:
         not a shape check.
         """
         monkeypatch.setenv("KT_SESSION_DIR", str(tmp_path / "sessions"))
-        cfg_alpha = _write_creature_config(tmp_path, "alpha")
+        package_source = tmp_path / "workflow-biome"
+        cfg_alpha = _write_creature_config(package_source, "alpha")
+        (package_source / "kohaku.yaml").write_text(
+            "name: workflow-biome\nversion: 1.0.0\ncreatures: [creature_alpha]\n",
+            encoding="utf-8",
+        )
+        install_package_op(str(package_source), editable=True, deps="never")
         cfg_bravo = _write_creature_config(tmp_path, "bravo")
 
         # ── 1. Start the host (no local creatures) + the multi-node service ──
@@ -290,10 +297,49 @@ class TestLaboratoryMultiNodeService:
             # ── 5. add_creature on w1 (path-form via studio.deploy) ──
             from kohakuterrarium.core.config import load_agent_config
 
-            a_cfg = load_agent_config(cfg_alpha)
-            alpha_info = await service.add_creature(a_cfg, on_node="w1", start=True)
+            with pytest.raises(KeyError, match="Package not installed"):
+                await service.add_creature("@missing/creatures/general", on_node="w1")
+            alpha_info = await service.add_creature(
+                "@workflow-biome/creature_alpha", on_node="w1", start=True
+            )
             assert alpha_info.creature_id
             assert alpha_info.is_running is True
+            alpha = w1_engine.get_creature(alpha_info.creature_id)
+            paging_store = w1_engine._session_stores[alpha.graph_id]
+            for index in range(4):
+                paging_store.append_event(
+                    alpha.name, "text", {"content": f"page-{index}"}
+                )
+            tail = await service.chat_history_page(alpha_info.creature_id, limit=2)
+            assert [row["content"] for row in tail["events"]] == ["page-2", "page-3"]
+            assert tail["messages"] == []
+            older = await service.chat_history_page(
+                alpha_info.creature_id,
+                limit=2,
+                before=tail["history_page"]["before"],
+                history_id=tail["history_page"]["history_id"],
+                stream="events",
+            )
+            assert [row["content"] for row in older["events"]] == ["page-0", "page-1"]
+            newer = await service.chat_history_page(
+                alpha_info.creature_id,
+                limit=2,
+                after=older["history_page"]["after"],
+                history_id=older["history_page"]["history_id"],
+                stream="events",
+            )
+            assert newer["events"] == tail["events"]
+            detail = await service.chat_history_detail(
+                alpha_info.creature_id,
+                stream="events",
+                ref=tail["history_page"]["after"],
+                history_id=tail["history_page"]["history_id"],
+            )
+            assert detail["record"] == tail["events"][-1]
+            with pytest.raises(ValueError):
+                await service.chat_history_page(
+                    alpha_info.creature_id, before="malformed"
+                )
 
             b_cfg = load_agent_config(cfg_bravo)
             bravo_info = await service.add_creature(b_cfg, on_node="w2", start=True)

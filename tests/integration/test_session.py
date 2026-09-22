@@ -37,6 +37,11 @@ from kohakuterrarium.session.errors import (
     NotAttachedError,
 )
 from kohakuterrarium.session.session import Session
+from kohakuterrarium.session.history_records import (
+    history_detail,
+    history_page,
+)
+
 from kohakuterrarium.session.history import (
     collect_branch_metadata,
     collect_user_groups,
@@ -51,6 +56,8 @@ from kohakuterrarium.session.migrations import (
     migration_marker,
     path_for_version,
 )
+from kohakuterrarium.session.readonly import read_session_meta
+from kohakuterrarium.session.raw_history import UserMessageSelector
 from kohakuterrarium.session.resume import detect_session_type, resume_agent
 from kohakuterrarium.session.store import SessionStore
 from kohakuterrarium.session.version import FORMAT_VERSION, detect_format_version
@@ -423,11 +430,142 @@ class TestSessionIntegration:
         assert store.load_triggers("nobody") == []
         assert await agent.remove_trigger(hb_id) is True
         assert [t["trigger_id"] for t in store.load_triggers("scribe")] == [t2_id]
+
+        # ── History paging + detail over the shared session pager ─────
+        # The runtime writes raw physical event + channel records; the
+        # shared ``session.history_records`` pager returns bounded,
+        # cursor-driven pages over those exact records (the same backend
+        # the live/saved HTTP routes expose).
+        sid = session_path.stem
+        page = history_page(store, "scribe", session_id=sid, stream="events", limit=5)
+        page_hp = page["history_page"]
+        assert page_hp["version"] == 1
+        assert page_hp["stream"] == "events"
+        assert page_hp["history_id"] and len(page_hp["history_id"]) == 16
+        assert page["messages"] == []
+        assert page["events"]
+        page_keys = [e["_history_key"] for e in page["events"]]
+        assert all(k.startswith("events:") for k in page_keys)
+
+        # ``before`` walks older; ``after`` walks newer — the two pages
+        # stitch into one contiguous span without holes or duplicates.
+        older_page = history_page(
+            store,
+            "scribe",
+            session_id=sid,
+            stream="events",
+            limit=5,
+            before=page_hp["before"],
+            history_id=page_hp["history_id"],
+        )
+        assert older_page["history_page"]["history_id"] == page_hp["history_id"]
+        older_keys = [e["_history_key"] for e in older_page["events"]]
+        assert older_keys and older_keys != page_keys
+        assert set(older_keys).isdisjoint(set(page_keys))
+        back_page = history_page(
+            store,
+            "scribe",
+            session_id=sid,
+            stream="events",
+            limit=5,
+            after=older_page["history_page"]["after"],
+            history_id=older_page["history_page"]["history_id"],
+        )
+        assert [e["_history_key"] for e in back_page["events"]] == page_keys
+
+        # A stale history identity signals a reset, never a wrong payload.
+        stale_page = history_page(
+            store,
+            "scribe",
+            session_id=sid,
+            stream="events",
+            limit=5,
+            before=page_hp["before"],
+            history_id="0000000000000000",
+        )
+        assert stale_page["history_page"]["reset_required"] is True
+        assert stale_page["events"] == []
+
+        # Channel records page the ``channel`` stream with their own
+        # physical identity (no invented event id) and stable cursors.
+        chan = history_page(
+            store, "ch:broadcast", session_id=sid, stream="channel", limit=1
+        )
+        chan_hp = chan["history_page"]
+        assert chan_hp["stream"] == "channel"
+        assert chan_hp["has_older"] is True
+        assert len(chan["messages"]) == 1
+        chan_older = history_page(
+            store,
+            "ch:broadcast",
+            session_id=sid,
+            stream="channel",
+            limit=1,
+            before=chan_hp["before"],
+            history_id=chan_hp["history_id"],
+        )
+        assert len(chan_older["messages"]) == 1
+        assert chan_older["messages"] != chan["messages"]
+
+        # Detail resolves the full raw record behind an opaque ref cursor,
+        # returning the identical ``_history_key`` for both streams.
+        detail = history_detail(
+            store,
+            "scribe",
+            session_id=sid,
+            stream="events",
+            ref=page_hp["after"],
+            history_id=page_hp["history_id"],
+        )
+        assert detail["record"]["_history_key"] == page_keys[-1]
+        assert detail["history_page"]["version"] == 1
+        assert detail["history_page"]["stream"] == "events"
+        assert detail["history_page"]["history_id"] == page_hp["history_id"]
+        chan_detail = history_detail(
+            store,
+            "ch:broadcast",
+            session_id=sid,
+            stream="channel",
+            ref=chan_hp["after"],
+            history_id=chan_hp["history_id"],
+        )
+        assert (
+            chan_detail["record"]["_history_key"]
+            == chan["messages"][-1]["_history_key"]
+        )
+
+        # A store that never streamed physical events keeps its history
+        # ONLY in the conversation snapshot; the default ``events`` page
+        # falls back to the ``snapshot`` stream rather than returning an
+        # empty window or fabricating event ids for legacy sessions.
+        snap_dir = tmp_path / "snapper"
+        snap_dir.mkdir()
+        snap_path = snap_dir / "snapper.kohakutr.v2"
+        snap_store = _new_store(snap_path, config_path=config_path, agents=["snapper"])
+        snap_store.save_conversation(
+            "snapper",
+            [
+                {"role": "user", "content": "snapshot question"},
+                {"role": "assistant", "content": "snapshot answer"},
+            ],
+        )
+        snap_page = history_page(
+            snap_store, "snapper", session_id=snap_path.stem, stream="events"
+        )
+        assert snap_page["history_page"]["stream"] == "snapshot"
+        assert snap_page["messages"] and not snap_page["events"]
+        snap_store.close()
         store.close()
 
         # ---- version probe + session-type detection on the closed file ----
         # detect_format_version reads the stamped version off disk.
         assert detect_format_version(session_path) == FORMAT_VERSION
+        source_bytes = session_path.read_bytes()
+        source_mtime = session_path.stat().st_mtime_ns
+        assert detect_format_version(session_path.as_uri()) == FORMAT_VERSION
+        assert read_session_meta(session_path.as_uri())["agents"] == ["scribe"]
+        assert session_path.read_bytes() == source_bytes
+        assert session_path.stat().st_mtime_ns == source_mtime
         # A missing path is a hard FileNotFoundError, not a silent 1.
         with pytest.raises(FileNotFoundError):
             detect_format_version(tmp_path / "nope.kohakutr.v2")
@@ -1229,6 +1367,44 @@ class TestSessionIntegration:
         finally:
             resumed_store.close()
 
+        # Structured events existed before the format marker. Migrating such a
+        # recording must preserve the canonical edit target, then permit a real
+        # rerun after resume rather than reject colliding event identifiers.
+        structured_path = tmp_path / "structured.kohakutr"
+        structured = _new_store(
+            structured_path, config_path=config_path, agents=["legacy"]
+        )
+        recording_agent = Agent.from_path(config_path)
+        recording_agent.attach_session_store(structured)
+        await recording_agent.start()
+        try:
+            await recording_agent._process_event(create_user_input_event("original"))
+        finally:
+            await recording_agent.stop()
+        recorded = structured.get_events("legacy")
+        target = next(event for event in recorded if event["type"] == "user_message")
+        del structured.meta["format_version"]
+        structured.close()
+        restored, restored_store = resume_agent(structured_path)
+        try:
+            assert restored_store.get_events("legacy") == recorded
+            await restored.start()
+            assert await restored.edit_and_rerun(
+                0,
+                "edited after migration",
+                target=UserMessageSelector(
+                    target["event_id"], target["turn_index"], target["branch_id"]
+                ),
+            )
+            messages = restored.controller.conversation.to_messages()
+            assert [m["content"] for m in messages if m["role"] == "user"] == [
+                "edited after migration"
+            ]
+            assert any(m["role"] == "assistant" for m in messages)
+        finally:
+            await restored.stop()
+            restored_store.close()
+
         # ---- the snapshot-fallback migration path ----
         # A v1 session that never streamed events: its history lives
         # ONLY in the conversation snapshot. The migrator must fall back
@@ -1253,6 +1429,25 @@ class TestSessionIntegration:
             ],
         )
         snap_v1.flush()
+        # This snapshot-only store has NO physical event records, so the
+        # shared history pager's initial ``events`` request falls back to
+        # the ``snapshot`` stream (contract: ``paged=true`` default events
+        # falls back to snapshot when there are no physical events and no
+        # cursor/history_id). The snapshot page carries the conversation as
+        # ``messages`` with physical ``_history_key`` identity, never as
+        # synthetic ``events``.
+        fallback = history_page(
+            snap_v1,
+            "legacy",
+            session_id="snaponly",
+            stream="events",
+            limit=10,
+            envelope={"target": "legacy", "session_name": "snaponly"},
+        )
+        assert fallback["history_page"]["stream"] == "snapshot"
+        assert fallback["events"] == []
+        assert len(fallback["messages"]) >= 2
+        assert all("_history_key" in m for m in fallback["messages"])
         snap_v1.close()
 
         snap_migrated_path = ensure_latest_version(snap_v1_path)

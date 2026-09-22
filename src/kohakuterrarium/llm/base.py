@@ -294,13 +294,19 @@ class BaseLLMProvider:
         normalized = self._normalize_messages(messages)
 
         if stream:
-            async for chunk in self._stream_chat_with_empty_retry(
+            provider_stream = self._stream_chat_with_empty_retry(
                 normalized,
                 tools=tools,
                 provider_native_tools=provider_native_tools,
                 **kwargs,
-            ):
-                yield chunk
+            )
+            try:
+                async for chunk in provider_stream:
+                    yield chunk
+            finally:
+                close = getattr(provider_stream, "aclose", None)
+                if close is not None:
+                    await close()
         else:
             response = await self._complete_chat_with_empty_retry(normalized, **kwargs)
             yield response.content
@@ -356,20 +362,26 @@ class BaseLLMProvider:
             self._reset_attempt_state()
             pending: list[str] = []
             saw_text = False
-            async for chunk in self._stream_chat(
+            raw = self._stream_chat(
                 messages,
                 tools=tools,
                 provider_native_tools=provider_native_tools,
                 **kwargs,
-            ):
-                if saw_text:
-                    yield chunk
-                    continue
-                pending.append(chunk)
-                if chunk and str(chunk).strip():
-                    saw_text = True
-                    for item in pending:
-                        yield item
+            )
+            try:
+                async for chunk in raw:
+                    if saw_text:
+                        yield chunk
+                        continue
+                    pending.append(chunk)
+                    if chunk and str(chunk).strip():
+                        saw_text = True
+                        for item in pending:
+                            yield item
+            finally:
+                close = getattr(raw, "aclose", None)
+                if close is not None:
+                    await close()
             if saw_text or not self._is_empty_response(""):
                 return
             if (

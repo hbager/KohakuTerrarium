@@ -8,7 +8,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from kohakuterrarium.builtin_skills import get_builtin_tool_doc
+from kohakuterrarium.modules.tool.media_policy import MediaPolicy
 from kohakuterrarium.modules.tool.runtime_options import validate_tool_options
+from kohakuterrarium.utils.fs_path import coerce_fs_path
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -62,7 +64,7 @@ class ToolContext:
 
     def resolve_path(self, path_str: str) -> Path:
         """Resolve relative paths against the agent directory, not process cwd."""
-        p = Path(path_str).expanduser()
+        p = coerce_fs_path(path_str)
         if not p.is_absolute():
             return (self.working_dir / p).resolve()
         return p.resolve()
@@ -77,7 +79,7 @@ def resolve_tool_path(path_str: str, context: ToolContext | None = None) -> Path
     """Resolve a path against agent context when one is available."""
     if context:
         return context.resolve_path(path_str)
-    return Path(path_str).expanduser().resolve()
+    return coerce_fs_path(path_str).resolve()
 
 
 def has_interactive_responder(router: Any) -> bool:
@@ -179,6 +181,10 @@ class BaseTool:
 
     # False drops the ``run_in_background`` argument from this tool's schema.
     supports_background: bool = False
+
+    # How inline media in results is transported and shown; a result may
+    # override it through ``ToolResult.metadata["media_policy"]``.
+    media_policy: MediaPolicy = MediaPolicy()
 
     # Buckets order prompt contributions; names remain alphabetical within each bucket.
     prompt_contribution_bucket: str = "normal"
