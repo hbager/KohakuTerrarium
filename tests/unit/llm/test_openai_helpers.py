@@ -14,6 +14,7 @@ from kohakuterrarium.llm.openai_helpers import (
     extract_usage,
     log_token_usage,
     merge_reasoning_detail_stream,
+    normalize_assistant_tool_call_content,
     normalize_stateful_assistant_fields,
     pack_reasoning_fields,
     tool_call_from_pending,
@@ -191,6 +192,54 @@ class TestNormalizeStatefulAssistantFields:
         out = normalize_stateful_assistant_fields(messages)
         # only one assistant msg, field already present → nothing changed
         assert out is messages
+
+
+class TestNormalizeAssistantToolCallContent:
+    def test_empty_content_with_tool_calls_becomes_none(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "click", "arguments": "{}"},
+                    }
+                ],
+            },
+        ]
+        out = normalize_assistant_tool_call_content(messages)
+        assert out[0]["content"] is None
+        assert out[0]["tool_calls"] == messages[0]["tool_calls"]
+
+    def test_input_list_not_mutated(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "c1"}],
+            },
+        ]
+        normalize_assistant_tool_call_content(messages)
+        assert messages[0]["content"] == ""
+
+    def test_nonempty_content_untouched(self):
+        messages = [
+            {"role": "assistant", "content": "working", "tool_calls": [{"id": "c1"}]}
+        ]
+        assert normalize_assistant_tool_call_content(messages) is messages
+
+    def test_empty_content_without_tool_calls_untouched(self):
+        messages = [{"role": "assistant", "content": ""}]
+        assert normalize_assistant_tool_call_content(messages) is messages
+
+    def test_user_and_tool_messages_untouched(self):
+        messages = [
+            {"role": "user", "content": ""},
+            {"role": "tool", "content": "", "tool_call_id": "c1"},
+        ]
+        assert normalize_assistant_tool_call_content(messages) is messages
 
 
 class TestToolCallConverters:
