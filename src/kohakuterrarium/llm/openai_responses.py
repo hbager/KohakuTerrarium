@@ -30,6 +30,8 @@ from kohakuterrarium.llm.recovery import (
     backoff_delay,
     classify_openai_error,
 )
+from kohakuterrarium.llm.responses_reasoning import ResponsesReasoningCollector
+from kohakuterrarium.llm.responses_ws_options import FRAMEWORK_KNOBS
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
@@ -85,6 +87,8 @@ class OpenAIResponsesProvider(BaseLLMProvider):
         self._last_usage: dict[str, int] = {}
         self._last_tool_calls: list[NativeToolCall] = []
         self._last_assistant_parts: list[Any] = []
+        self._reasoning = ResponsesReasoningCollector()
+        self._last_assistant_extra_fields: dict[str, Any] = {}
         self.prompt_cache_key: str | None = None
 
         if not api_key_for_client:
@@ -222,9 +226,34 @@ class OpenAIResponsesProvider(BaseLLMProvider):
             error=str(exc),
         )
 
+    def _materialize_summary_reasoning(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Promote summary-only reasoning to replayable reasoning_content.
+
+        Some Responses gateways expose thinking-mode output only as reasoning
+        summaries; their upstreams then require that text to be passed back.
+        """
+        out: list[dict[str, Any]] = []
+        for msg in messages:
+            if (
+                msg.get("role") == "assistant"
+                and msg.get("reasoning_summary")
+                and not msg.get("reasoning_content")
+            ):
+                out.append(
+                    {
+                        **msg,
+                        "reasoning_content": msg["reasoning_summary"],
+                    }
+                )
+            else:
+                out.append(msg)
+        return out
+
     def _sanitize_extra_body(self, extra: dict[str, Any]) -> dict[str, Any]:
         """Drop KT-internal knobs that are not Responses API fields."""
-        return {k: v for k, v in extra.items() if k != "disable_prompt_caching"}
+        return {k: v for k, v in extra.items() if k not in FRAMEWORK_KNOBS}
 
     def _split_instructions(
         self, messages: list[dict[str, Any]]
@@ -258,7 +287,22 @@ class OpenAIResponsesProvider(BaseLLMProvider):
     ) -> dict[str, Any]:
         cleaned_messages = strip_kt_extras(messages)
         instructions, input_messages = self._split_instructions(cleaned_messages)
-        api_input = fix_tool_call_pairing(to_responses_input(input_messages))
+        model = kwargs.get("model", self.model or self.config.model)
+        replay_override = self.extra_body.get("responses_reasoning_replay")
+        replay = (
+            replay_override
+            if isinstance(replay_override, bool)
+            else model.lower().startswith(("deepseek-", "deepseek/"))
+        )
+        if replay:
+            input_messages = self._materialize_summary_reasoning(input_messages)
+        api_input = fix_tool_call_pairing(
+            to_responses_input(
+                input_messages,
+                model=model,
+                replay_reasoning=replay_override,
+            )
+        )
 
         api_tools: list[dict[str, Any]] | None = None
         if tools:
@@ -273,7 +317,7 @@ class OpenAIResponsesProvider(BaseLLMProvider):
             ]
 
         create_kwargs: dict[str, Any] = {
-            "model": kwargs.get("model", self.model or self.config.model),
+            "model": model,
             "input": api_input,
             "store": False,
             "stream": stream,
@@ -393,6 +437,8 @@ class OpenAIResponsesProvider(BaseLLMProvider):
         self._last_tool_calls = []
         self._last_usage = {}
         self._last_assistant_parts = []
+        self._reasoning = ResponsesReasoningCollector()
+        self._last_assistant_extra_fields = {}
         create_kwargs = self._build_create_kwargs(
             messages, stream=True, tools=tools, **kwargs
         )
@@ -400,15 +446,20 @@ class OpenAIResponsesProvider(BaseLLMProvider):
         collected_tool_calls: list[NativeToolCall] = []
 
         async for event in stream:
+            self._reasoning.consume(event)
             event_type = getattr(event, "type", "")
             if event_type == "response.output_text.delta":
-                yield strip_surrogates(getattr(event, "delta", "") or "")
+                piece = strip_surrogates(getattr(event, "delta", "") or "")
+                self._reasoning.consume_output_text(piece)
+                yield piece
             elif event_type == "response.output_item.done":
                 item = getattr(event, "item", None)
                 if getattr(item, "type", "") == "function_call":
+                    call_id = getattr(item, "call_id", "") or ""
+                    self._reasoning.consume_function_call(call_id)
                     collected_tool_calls.append(
                         NativeToolCall(
-                            id=getattr(item, "call_id", "") or "",
+                            id=call_id,
                             name=getattr(item, "name", "") or "",
                             arguments=getattr(item, "arguments", "") or "",
                         )
@@ -417,6 +468,7 @@ class OpenAIResponsesProvider(BaseLLMProvider):
                 resp = getattr(event, "response", None)
                 self._capture_usage(resp)
 
+        self._last_assistant_extra_fields = self._reasoning.fields()
         self._last_tool_calls = collected_tool_calls
 
     async def _complete_chat(
@@ -472,6 +524,7 @@ class OpenAIResponsesProvider(BaseLLMProvider):
         response = await self._client.responses.create(**create_kwargs)
         self._capture_usage(response)
         self._capture_tool_calls_from_response(response)
+        self._capture_reasoning_from_response(response)
         content = self._response_output_text(response)
         status = getattr(response, "status", None) or "completed"
         model = getattr(response, "model", None) or self.model
@@ -481,6 +534,14 @@ class OpenAIResponsesProvider(BaseLLMProvider):
             usage=self._last_usage,
             model=model,
         )
+
+    def _capture_reasoning_from_response(self, response: Any) -> None:
+        """Fold completed reasoning output items into persistence fields."""
+        self._reasoning = ResponsesReasoningCollector()
+        for item in getattr(response, "output", None) or []:
+            if getattr(item, "type", "") == "reasoning":
+                self._reasoning.consume_item(item)
+        self._last_assistant_extra_fields = self._reasoning.fields()
 
     def _capture_usage(self, response: Any) -> None:
         if response is None:
