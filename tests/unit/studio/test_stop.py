@@ -109,6 +109,72 @@ async def test_stop_preserves_graph_manifest_for_resume(tmp_path):
     assert {c["name"] for c in manifest["creatures"]} == {"alice", "bob"}
 
 
+class _HubFirstIds(set):
+    """Iterate "hub" first so teardown deterministically splits the graph."""
+
+    def __iter__(self):
+        return iter(sorted(super().__iter__()))
+
+
+async def test_stop_does_not_mint_split_session_copies(tmp_path):
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+    engine = (
+        await TestTerrariumBuilder()
+        .with_creature("hub")
+        .with_creature("leaf-a")
+        .with_creature("leaf-b")
+        .with_connection("hub", "leaf-a")
+        .with_connection("hub", "leaf-b")
+        .build()
+    )
+    engine._session_dir = sessions
+    service = LocalTerrariumService(engine)
+    session_id = engine.get_creature("hub").graph_id
+    assert {c.graph_id for c in engine.list_creatures()} == {session_id}
+    # "hub" bridges both leaves; removing it first must fork the graph.
+    engine._topology.graphs[session_id].creature_ids = _HubFirstIds(
+        engine._topology.graphs[session_id].creature_ids
+    )
+    path = sessions / f"{session_id}.kohakutr"
+    store = SessionStore(path)
+    store.init_meta(
+        session_id, "terrarium", "/cfg", str(tmp_path), ["hub", "leaf-a", "leaf-b"]
+    )
+    engine._session_stores[session_id] = store
+    engine._owned_sessions.add(session_id)
+    lifecycle.stores_for(service)[session_id] = store
+    lifecycle.meta_for(service)[session_id] = {"name": "team"}
+
+    try:
+        await stop.stop_session(
+            service,
+            session_id,
+            meta=lifecycle.meta_for(service),
+            session_stores=lifecycle.stores_for(service),
+            mirror_dir=tmp_path / "mirror",
+        )
+    finally:
+        await engine.shutdown()
+
+    assert [p.name for p in sessions.glob("*.kohakutr")] == [path.name]
+    reopened = SessionStore.open_readonly(path)
+    try:
+        meta = reopened.load_meta()
+    finally:
+        reopened.close(update_status=False)
+    assert meta["config_type"] == "terrarium"
+    assert meta["agents"] == ["hub", "leaf-a", "leaf-b"]
+    assert "split_at" not in meta
+    manifest = meta.get("live_graph_manifest")
+    assert isinstance(manifest, dict)
+    assert {c["name"] for c in manifest["creatures"]} == {
+        "hub",
+        "leaf-a",
+        "leaf-b",
+    }
+
+
 @pytest.mark.parametrize("error_type", [RuntimeError, asyncio.CancelledError])
 async def test_teardown_failure_rolls_back_local_marker(tmp_path, error_type):
     engine = await TestTerrariumBuilder().with_creature("alice").build()
