@@ -394,6 +394,53 @@ class TestAddNativeResults:
 # ── _format_text_results ─────────────────────────────────────────
 
 
+class TestAdvertisedToolName:
+    """The conversation name must match what the provider was told about the tool."""
+
+    def test_result_uses_the_advertised_name_not_the_job_label(self, agent):
+        jid = "agent_persona_checker_dacf621f"
+        agent._register_direct_job(
+            jid, kind="subagent", name="persona_checker", tool_call_id="call_9"
+        )
+        result = JobResult(job_id=jid, output="ok", exit_code=0)
+        agent._add_native_results_to_conversation(
+            agent.controller, [jid], {jid: result}, {jid: "call_9"}
+        )
+        last = agent.controller.conversation.get_messages()[-1]
+        assert last.name == "persona_checker"
+        assert last.name != "agent_persona_checker"
+
+    def test_an_exception_result_keeps_the_advertised_name(self, agent):
+        jid = "agent_banword_checker_0badcafe"
+        agent._register_direct_job(
+            jid, kind="subagent", name="banword_checker", tool_call_id="call_e"
+        )
+        agent._add_native_results_to_conversation(
+            agent.controller, [jid], {jid: RuntimeError("boom")}, {jid: "call_e"}
+        )
+        last = agent.controller.conversation.get_messages()[-1]
+        assert last.name == "banword_checker"
+
+    def test_an_unregistered_job_falls_back_to_the_job_label(self, agent):
+        result = JobResult(job_id="bash_x", output="ok", exit_code=0)
+        agent._add_native_results_to_conversation(
+            agent.controller, ["bash_x"], {"bash_x": result}, {"bash_x": "call_1"}
+        )
+        last = agent.controller.conversation.get_messages()[-1]
+        assert last.name == "bash"
+
+    def test_promotion_placeholder_uses_the_advertised_name(self, agent):
+        jid = "agent_plot_checker_1a2b3c4d"
+        agent._register_direct_job(
+            jid, kind="subagent", name="plot_checker", tool_call_id="call_p"
+        )
+        agent._handle_promotion(
+            jid, agent.controller, tool_call_ids={jid: "call_p"}, native_mode=True
+        )
+        last = agent.controller.conversation.get_messages()[-1]
+        assert last.name == "plot_checker"
+
+
 class TestFormatTextResults:
     def test_ok_result(self, agent):
         result = JobResult(job_id="bash_x", output="hello", exit_code=0)
@@ -493,6 +540,10 @@ class TestWaitHandles:
             {"x": handle}, ["x"], agent.controller, {}, False
         )
         assert "x" in results
+        # Handles and notifications retire; meta survives for the result append.
+        assert "x" not in agent._active_handles
+        assert "x" not in agent._bg_controller_notify
+        assert agent._direct_job_meta["x"]["name"] == "t"
 
     @pytest.mark.parametrize("notify", [True, False])
     async def test_promotion_recorded(self, agent, notify):

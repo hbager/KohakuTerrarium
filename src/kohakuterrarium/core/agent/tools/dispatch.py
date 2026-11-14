@@ -102,7 +102,10 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
                 else:
                     results[jid] = result
                     self._emit_direct_completion_activity(jid, result)
-                    self._clear_direct_job_tracking(jid)
+                    # Direct-job meta outlives the wait: the native result
+                    # append still needs the advertised tool name.
+                    self._active_handles.pop(jid, None)
+                    self._bg_controller_notify.pop(jid, None)
 
         return results, had_promotions
 
@@ -114,7 +117,8 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
         native_mode: bool,
     ) -> None:
         """Handle a task that was promoted to background mid-wait."""
-        tool_name, label = _make_job_label(job_id)
+        label_name, label = _make_job_label(job_id)
+        tool_name = self._direct_job_meta.get(job_id, {}).get("name") or label_name
         logger.info("Task promoted to background", job_id=job_id)
 
         # Native tool-call protocols require a result even when the real result
@@ -549,7 +553,10 @@ class AgentToolsMixin(AgentRuntimeToolsMixin):
                 continue  # Promoted jobs already have a protocol placeholder.
 
             result = results[job_id]
-            tool_name, _ = _make_job_label(job_id)
+            tool_name = (
+                self._direct_job_meta.get(job_id, {}).get("name")
+                or _make_job_label(job_id)[0]
+            )
             tool_call_id = tool_call_ids.get(job_id, job_id)
 
             if isinstance(result, Exception):

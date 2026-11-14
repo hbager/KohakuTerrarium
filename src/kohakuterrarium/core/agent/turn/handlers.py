@@ -619,6 +619,10 @@ class AgentHandlersMixin(AgentMidTurnMixin, AgentToolsMixin, AgentOutputWiringMi
                     text = self._format_text_results(handle_order, results)
                     if text:
                         feedback_parts.append(text)
+            # Finished direct jobs retire meta here, after the result append
+            # has read the advertised name.
+            for jid in results:
+                self._direct_job_meta.pop(jid, None)
 
         # A direct job promoted to background mid-wait also defers this
         # turn's output wire (deliverable — promoted directs are ordinary

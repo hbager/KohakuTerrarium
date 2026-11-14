@@ -3877,6 +3877,49 @@ class TestCollectAndPushFeedbackNative:
         finally:
             await agent.stop()
 
+    async def test_finished_direct_job_meta_retires_after_the_result_append(
+        self, make_agent
+    ):
+        from kohakuterrarium.core.jobs.job import JobResult
+
+        agent = make_agent()
+        await agent.start()
+        try:
+            seen: list[str] = []
+            original = agent._add_native_results_to_conversation
+
+            def spy(controller, order, results, ids):
+                # The advertised name must still be resolvable at append time.
+                seen.append(agent._direct_job_meta["agent_checker_abc"]["name"])
+                original(controller, order, results, ids)
+
+            agent._add_native_results_to_conversation = spy  # type: ignore
+            agent._register_direct_job(
+                "agent_checker_abc", kind="subagent", name="checker"
+            )
+
+            async def fake_wait(*args, **kwargs):
+                return {
+                    "agent_checker_abc": JobResult(
+                        job_id="agent_checker_abc", output="ok"
+                    )
+                }, False
+
+            agent._wait_handles = fake_wait  # type: ignore[method-assign]
+            ok = await agent._collect_and_push_feedback(
+                agent.controller,
+                {"agent_checker_abc": object()},
+                ["agent_checker_abc"],
+                {"agent_checker_abc": "call_c"},
+                True,
+            )
+            assert seen == ["checker"]
+            # The registered direct job retired: nothing leaks across turns.
+            assert agent._direct_job_meta == {}
+            assert ok is True
+        finally:
+            await agent.stop()
+
 
 # ── _load_plugins on_load + on_agent_start fired ────────────────
 
