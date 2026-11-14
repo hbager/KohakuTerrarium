@@ -627,17 +627,28 @@ class TestSummaryMaxTokens:
     def test_default(self):
         mgr = CompactManager()
         out = mgr._summary_max_tokens()
-        # Default 256000 // 64 = 4000 → clamped to 4096 ceiling? actually min(4096, 4000) = 4000.
-        assert 512 <= out <= 4096
+        # Default target = 256000 * 0.5 = 128000; 80% = 102400 → capped at 65536.
+        assert out == 65_536
 
     def test_floor(self):
         mgr = CompactManager(CompactConfig(max_tokens=1024))
-        # 1024 // 64 = 16 → floor at 512.
+        # target = 512; 80% = 409 → floor at 512.
         assert mgr._summary_max_tokens() == 512
 
     def test_ceiling(self):
         mgr = CompactManager(CompactConfig(max_tokens=10_000_000))
-        assert mgr._summary_max_tokens() == 4096
+        assert mgr._summary_max_tokens() == 65_536
+
+    def test_scales_down_below_ceiling(self):
+        mgr = CompactManager(CompactConfig(max_tokens=100_000))
+        # target = 50000; 80% = 40000 → under the ceiling, kept as-is.
+        assert mgr._summary_max_tokens() == 40_000
+
+    def test_never_consumes_entire_target(self):
+        # If the summary budget reaches the post-compact target, the
+        # boundary selector finds no live zone and compaction no-ops.
+        mgr = CompactManager(CompactConfig(max_tokens=20_000, target=0.5))
+        assert mgr._summary_max_tokens() < 10_000
 
 
 # ── _summarize ───────────────────────────────────────────────────

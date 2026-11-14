@@ -2601,7 +2601,7 @@ class TestLlmIntegration:
                 False,
                 65536,
                 {"thinkingBudget": 4000},
-                (4000, {"thinkingBudget": 2000}),
+                (65536, {"thinkingBudget": 4000}),
             ),
             (
                 "google-antigravity/gemini-4-argon@reasoning=medium,context=512k",
@@ -2610,7 +2610,7 @@ class TestLlmIntegration:
                 False,
                 65536,
                 {"thinkingLevel": "MEDIUM"},
-                (4096, {"thinkingLevel": "MEDIUM"}),
+                (65536, {"thinkingLevel": "MEDIUM"}),
             ),
             (
                 "google-antigravity/claude-sonnet-5-5",
@@ -2619,7 +2619,7 @@ class TestLlmIntegration:
                 True,
                 128000,
                 {"thinkingLevel": "MEDIUM"},
-                (4000, {"thinkingLevel": "MEDIUM"}),
+                (65536, {"thinkingLevel": "MEDIUM"}),
             ),
         ):
             with monkeypatch.context() as agy_patch:

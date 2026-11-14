@@ -510,15 +510,17 @@ class CompactManager:
         )
 
     def _summary_max_tokens(self) -> int:
-        """Return a conservative output cap for the summarization request.
+        """Return the output cap for the summarization request.
 
-        Compact runs near the model's context ceiling. Reusing the
-        profile's full normal ``max_output`` budget can make the summary
-        request exceed the context window even when the regular turn just
-        fit. Keep the summary budget intentionally small.
+        Capped at 65,536 tokens and at 80% of the post-compact target:
+        the boundary selector reserves this budget out of the target, so
+        spending it all would leave no live zone to keep.
         """
-        max_context = max(int(self.config.max_tokens or DEFAULT_MAX_TOKENS), 1024)
-        return max(512, min(4096, max_context // 64))
+        target_tokens = int(
+            max(int(self.config.max_tokens or DEFAULT_MAX_TOKENS), 1024)
+            * self.config.target
+        )
+        return max(512, min(65_536, int(target_tokens * 0.8)))
 
     async def _summarize(self, text: str) -> str:
         """Call LLM to produce a structured summary."""
