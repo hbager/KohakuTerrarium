@@ -115,6 +115,30 @@ _STATEFUL_ASSISTANT_FIELD_DEFAULTS: dict[str, Any] = {
 }
 
 
+def normalize_assistant_tool_call_content(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Null out empty assistant content when tool calls are present.
+
+    The Chat Completions schema allows ``content: null`` next to
+    ``tool_calls``; strict vLLM-based servers reject an empty string there.
+    Storage keeps its own form; this is the wire shape only.
+    """
+    changed = False
+    normalized: list[dict[str, Any]] = []
+    for msg in messages:
+        if (
+            msg.get("role") == "assistant"
+            and msg.get("tool_calls")
+            and msg.get("content") == ""
+        ):
+            normalized.append({**msg, "content": None})
+            changed = True
+        else:
+            normalized.append(msg)
+    return normalized if changed else messages
+
+
 def normalize_stateful_assistant_fields(
     messages: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:

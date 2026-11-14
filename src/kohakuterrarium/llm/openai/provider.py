@@ -32,6 +32,7 @@ from kohakuterrarium.llm.openai.helpers import (
     is_gemini_endpoint,
     log_token_usage,
     merge_reasoning_detail_stream,
+    normalize_assistant_tool_call_content,
     normalize_stateful_assistant_fields,
     pack_reasoning_fields,
     restore_tool_call_extra,
@@ -282,6 +283,7 @@ class OpenAIProvider(BaseLLMProvider):
         messages = strip_internal_message_fields(messages)
         messages = strip_kt_extras(messages)
         messages = normalize_stateful_assistant_fields(messages)
+        messages = normalize_assistant_tool_call_content(messages)
         if not is_anthropic_endpoint(self.base_url, None):
             return messages
         if self.extra_body.get("disable_prompt_caching"):
