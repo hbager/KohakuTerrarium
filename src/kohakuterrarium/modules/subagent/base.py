@@ -194,6 +194,12 @@ class SubAgent:
             tool_format=self.tool_format or "bracket",
             runtime_plugins=self._plugin_manager,
             plugin_context=plugin_ctx,
+            extra_context={
+                "agent_name": self.config.name,
+                "working_dir": str(self.agent_path),
+                "agent_path": str(self.agent_path),
+                "model": getattr(self.llm, "model", ""),
+            },
         )
         if self._missing_tools:
             missing_note = (

@@ -9,6 +9,7 @@ Framework-hint overrides may replace canonical blocks; an empty override omits
 that block entirely.
 """
 
+from pathlib import Path
 from typing import Any
 
 from kohakuterrarium.builtin_skills import get_all_subagent_docs, get_all_tool_docs
@@ -38,6 +39,7 @@ from kohakuterrarium.modules.tool.doc_mode import (
     resolve_doc_mode,
 )
 from kohakuterrarium.prompt.presentation import build_presentation_section
+from kohakuterrarium.prompt.rules import append_rule_prompt
 from kohakuterrarium.prompt.template import render_template_safe
 from kohakuterrarium.prompt.tool_contributions import build_tool_guidance_section
 from kohakuterrarium.skills.index import (
@@ -274,6 +276,11 @@ def aggregate_system_prompt(
             parts.append(execution)
 
     result = "\n\n".join(parts)
+    result = append_rule_prompt(
+        result,
+        project_dir=_as_path(context.get("working_dir") or context.get("pwd")),
+        agent_path=_as_path(context.get("agent_path")),
+    )
     logger.debug(
         "Aggregated system prompt",
         length=len(result),
@@ -281,6 +288,12 @@ def aggregate_system_prompt(
         tool_format=tool_format,
     )
     return result
+
+
+def _as_path(value: Any) -> Path | None:
+    if not value:
+        return None
+    return Path(str(value))
 
 
 def _build_output_hints(
