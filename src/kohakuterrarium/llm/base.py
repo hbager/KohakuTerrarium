@@ -8,6 +8,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Callable, Protocol, runtime_checkable
 
+from kohakuterrarium.errors import EmptyLLMResponseError
 from kohakuterrarium.llm.message import Message
 from kohakuterrarium.llm.recovery.context_repair import (
     CONTENT_REPAIR_LADDER,
@@ -16,6 +17,7 @@ from kohakuterrarium.llm.recovery.context_repair import (
 from kohakuterrarium.llm.recovery.errors import (
     ErrorClass,
     RetryPolicy,
+    backoff_delay,
     drop_last_tool_round,
     provider_error_text,
 )
@@ -29,6 +31,9 @@ from kohakuterrarium.llm.recovery.request_budget import (
 from kohakuterrarium.utils.logging import get_logger
 
 logger = get_logger(__name__)
+
+# Provider extra_body knob that turns on empty streaming-turn retries.
+EMPTY_RETRY_KNOB = "retry_empty_response"
 
 
 @dataclass
@@ -506,12 +511,17 @@ class BaseLLMProvider:
         provider_native_tools: list[Any] | None = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        """Normalize messages and delegate streaming or completion to the provider."""
+        """Delegate to the provider, retrying empty stream turns when enabled."""
         self._last_tool_calls = []
         normalized = self._normalize_messages(messages)
 
         if stream:
-            provider_stream = self._stream_chat(
+            stream_call = (
+                self._stream_chat_with_empty_retry
+                if self._empty_retry_enabled()
+                else self._stream_chat
+            )
+            provider_stream = stream_call(
                 normalized,
                 tools=tools,
                 provider_native_tools=provider_native_tools,
@@ -536,6 +546,113 @@ class BaseLLMProvider:
         """Default complete implementation."""
         normalized = self._normalize_messages(messages)
         return await self._complete_chat(normalized, **kwargs)
+
+    def _empty_retry_enabled(self) -> bool:
+        """Whether the provider opted into retrying successful-but-empty stream turns."""
+        extra = getattr(self, "extra_body", None)
+        return bool(isinstance(extra, dict) and extra.get(EMPTY_RETRY_KNOB))
+
+    def _reset_attempt_state(self) -> None:
+        """Clear per-attempt result state before a provider attempt starts."""
+        self._last_tool_calls = []
+        self._last_usage = {}
+        self._last_assistant_parts = []
+        self._last_assistant_extra_fields = {}
+
+    def _has_presentable_parts(self) -> bool:
+        """Whether the last attempt carried non-blank text or a non-text content part."""
+        for part in self.last_assistant_content_parts or []:
+            if isinstance(part, dict):
+                kind = part.get("type", "")
+                text = part.get("text", "")
+            else:
+                kind = getattr(part, "type", "")
+                text = getattr(part, "text", "")
+            if kind != "text" or str(text).strip():
+                return True
+        return False
+
+    def _is_empty_turn(self, content: str) -> bool:
+        """Whether an attempt produced no visible answer: no text, tool call, or media.
+
+        Reasoning fields are not an answer, so a turn that only thought is empty.
+        """
+        return not (
+            (content or "").strip()
+            or self._last_tool_calls
+            or self._has_presentable_parts()
+        )
+
+    def _empty_retry_policy(self) -> RetryPolicy:
+        """Return the provider's own retry policy, else the one configured for the model."""
+        policy = getattr(self, "_retry_policy", None)
+        if isinstance(policy, RetryPolicy):
+            return policy
+        return RetryPolicy.from_value(self.config.retry_policy)
+
+    async def _wait_before_empty_retry(self, attempt: int) -> int:
+        """Raise when empty retries are exhausted, else back off and return the next attempt."""
+        policy = self._empty_retry_policy()
+        if (
+            ErrorClass.TRANSIENT not in policy.retry_classes
+            or attempt >= policy.max_retries
+        ):
+            raise EmptyLLMResponseError(
+                f"{type(self).__name__} returned an empty response after "
+                f"{attempt + 1} attempt(s)"
+            )
+        attempt += 1
+        delay = backoff_delay(attempt, policy)
+        logger.warning(
+            "provider_empty_response_retry",
+            attempt=attempt,
+            max_retries=policy.max_retries,
+            delay=delay,
+        )
+        await asyncio.sleep(delay)
+        return attempt
+
+    async def _stream_chat_with_empty_retry(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[ToolSchema] | None = None,
+        provider_native_tools: list[Any] | None = None,
+        **kwargs: Any,
+    ) -> AsyncIterator[str]:
+        """Stream a turn, holding whitespace until the attempt proves non-empty."""
+        attempt = 0
+        while True:
+            self._reset_attempt_state()
+            pending: list[str] = []
+            saw_text = False
+            raw = self._stream_chat(
+                messages,
+                tools=tools,
+                provider_native_tools=provider_native_tools,
+                **kwargs,
+            )
+            try:
+                async for chunk in raw:
+                    if saw_text:
+                        yield chunk
+                        continue
+                    pending.append(chunk)
+                    if chunk and str(chunk).strip():
+                        saw_text = True
+                        for item in pending:
+                            yield item
+            finally:
+                close = getattr(raw, "aclose", None)
+                if close is not None:
+                    await close()
+            if saw_text:
+                return
+            if not self._is_empty_turn(""):
+                for item in pending:
+                    yield item
+                return
+            attempt = await self._wait_before_empty_retry(attempt)
 
     async def _stream_chat(
         self,

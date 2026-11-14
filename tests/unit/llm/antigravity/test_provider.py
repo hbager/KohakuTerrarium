@@ -540,12 +540,12 @@ async def test_only_advertised_catalog_skus_are_requested(family, effort):
 @pytest.mark.parametrize(
     "model,summary_limit,summary_budget",
     [
-        ("gemini-4-argon", 4000, None),
-        ("gemini-3.8-flash", 4000, 2000),
-        ("gemini-3.8-flash-low", 4000, 1000),
-        ("gemini-3.8-flash-high", 4000, -1),
-        ("claude-sonnet-5-5", 4000, None),
-        ("gpt-oss-120b", 1250, 625),
+        ("gemini-4-argon", 65536, None),
+        ("gemini-3.8-flash", 65536, 4000),
+        ("gemini-3.8-flash-low", 65536, 1000),
+        ("gemini-3.8-flash-high", 65536, -1),
+        ("claude-sonnet-5-5", 65536, None),
+        ("gpt-oss-120b", 32000, 8192),
     ],
 )
 async def test_compact_summary_uses_per_call_limit_without_mutating_profile(

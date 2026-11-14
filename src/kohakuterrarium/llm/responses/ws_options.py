@@ -14,6 +14,7 @@ FRAMEWORK_KNOBS = frozenset(
         "websocket_fallback_after",
         "request_max_bytes",
         "responses_reasoning_replay",
+        "retry_empty_response",
     }
 )
 

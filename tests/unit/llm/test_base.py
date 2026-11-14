@@ -3,11 +3,12 @@
 Behavior-first: assert the exact API-format conversion, JSON-argument
 parsing fallback, the BaseLLMProvider message-normalisation contract,
 the streaming vs non-streaming dispatch, emergency-drop callback
-fan-out, and ``with_model`` reuse/refusal semantics.
+fan-out, ``with_model`` reuse/refusal semantics, and the opt-in empty-turn retry.
 """
 
 import pytest
 
+from kohakuterrarium.errors import EmptyLLMResponseError, LLMError
 from kohakuterrarium.llm.base import (
     BaseLLMProvider,
     ChatResponse,
@@ -19,7 +20,7 @@ from kohakuterrarium.llm.base import (
     fork_llm,
 )
 from kohakuterrarium.llm.message import Message
-from kohakuterrarium.llm.recovery.errors import ErrorClass
+from kohakuterrarium.llm.recovery.errors import ErrorClass, RetryPolicy
 from kohakuterrarium.llm.recovery.request_budget import (
     MAX_REQUEST_SHRINKS,
     RequestMeasure,
@@ -87,6 +88,59 @@ class _StubProvider(BaseLLMProvider):
             content="full-response",
             finish_reason="stop",
             usage={"prompt_tokens": 1},
+            model="m",
+        )
+
+
+class _TurnProvider(BaseLLMProvider):
+    """Play one scripted attempt per call and record result state like a real provider."""
+
+    extra_body = {"retry_empty_response": True}
+
+    _STATE = (
+        ("usage", "_last_usage"),
+        ("tool_calls", "_last_tool_calls"),
+        ("parts", "_last_assistant_parts"),
+        ("extra", "_last_assistant_extra_fields"),
+    )
+
+    def __init__(self, attempts, policy=None):
+        policy = policy or RetryPolicy(base_delay=0, jitter=0)
+        super().__init__(LLMConfig(model="m", retry_policy=policy))
+        self.attempts = list(attempts)
+        self.calls = 0
+        self.closed_attempts = 0
+
+    def _next_attempt(self):
+        attempt = self.attempts[self.calls]
+        self.calls += 1
+        return attempt
+
+    def _record(self, attempt):
+        for key, attr in self._STATE:
+            if key in attempt:
+                setattr(self, attr, attempt[key])
+
+    async def _stream_chat(
+        self, messages, *, tools=None, provider_native_tools=None, **kw
+    ):
+        attempt = self._next_attempt()
+        try:
+            if "error" in attempt:
+                raise attempt["error"]
+            for chunk in attempt.get("chunks", []):
+                yield chunk
+            self._record(attempt)
+        finally:
+            self.closed_attempts += 1
+
+    async def _complete_chat(self, messages, **kw):
+        attempt = self._next_attempt()
+        self._record(attempt)
+        return ChatResponse(
+            content="".join(attempt.get("chunks", [])),
+            finish_reason="stop",
+            usage={},
             model="m",
         )
 
@@ -169,6 +223,145 @@ class TestBaseLLMProviderChat:
         assert resp.content == "full-response"
         # Message objects were normalised before reaching _complete_chat
         assert provider.completed_messages == [{"role": "user", "content": "hi"}]
+
+
+async def _collect(provider):
+    return [c async for c in provider.chat([{"role": "user", "content": "x"}])]
+
+
+class TestEmptyTurnRetry:
+    async def test_retry_is_off_by_default(self):
+        provider = _TurnProvider([{}])
+        provider.extra_body = {}
+        assert await _collect(provider) == []
+        assert provider.calls == 1
+
+    async def test_empty_stream_is_retried_until_text_arrives(self):
+        provider = _TurnProvider([{}, {}, {"chunks": ["hello"]}])
+        assert await _collect(provider) == ["hello"]
+        assert provider.calls == 3
+
+    async def test_whitespace_only_attempt_is_not_emitted(self):
+        provider = _TurnProvider([{"chunks": ["\n", "  "]}, {"chunks": ["ok"]}])
+        assert await _collect(provider) == ["ok"]
+        assert provider.calls == 2
+
+    async def test_leading_whitespace_is_emitted_once_text_arrives(self):
+        provider = _TurnProvider([{"chunks": ["\n", "hi"]}])
+        assert await _collect(provider) == ["\n", "hi"]
+        assert provider.calls == 1
+
+    async def test_reasoning_only_attempt_counts_as_empty(self):
+        third = {"extra": {"reasoning_content": "thinking"}}
+        provider = _TurnProvider([third, {"chunks": ["answer"]}])
+        assert await _collect(provider) == ["answer"]
+        assert provider.calls == 2
+
+    async def test_replay_only_attempt_counts_as_empty(self):
+        third = {"extra": {"_kt_reasoning_replay": {"tokens": 12}}}
+        provider = _TurnProvider([third, {"chunks": ["answer"]}])
+        assert await _collect(provider) == ["answer"]
+        assert provider.calls == 2
+
+    async def test_tool_call_only_attempt_is_not_empty(self):
+        call = NativeToolCall("c1", "bash", "{}")
+        provider = _TurnProvider([{"tool_calls": [call]}])
+        assert await _collect(provider) == []
+        assert provider.calls == 1
+        assert provider.last_tool_calls == [call]
+
+    async def test_media_part_only_attempt_is_not_empty(self):
+        parts = [{"type": "image_url", "image_url": {"url": "data:x"}}]
+        provider = _TurnProvider([{"parts": parts}])
+        assert await _collect(provider) == []
+        assert provider.calls == 1
+
+    async def test_blank_text_part_only_attempt_is_empty(self):
+        blank = [{"type": "text", "text": "  "}]
+        provider = _TurnProvider([{"parts": blank}, {"chunks": ["ok"]}])
+        assert await _collect(provider) == ["ok"]
+        assert provider.calls == 2
+
+    async def test_exhausted_retries_raise_empty_response_error(self):
+        policy = RetryPolicy(max_retries=2, base_delay=0, jitter=0)
+        provider = _TurnProvider([{}] * 5, policy)
+        with pytest.raises(EmptyLLMResponseError, match=r"3 attempt\(s\)"):
+            await _collect(provider)
+        assert provider.calls == 3
+        assert provider.closed_attempts == 3
+
+    def test_empty_response_error_is_an_llm_error(self):
+        assert issubclass(EmptyLLMResponseError, LLMError)
+
+    async def test_policy_can_disable_empty_retries(self):
+        policy = RetryPolicy(
+            max_retries=3,
+            base_delay=0,
+            jitter=0,
+            retry_classes=frozenset({ErrorClass.RATE_LIMIT}),
+        )
+        provider = _TurnProvider([{}, {"chunks": ["late"]}], policy)
+        with pytest.raises(EmptyLLMResponseError):
+            await _collect(provider)
+        assert provider.calls == 1
+
+    async def test_provider_retry_policy_overrides_configured_policy(self):
+        provider = _TurnProvider(
+            [{}, {"chunks": ["late"]}],
+            RetryPolicy(max_retries=5, base_delay=0, jitter=0),
+        )
+        provider._retry_policy = RetryPolicy(max_retries=0, base_delay=0, jitter=0)
+        with pytest.raises(EmptyLLMResponseError):
+            await _collect(provider)
+        assert provider.calls == 1
+
+    async def test_backoff_delay_doubles_between_attempts(self, monkeypatch):
+        sleeps = []
+
+        async def fake_sleep(delay):
+            sleeps.append(delay)
+
+        monkeypatch.setattr("kohakuterrarium.llm.base.asyncio.sleep", fake_sleep)
+        policy = RetryPolicy(max_retries=3, base_delay=1.0, jitter=0)
+        provider = _TurnProvider([{}, {}, {"chunks": ["ok"]}], policy)
+        assert await _collect(provider) == ["ok"]
+        assert sleeps == [1.0, 2.0]
+
+    async def test_attempt_state_is_reset_between_attempts(self):
+        provider = _TurnProvider(
+            [{"extra": {"reasoning_content": "x"}}, {"chunks": ["ok"]}]
+        )
+        assert await _collect(provider) == ["ok"]
+        assert provider.last_assistant_extra_fields == {}
+
+    async def test_closing_stream_mid_attempt_does_not_retry(self):
+        provider = _TurnProvider([{"chunks": ["a", "b"]}, {"chunks": ["never"]}])
+        stream = provider.chat([{"role": "user", "content": "x"}])
+        assert await anext(stream) == "a"
+        await stream.aclose()
+        assert provider.calls == 1
+        assert provider.closed_attempts == 1
+
+    async def test_provider_errors_are_not_retried_as_empty(self):
+        boom = RuntimeError("boom")
+        provider = _TurnProvider([{"error": boom}, {"chunks": ["x"]}])
+        with pytest.raises(RuntimeError, match="boom"):
+            await _collect(provider)
+        assert provider.calls == 1
+
+    async def test_chat_complete_does_not_retry_empty_response(self):
+        provider = _TurnProvider([{}, {"chunks": ["full"]}])
+        response = await provider.chat_complete([{"role": "user", "content": "x"}])
+        assert response.content == ""
+        assert provider.calls == 1
+
+    async def test_knob_is_stripped_from_provider_request_body(self):
+        from kohakuterrarium.llm.responses.ws_options import FRAMEWORK_KNOBS
+        from kohakuterrarium.llm.anthropic.format import INTERNAL_EXTRA_KEYS
+
+        knob = "retry_empty_response"
+        assert knob in FRAMEWORK_KNOBS
+        assert knob in INTERNAL_EXTRA_KEYS
 
 
 class TestBaseLLMProviderProperties:
