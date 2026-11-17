@@ -9,6 +9,7 @@ from typing import Any, AsyncIterator
 
 from openai import AsyncOpenAI
 
+from kohakuterrarium.llm.http_headers import with_browser_user_agent
 from kohakuterrarium.llm.responses import ws_options
 from kohakuterrarium.llm.anthropic.cache import (
     apply_anthropic_cache_markers,
@@ -161,7 +162,7 @@ class OpenAIProvider(BaseLLMProvider):
             base_url=self._base_url_input,
             timeout=self._timeout,
             max_retries=self._max_retries,
-            default_headers=self._extra_headers,
+            default_headers=with_browser_user_agent(self._extra_headers),
         )
 
     def _open_client(self) -> AsyncOpenAI:

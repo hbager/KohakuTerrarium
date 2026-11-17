@@ -14,6 +14,7 @@ from kohakuterrarium.llm.base import (
     NativeToolCall,
     ToolSchema,
 )
+from kohakuterrarium.llm.http_headers import with_browser_user_agent
 from kohakuterrarium.llm.media.artifacts import resolve_message_image_urls
 from kohakuterrarium.llm.openai.helpers import (
     delta_field,
@@ -277,6 +278,7 @@ class LiteLLMProvider(BaseLLMProvider):
             "temperature": kwargs.get("temperature", self.config.temperature),
             "stream": stream,
             "drop_params": True,
+            "extra_headers": with_browser_user_agent(),
         }
 
         if self._api_key:
